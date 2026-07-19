@@ -10,7 +10,10 @@
 #   claude_args =
 #
 # environment variables:
-#   BOB_CHAT_MODE  - bob chat mode: ask | code | plan | advanced (default: code)
+#   BOB_CHAT_MODE  - bob chat mode: ask | code | plan | advanced (default: code).
+#                    Custom mode slugs defined in ~/.bob/custom_modes.yaml are
+#                    also accepted and forwarded to bob's --chat-mode; a stderr
+#                    warning is emitted for values outside the built-in set.
 #   BOB_MODEL      - model to use (passed as -m when --model flag absent)
 #   BOB_VERBOSE    - set to 1 to include tool_result output and [tool] markers (default: 0)
 #   BOB_EXTRA_ARGS - extra args appended verbatim to the bob invocation, word-split on
@@ -81,7 +84,7 @@ if [[ -z "$prompt" ]]; then
 fi
 
 # configurable via environment
-BOB_CHAT_MODE="${BOB_CHAT_MODE:-code}"
+BOB_CHAT_MODE="${BOB_CHAT_MODE-code}"
 BOB_MODEL="${BOB_MODEL:-}"
 BOB_VERBOSE="${BOB_VERBOSE:-0}"
 if [[ "$BOB_VERBOSE" != "0" && "$BOB_VERBOSE" != "1" ]]; then
@@ -90,12 +93,20 @@ if [[ "$BOB_VERBOSE" != "0" && "$BOB_VERBOSE" != "1" ]]; then
 fi
 BOB_EXTRA_ARGS="${BOB_EXTRA_ARGS:-}"
 
-# validate BOB_CHAT_MODE: bob accepts ask | code | plan | advanced
+# validate BOB_CHAT_MODE: built-in modes are ask | code | plan | advanced, but
+# bob also supports user-defined custom mode slugs defined in
+# ~/.bob/custom_modes.yaml. Reject empty/whitespace-only values; accept any
+# non-empty value and pass it through to bob (bob validates the slug). Emit a
+# stderr warning for values outside the known built-in set so typos are visible.
+trimmed_chat_mode="${BOB_CHAT_MODE//[[:space:]]/}"
+if [[ -z "$trimmed_chat_mode" ]]; then
+    echo "error: BOB_CHAT_MODE is empty or whitespace-only; set it to a bob chat mode (ask, code, plan, advanced, or a custom mode slug defined in ~/.bob/custom_modes.yaml)" >&2
+    exit 1
+fi
 case "$BOB_CHAT_MODE" in
     ask|code|plan|advanced) ;;
     *)
-        echo "error: BOB_CHAT_MODE must be one of: ask, code, plan, advanced (got '$BOB_CHAT_MODE')" >&2
-        exit 1
+        echo "warning: BOB_CHAT_MODE='$BOB_CHAT_MODE' is not a built-in mode (ask|code|plan|advanced); passing through to bob — ensure it is defined in ~/.bob/custom_modes.yaml" >&2
         ;;
 esac
 

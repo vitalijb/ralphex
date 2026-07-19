@@ -440,7 +440,7 @@ ralphex --claude-command=/path/to/scripts/bob-as-claude/bob-as-claude.sh docs/pl
 
 | Variable | Default | Description |
 |---|---|---|
-| `BOB_CHAT_MODE` | `code` | bob chat mode: `ask`, `code`, `plan`, or `advanced`. Use `code` for task/review, `plan` for plan creation (untested). |
+| `BOB_CHAT_MODE` | `code` | bob chat mode: `ask`, `code`, `plan`, or `advanced`. Use `code` for task/review, `plan` for plan creation (untested). Custom mode slugs defined in `~/.bob/custom_modes.yaml` are also accepted (forwarded to bob's `--chat-mode`); a stderr warning is emitted for values outside the built-in set, and an empty/whitespace-only value exits 1. |
 | `BOB_MODEL` | (bob default) | Model passed as `-m` when ralphex does not append a `--model` flag. bob 1.0.6+ supports `-m`/`--model`. |
 | `BOB_VERBOSE` | `0` | Set to `1` to include `tool_result` output and `[tool]` markers in the stream (default: only `attempt_completion` result text is shown). |
 | `BOB_EXTRA_ARGS` | (none) | Extra flags appended verbatim to the bob invocation (word-split on whitespace, **no quote preservation**); e.g. `--max-coins 100` to cap spend. |
@@ -459,6 +459,8 @@ ralphex does not tell the wrapper which phase it is in, so a single `BOB_CHAT_MO
 | `code` | Task execution and review that applies fixes (default). |
 | `plan` | Plan creation (`ralphex --plan`). Untested with bob. |
 | `advanced` | Complex multi-step operations. |
+
+Custom mode slugs defined in `~/.bob/custom_modes.yaml` (e.g. `shell-debug`) are also accepted and forwarded to bob's `--chat-mode`. The wrapper emits a stderr warning for values outside the built-in set `{ask,code,plan,advanced}` so typos are visible, but passes the value through to bob (bob validates the slug). An empty or whitespace-only `BOB_CHAT_MODE` exits 1. The built-in set is the recommended/safe choice.
 
 ### Event translation
 

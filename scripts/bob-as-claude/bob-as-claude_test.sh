@@ -333,28 +333,87 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# test: invalid BOB_CHAT_MODE exits with error
+# test: empty BOB_CHAT_MODE exits with error
 # ---------------------------------------------------------------------------
-echo "test: invalid BOB_CHAT_MODE"
+echo "test: empty BOB_CHAT_MODE"
 
 set +e
 MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
-    BOB_CHAT_MODE="invalid" \
+    BOB_CHAT_MODE="" \
     PATH="$TMPDIR_TEST:$PATH" \
     bash "$WRAPPER" -p "test prompt" 2>"$TMPDIR_TEST/chatmode_err" >/dev/null
 chatmode_exit=$?
 set -e
 
 if [[ $chatmode_exit -ne 0 ]]; then
-    pass "invalid BOB_CHAT_MODE exits non-zero"
+    pass "empty BOB_CHAT_MODE exits non-zero"
 else
-    fail "invalid BOB_CHAT_MODE should exit non-zero" "got exit 0"
+    fail "empty BOB_CHAT_MODE should exit non-zero" "got exit 0"
 fi
 
-if grep -qi "BOB_CHAT_MODE must be one of" "$TMPDIR_TEST/chatmode_err"; then
-    pass "invalid BOB_CHAT_MODE error message is clear"
+if grep -qi "BOB_CHAT_MODE is empty" "$TMPDIR_TEST/chatmode_err"; then
+    pass "empty BOB_CHAT_MODE error message is clear"
 else
-    fail "invalid BOB_CHAT_MODE error message missing" "stderr: $(cat "$TMPDIR_TEST/chatmode_err")"
+    fail "empty BOB_CHAT_MODE error message missing" "stderr: $(cat "$TMPDIR_TEST/chatmode_err")"
+fi
+
+# whitespace-only BOB_CHAT_MODE also exits non-zero
+set +e
+MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
+    BOB_CHAT_MODE="   " \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "test prompt" 2>"$TMPDIR_TEST/chatmode_err2" >/dev/null
+chatmode_ws_exit=$?
+set -e
+
+if [[ $chatmode_ws_exit -ne 0 ]]; then
+    pass "whitespace-only BOB_CHAT_MODE exits non-zero"
+else
+    fail "whitespace-only BOB_CHAT_MODE should exit non-zero" "got exit 0"
+fi
+
+# ---------------------------------------------------------------------------
+# test: custom (non-builtin) BOB_CHAT_MODE slug forwarded to bob
+# ---------------------------------------------------------------------------
+echo "test: custom BOB_CHAT_MODE slug forwarded"
+
+rm -f "$TMPDIR_TEST/bob_args"
+set +e
+MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
+    BOB_CHAT_MODE="shell-debug" \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "test prompt" 2>"$TMPDIR_TEST/custom_err" >/dev/null
+custom_exit=$?
+set -e
+
+if [[ $custom_exit -eq 0 ]]; then
+    pass "custom BOB_CHAT_MODE slug exits 0"
+else
+    fail "custom BOB_CHAT_MODE slug should exit 0" "got exit $custom_exit"
+fi
+
+recorded=$(cat "$TMPDIR_TEST/bob_args")
+if echo "$recorded" | grep -q -- "--chat-mode shell-debug"; then
+    pass "custom BOB_CHAT_MODE=shell-debug forwarded as --chat-mode shell-debug"
+else
+    fail "custom BOB_CHAT_MODE slug not forwarded" "args: $recorded"
+fi
+
+# ---------------------------------------------------------------------------
+# test: non-builtin slug emits a warning on stderr but still proceeds
+# ---------------------------------------------------------------------------
+echo "test: non-builtin slug warning"
+
+if grep -qi "not a built-in mode" "$TMPDIR_TEST/custom_err"; then
+    pass "non-builtin slug emits warning on stderr"
+else
+    fail "non-builtin slug warning missing" "stderr: $(cat "$TMPDIR_TEST/custom_err")"
+fi
+
+if echo "$recorded" | grep -q -- "--chat-mode shell-debug" && [[ $custom_exit -eq 0 ]]; then
+    pass "non-builtin slug proceeds despite warning"
+else
+    fail "non-builtin slug did not proceed" "args: $recorded, exit: $custom_exit"
 fi
 
 # ---------------------------------------------------------------------------

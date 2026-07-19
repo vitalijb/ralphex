@@ -27,7 +27,7 @@ ralphex --claude-command=/path/to/scripts/bob-as-claude/bob-as-claude.sh docs/pl
 
 **Environment variables:**
 
-- `BOB_CHAT_MODE` — bob chat mode: `ask` (read-only), `code` (writes/commands), `plan` (planning), `advanced` (complex multi-step). Default: `code`. Invalid values exit 1 with a clear error.
+- `BOB_CHAT_MODE` — bob chat mode: `ask` (read-only), `code` (writes/commands), `plan` (planning), `advanced` (complex multi-step). Default: `code`. Custom mode slugs defined in `~/.bob/custom_modes.yaml` are also accepted and forwarded to bob's `--chat-mode`; a stderr warning is emitted for values outside the built-in set `{ask,code,plan,advanced}` (e.g. `BOB_CHAT_MODE=shell-debug`). An empty or whitespace-only value exits 1 with a clear error. The built-in set is the recommended/safe choice.
 - `BOB_MODEL` — model to use (passed as `-m` when ralphex does not append a `--model` flag)
 - `BOB_VERBOSE` — set to `1` to include `tool_result` output and `[tool]` markers in the stream (default: `0`, only `attempt_completion` result text is shown)
 - `BOB_EXTRA_ARGS` — extra flags appended verbatim to the bob invocation (word-split on whitespace). The wrapper builds the bob command line itself and ignores unknown flags, so this is the only way to pass through arbitrary bob options. **Limitation:** word-splitting does NOT preserve quotes; arguments containing spaces or quotes cannot be expressed via `BOB_EXTRA_ARGS`. Use a wrapper script instead.
@@ -42,6 +42,8 @@ ralphex --claude-command=/path/to/scripts/bob-as-claude/bob-as-claude.sh docs/pl
 | `ask` | Read-only review, Q&A | Bob may still call `attempt_completion` (the terminal tool). If `ask` mode calls unexpected write tools, the review adapter's sequential instructions discourage it, but the wrapper does not enforce read-only behavior. |
 | `plan` | Planning | Use `BOB_CHAT_MODE=plan` for `ralphex --plan`. The wrapper has no plan-specific adapter (like pi); documented as untested. |
 | `advanced` | Complex multi-step tasks | Bob's most capable mode. |
+
+Custom mode slugs defined in `~/.bob/custom_modes.yaml` (e.g. `shell-debug`) are also accepted and forwarded to bob's `--chat-mode`. The wrapper emits a stderr warning for values outside the built-in set `{ask,code,plan,advanced}` so typos are visible, but passes the value through to bob (bob validates the slug). An empty or whitespace-only `BOB_CHAT_MODE` exits 1. The built-in set is the recommended/safe choice.
 
 ### Review adapter
 
