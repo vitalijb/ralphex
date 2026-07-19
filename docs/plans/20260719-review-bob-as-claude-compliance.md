@@ -37,9 +37,9 @@ Confirmed findings:
 - Modify: `CLAUDE.md`
 - Modify: `scripts/bob-as-claude/bob-as-claude_docs_test.sh`
 
-- [ ] Rewrite the `bob wrapper:` bullet at CLAUDE.md line 121 so it describes the actual strict trigger: the adapter is prepended only when a review START marker (`Use the Task tool to launch`, or a line matching `Launch.*Review Agents IN PARALLEL`) appears in the prompt OUTSIDE fenced code blocks (` ``` `/`~~~`), and that the completion signal `<<<RALPHEX:REVIEW_DONE>>>` is NOT a trigger (it is an end-of-review output signal). Match the wording already correct in README and custom-providers.md line 496.
-- [ ] Add a docs-test assertion in `bob-as-claude_docs_test.sh` that CLAUDE.md no longer claims REVIEW_DONE is the trigger and does describe the START-marker + fence-guard trigger (e.g. assert CLAUDE.md contains `Use the Task tool to launch` near the bob wrapper bullet, and assert it does NOT contain the phrase `REVIEW_DONE>>>` appears as a standalone line`).
-- [ ] Run `bash scripts/bob-as-claude/bob-as-claude_docs_test.sh` — must pass before Task 2.
+- [x] Rewrite the `bob wrapper:` bullet at CLAUDE.md line 121 so it describes the actual strict trigger: the adapter is prepended only when a review START marker (`Use the Task tool to launch`, or a line matching `Launch.*Review Agents IN PARALLEL`) appears in the prompt OUTSIDE fenced code blocks (` ``` `/`~~~`), and that the completion signal `<<<RALPHEX:REVIEW_DONE>>>` is NOT a trigger (it is an end-of-review output signal). Match the wording already correct in README and custom-providers.md line 496.
+- [x] Add a docs-test assertion in `bob-as-claude_docs_test.sh` that CLAUDE.md no longer claims REVIEW_DONE is the trigger and does describe the START-marker + fence-guard trigger (e.g. assert CLAUDE.md contains `Use the Task tool to launch` near the bob wrapper bullet, and assert it does NOT contain the phrase `REVIEW_DONE>>>` appears as a standalone line`).
+- [x] Run `bash scripts/bob-as-claude/bob-as-claude_docs_test.sh` — must pass before Task 2.
 
 ### Task 2: Relax BOB_CHAT_MODE validation to accept custom mode slugs
 

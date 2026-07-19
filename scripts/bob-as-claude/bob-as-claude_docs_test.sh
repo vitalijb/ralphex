@@ -157,6 +157,29 @@ assert_contains \
     "scripts/bob-as-claude/bob-as-claude.sh" \
     "CLAUDE alternative provider docs mention bob wrapper path"
 
+# CLAUDE.md review-adapter trigger description regression guard (Task 1)
+# CLAUDE.md must describe the START-marker + fence-guard trigger and must NOT
+# claim REVIEW_DONE is the trigger.
+assert_contains \
+    "$REPO_ROOT/CLAUDE.md" \
+    "Use the Task tool to launch" \
+    "CLAUDE.md bob wrapper bullet describes START-marker trigger"
+assert_contains \
+    "$REPO_ROOT/CLAUDE.md" \
+    "Launch.*Review Agents IN PARALLEL" \
+    "CLAUDE.md bob wrapper bullet mentions parallel-review START marker regex"
+assert_contains \
+    "$REPO_ROOT/CLAUDE.md" \
+    "is NOT a trigger" \
+    "CLAUDE.md bob wrapper bullet states REVIEW_DONE is not a trigger"
+# The old wrong phrasing must be gone
+if grep -Fq -- "REVIEW_DONE>>> appears as a standalone line" "$REPO_ROOT/CLAUDE.md"; then
+    fail "CLAUDE.md no longer claims REVIEW_DONE is the standalone-line trigger" \
+        "found old wrong phrasing in CLAUDE.md"
+else
+    pass "CLAUDE.md no longer claims REVIEW_DONE is the standalone-line trigger"
+fi
+
 echo ""
 echo "summary: $passed passed, $failed failed, $total total"
 
