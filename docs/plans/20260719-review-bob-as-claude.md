@@ -107,7 +107,7 @@ The wrapper is well-implemented, follows all ralphex guidelines, has comprehensi
 
 ### Task 4: Verify acceptance criteria
 
-- [ ] run full test suite for bob wrapper
-- [ ] run full test suite for pi wrapper (reference)
-- [ ] verify all tests pass
-- [ ] verify documentation tests pass
+- [x] run full test suite for bob wrapper
+- [x] run full test suite for pi wrapper (reference)
+- [x] verify all tests pass
+- [x] verify documentation tests pass
