@@ -45,9 +45,15 @@ ralphex --claude-command=/path/to/scripts/bob-as-claude/bob-as-claude.sh docs/pl
 
 ### Review adapter
 
-bob exposes no parallel sub-agents, so the wrapper prepends a sequential-review adapter when a review prompt is detected. The adapter instructs bob to interpret review "Task tool" instructions as sequential steps, executing each review agent's work one at a time using bob's `read`, `bash`, `edit`, and `write` tools, and applying fixes after completing all review steps.
+bob exposes no parallel sub-agents (no `Task` tool, no `spawn_agent`/`wait_agent`), so the wrapper prepends a sequential-review adapter when a review prompt is detected. The adapter instructs bob to interpret each `Use the Task tool to launch a ... agent with this prompt: "..."` block as a sequential review task — perform each agent's review work one at a time using bob's `read`, `bash`, `edit`, and `write` tools, collect findings, verify and fix confirmed issues, then follow the original prompt's `<<<RALPHEX:...>>>` signal logic unchanged.
 
-**Strict trigger:** the adapter is prepended ONLY when `<<<RALPHEX:REVIEW_DONE>>>` appears as a standalone line in the prompt AND that line is not inside a fenced code block (` ``` ` or `~~~`). This avoids prompt-injection false positives where the token appears inside code blocks, strings, or other embedded contexts. A standalone-line check alone is not enough: a fenced code block can contain the token on its own line.
+**Strict trigger:** the adapter is prepended when a review START marker appears in the prompt OUTSIDE any fenced code block (` ``` ` or `~~~`). Start markers are the strings ralphex's review prompts emit at the BEGINNING of a review pass:
+
+- `Use the Task tool to launch` — per-agent, from `{{agent:NAME}}` expansion under the claude executor (`pkg/processor/prompts.go` `formatAgentExpansionClaude`)
+- `Launch ALL 5 Review Agents IN PARALLEL` — `review_first.txt` Step 2 header (5-agent first pass)
+- `Launch Review Agents IN PARALLEL` — `review_second.txt` Step 2 header (2-agent second pass; matched by the regex `Launch.*Review Agents IN PARALLEL`)
+
+The completion signal `<<<RALPHEX:REVIEW_DONE>>>` is NOT a start marker — it appears at the END of a review iteration (Path A: no issues found) and is emitted by bob as output, not received as a prompt. The adapter therefore does NOT trigger on `REVIEW_DONE` alone. The fence-state guard rejects markers inside ` ``` `/`~~~` blocks, so a prompt that quotes a review marker inside a code block (e.g. documentation describing the wrapper) does not produce a false positive.
 
 ### `--trust` and `--yolo`
 
@@ -70,7 +76,7 @@ The unit test uses a mock bob — no real API calls are made.
 
 - `bob` CLI installed and accessible (v1.0.6+; the wrapper depends on `-m`/`--model`, `--chat-mode`, `--output-format stream-json`, `--hide-intermediary-output`, `--yolo`, `--trust` being available)
 - `jq` for JSON translation
-- `awk` for the strict review-adapter fence-state tracking
+- `awk` for the review-adapter fence-state tracking (start-marker detection outside ```/~~~ blocks)
 
 ## Limitations
 
@@ -85,7 +91,7 @@ The unit test uses a mock bob — no real API calls are made.
 
 - **`--yolo --trust` auto-approves all tool calls and writes to the real filesystem.** This is required for unattended task/review execution (ralphex has no TTY to confirm tool calls). Ensure the working directory is a git repository so changes are isolated to a feature branch. Do NOT run the wrapper in a directory with sensitive files you don't want bob to modify.
 - **stderr signal neutralization.** The wrapper re-emits bob's stderr as `content_block_delta` events so ralphex's error/limit pattern detection works. Any literal `<<<RALPHEX:` token on stderr is neutralized to `<<< RALPHEX:` (space inserted) so stray diagnostics cannot be mistaken for a real completion signal. Rate-limit and `API Error:` phrases pass through verbatim for error/limit detection.
-- **Review-adapter strict trigger.** The adapter is prepended only when `<<<RALPHEX:REVIEW_DONE>>>` appears as a standalone line outside fenced code blocks. This prevents prompt-injection attacks where a malicious prompt embeds the token inside a code block or string to trick the wrapper into prepending review instructions. A standalone-line check alone is insufficient; the fence-state tracking rejects tokens inside ` ``` ` and `~~~` blocks.
+- **Review-adapter strict trigger.** The adapter is prepended only when a review START marker (`Use the Task tool to launch`, or a line matching `Launch.*Review Agents IN PARALLEL`) appears in the prompt OUTSIDE fenced code blocks. This prevents prompt-injection attacks where a malicious prompt embeds a marker inside a code block or string to trick the wrapper into prepending review instructions. The completion signal `<<<RALPHEX:REVIEW_DONE>>>` is intentionally NOT a trigger — it is an end-of-review output signal, not a start marker, so a prompt that merely mentions the token (e.g. in docs) does not fire the adapter. The fence-state tracking rejects markers inside ` ``` ` and `~~~` blocks.
 - **Prompt delivery via stdin, not argv.** The prompt is written to a temp file and piped to bob via stdin, avoiding the 128KB per-arg cap and preventing the prompt from appearing in `ps`/process listings (argv is visible to other users on the same host).
 
 ## Troubleshooting

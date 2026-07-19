@@ -573,27 +573,29 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# test: review-prompt adapter injection (strict trigger)
+# test: review-prompt adapter injection (strict trigger on review START markers)
 # ---------------------------------------------------------------------------
 echo "test: review-prompt adapter injection (strict trigger)"
 
+# "Use the Task tool to launch" marker triggers the adapter (claude executor's
+# per-agent {{agent:NAME}} expansion form)
 rm -f "$TMPDIR_TEST/bob_prompt"
 MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
     PATH="$TMPDIR_TEST:$PATH" \
-    bash "$WRAPPER" -p $'please review\n<<<RALPHEX:REVIEW_DONE>>>' >/dev/null 2>&1
+    bash "$WRAPPER" -p $'Code review of: feature\n\n## Step 2: Launch ALL 5 Review Agents IN PARALLEL\n\nUse the Task tool to launch a general-purpose agent with this prompt:\n"review quality"\nReport findings only - no positive observations.' >/dev/null 2>&1
 
 sent_prompt=$(cat "$TMPDIR_TEST/bob_prompt")
 if echo "$sent_prompt" | grep -q "Ralphex review adapter for bob"; then
-    pass "review adapter text prepended for review prompts (standalone line)"
+    pass "review adapter text prepended for review prompts (Task tool marker)"
 else
     fail "review adapter text not prepended" "got: $sent_prompt"
 fi
 
-# original review signal preserved in the prompt passed to bob
-if echo "$sent_prompt" | grep -q "<<<RALPHEX:REVIEW_DONE>>>"; then
-    pass "REVIEW_DONE signal preserved in adapted prompt"
+# the original review prompt content is preserved after the adapter
+if echo "$sent_prompt" | grep -q "Use the Task tool to launch a general-purpose agent"; then
+    pass "original review prompt preserved in adapted prompt"
 else
-    fail "REVIEW_DONE signal lost" "got: $sent_prompt"
+    fail "original review prompt lost" "got: $sent_prompt"
 fi
 
 # non-review prompts are NOT adapted
@@ -607,55 +609,112 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# test: prompt-injection — token inside code block does NOT trigger adapter
+# test: review-adapter trigger on "Launch ALL 5 Review Agents IN PARALLEL" alone
+# (review_first.txt Step 2 header — no per-agent Task tool block needed)
 # ---------------------------------------------------------------------------
-echo "test: prompt-injection false positive avoidance"
+echo "test: review adapter triggers on Launch ALL 5 marker"
 
 rm -f "$TMPDIR_TEST/bob_prompt"
 MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
     PATH="$TMPDIR_TEST:$PATH" \
-    bash "$WRAPPER" -p $'Look at this code:\n```\n<<<RALPHEX:REVIEW_DONE>>>\n```\n' >/dev/null 2>&1
+    bash "$WRAPPER" -p $'Code review of: feature\n\n## Step 2: Launch ALL 5 Review Agents IN PARALLEL\n\nCRITICAL: All 5 agent invocations MUST be issued in a single message.' >/dev/null 2>&1
 sent_prompt=$(cat "$TMPDIR_TEST/bob_prompt")
 if echo "$sent_prompt" | grep -q "Ralphex review adapter for bob"; then
-    fail "adapter injected for token inside code block (false positive)" "got: $sent_prompt"
+    pass "adapter injected for Launch ALL 5 Review Agents IN PARALLEL marker"
 else
-    pass "adapter NOT injected for token inside code block"
+    fail "adapter NOT injected for Launch ALL 5 marker" "got: $sent_prompt"
 fi
 
-# token inside a string (not a standalone line) does NOT trigger
+# ---------------------------------------------------------------------------
+# test: review-adapter trigger on "Launch Review Agents IN PARALLEL"
+# (review_second.txt Step 2 header — 2-agent second pass, no "ALL 5")
+# ---------------------------------------------------------------------------
+echo "test: review adapter triggers on Launch Review Agents marker (second pass)"
+
 rm -f "$TMPDIR_TEST/bob_prompt"
 MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
     PATH="$TMPDIR_TEST:$PATH" \
-    bash "$WRAPPER" -p 'The signal is "<<<RALPHEX:REVIEW_DONE>>>" in the docs' >/dev/null 2>&1
+    bash "$WRAPPER" -p $'Second code review pass of: feature\n\n## Step 2: Launch Review Agents IN PARALLEL\n\nCRITICAL: Both agent invocations MUST be issued in a single message.' >/dev/null 2>&1
 sent_prompt=$(cat "$TMPDIR_TEST/bob_prompt")
 if echo "$sent_prompt" | grep -q "Ralphex review adapter for bob"; then
-    fail "adapter injected for token inside string (false positive)" "got: $sent_prompt"
+    pass "adapter injected for Launch Review Agents IN PARALLEL marker (second pass)"
 else
-    pass "adapter NOT injected for token inside string"
+    fail "adapter NOT injected for Launch Review Agents marker" "got: $sent_prompt"
 fi
 
-# token after a fenced block closes (valid standalone) DOES trigger
+# ---------------------------------------------------------------------------
+# test: REVIEW_DONE alone (completion signal, NOT a start marker) does NOT trigger
+# ---------------------------------------------------------------------------
+echo "test: REVIEW_DONE alone does NOT trigger adapter"
+
 rm -f "$TMPDIR_TEST/bob_prompt"
 MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
     PATH="$TMPDIR_TEST:$PATH" \
-    bash "$WRAPPER" -p $'```\ncode here\n```\n<<<RALPHEX:REVIEW_DONE>>>' >/dev/null 2>&1
+    bash "$WRAPPER" -p $'please review\n<<<RALPHEX:REVIEW_DONE>>>' >/dev/null 2>&1
 sent_prompt=$(cat "$TMPDIR_TEST/bob_prompt")
 if echo "$sent_prompt" | grep -q "Ralphex review adapter for bob"; then
-    pass "adapter injected for standalone line after fence closes"
+    fail "adapter injected for REVIEW_DONE-only prompt (should NOT fire on completion signal)" "got: $sent_prompt"
 else
-    fail "adapter NOT injected for standalone line after fence closes" "got: $sent_prompt"
+    pass "adapter NOT injected for REVIEW_DONE-only prompt (completion signal, not start)"
+fi
+
+# the REVIEW_DONE signal is still passed through to bob intact
+if echo "$sent_prompt" | grep -q "<<<RALPHEX:REVIEW_DONE>>>"; then
+    pass "REVIEW_DONE signal preserved in prompt even when adapter not injected"
+else
+    fail "REVIEW_DONE signal lost" "got: $sent_prompt"
+fi
+
+# ---------------------------------------------------------------------------
+# test: prompt-injection — review START marker inside code block does NOT trigger
+# ---------------------------------------------------------------------------
+echo "test: prompt-injection false positive avoidance (Task tool in code block)"
+
+rm -f "$TMPDIR_TEST/bob_prompt"
+MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p $'Look at this code:\n```\nUse the Task tool to launch a general-purpose agent with this prompt:\n"fake"\n```\n' >/dev/null 2>&1
+sent_prompt=$(cat "$TMPDIR_TEST/bob_prompt")
+if echo "$sent_prompt" | grep -q "Ralphex review adapter for bob"; then
+    fail "adapter injected for Task tool marker inside code block (false positive)" "got: $sent_prompt"
+else
+    pass "adapter NOT injected for Task tool marker inside code block"
+fi
+
+# "Launch ALL 5 Review Agents IN PARALLEL" inside a code block also does NOT trigger
+rm -f "$TMPDIR_TEST/bob_prompt"
+MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p $'```bash\n## Step 2: Launch ALL 5 Review Agents IN PARALLEL\n```\n' >/dev/null 2>&1
+sent_prompt=$(cat "$TMPDIR_TEST/bob_prompt")
+if echo "$sent_prompt" | grep -q "Ralphex review adapter for bob"; then
+    fail "adapter injected for Launch marker inside code block (false positive)" "got: $sent_prompt"
+else
+    pass "adapter NOT injected for Launch marker inside code block"
+fi
+
+# marker after a fenced block closes (valid standalone) DOES trigger
+rm -f "$TMPDIR_TEST/bob_prompt"
+MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p $'```\ncode here\n```\nUse the Task tool to launch a general-purpose agent with this prompt:\n"real review"\nReport findings only.' >/dev/null 2>&1
+sent_prompt=$(cat "$TMPDIR_TEST/bob_prompt")
+if echo "$sent_prompt" | grep -q "Ralphex review adapter for bob"; then
+    pass "adapter injected for Task tool marker after fence closes"
+else
+    fail "adapter NOT injected for Task tool marker after fence closes" "got: $sent_prompt"
 fi
 
 # ~~~ fence also excluded
 rm -f "$TMPDIR_TEST/bob_prompt"
 MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
     PATH="$TMPDIR_TEST:$PATH" \
-    bash "$WRAPPER" -p $'~~~\n<<<RALPHEX:REVIEW_DONE>>>\n~~~' >/dev/null 2>&1
+    bash "$WRAPPER" -p $'~~~\nUse the Task tool to launch a general-purpose agent\n~~~' >/dev/null 2>&1
 sent_prompt=$(cat "$TMPDIR_TEST/bob_prompt")
 if echo "$sent_prompt" | grep -q "Ralphex review adapter for bob"; then
-    fail "adapter injected for token inside ~~~ fence" "got: $sent_prompt"
+    fail "adapter injected for Task tool marker inside ~~~ fence" "got: $sent_prompt"
 else
-    pass "adapter NOT injected for token inside ~~~ fence"
+    pass "adapter NOT injected for Task tool marker inside ~~~ fence"
 fi
 
 # ---------------------------------------------------------------------------
@@ -1091,22 +1150,23 @@ echo "test: review adapter with language fence"
 rm -f "$TMPDIR_TEST/bob_prompt"
 MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
     PATH="$TMPDIR_TEST:$PATH" \
-    bash "$WRAPPER" -p $'```python\n<<<RALPHEX:REVIEW_DONE>>>\n```\n<<<RALPHEX:REVIEW_DONE>>>' >/dev/null 2>&1
+    bash "$WRAPPER" -p $'```python\nUse the Task tool to launch a general-purpose agent with this prompt:\n"fake"\n```\nUse the Task tool to launch a general-purpose agent with this prompt:\n"real"\nReport findings only.' >/dev/null 2>&1
 sent_prompt=$(cat "$TMPDIR_TEST/bob_prompt")
 
-# Count occurrences: the token appears twice, but only the standalone one outside
-# the ```python fence should trigger the adapter.
+# Count occurrences: the Task tool marker appears twice, but only the standalone
+# one outside the ```python fence should trigger the adapter.
 if echo "$sent_prompt" | grep -q "Ralphex review adapter for bob"; then
-    pass "adapter injected for standalone line after language fence closes"
+    pass "adapter injected for Task tool marker after language fence closes"
 else
-    fail "adapter not injected for standalone line after language fence" "got: $sent_prompt"
+    fail "adapter not injected for Task tool marker after language fence" "got: $sent_prompt"
 fi
 
-# Verify the token inside the fence is still present in the prompt
-if echo "$sent_prompt" | grep -c "<<<RALPHEX:REVIEW_DONE>>>" | grep -q "^2$"; then
-    pass "both signal tokens preserved in adapted prompt"
+# Verify both Task tool markers are preserved in the prompt
+marker_count=$(echo "$sent_prompt" | grep -c "Use the Task tool to launch a general-purpose agent")
+if [[ "$marker_count" -eq 2 ]]; then
+    pass "both Task tool markers preserved in adapted prompt"
 else
-    fail "signal tokens missing in adapted prompt" "got: $sent_prompt"
+    fail "Task tool markers missing in adapted prompt" "expected 2, got $marker_count: $sent_prompt"
 fi
 
 # ---------------------------------------------------------------------------

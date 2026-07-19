@@ -24,11 +24,25 @@
 # is passed). bob rejects unknown flags with exit 1 (e.g. `bob --effort high` exits 1),
 # so stripping --effort is mandatory, not cosmetic.
 #
-# NOTE on review-adapter trigger: the adapter is prepended ONLY when the exact standalone
-# line `<<<RALPHEX:REVIEW_DONE>>>` appears in the prompt. It is NOT triggered by the token
-# appearing inside code blocks, strings, or other embedded contexts. This avoids prompt-
-# injection false positives where a review string is mentioned but no actual review is
-# requested.
+# NOTE on review-adapter trigger: the adapter is prepended when a review START marker
+# appears in the prompt OUTSIDE any fenced code block (``` ... ``` or ~~~ ... ~~~).
+# Start markers are the strings ralphex's review prompts emit at the BEGINNING of a
+# review pass:
+#   - "Use the Task tool to launch"   (per-agent, from {{agent:NAME}} expansion under
+#                                     the claude executor; see pkg/processor/prompts.go
+#                                     formatAgentExpansionClaude)
+#   - "Launch ALL 5 Review Agents IN PARALLEL"  (review_first.txt Step 2 header)
+#   - "Launch Review Agents IN PARALLEL"         (review_second.txt Step 2 header;
+#     matched by the regex `Launch.*Review Agents IN PARALLEL`)
+# The completion signal `<<<RALPHEX:REVIEW_DONE>>>` is NOT a start marker — it appears
+# at the END of a review iteration (Path A: no issues found) and is emitted by bob as
+# output, not received as a prompt. Triggering on it would fire the adapter on the
+# *next* iteration's prompt only if that prompt happened to quote the signal, and would
+# also fire on a prompt that merely mentions the token (e.g. in docs). The adapter
+# therefore does NOT trigger on REVIEW_DONE alone.
+# The fence-state guard rejects markers inside ```/~~~ blocks, so a prompt that quotes
+# a review marker inside a code block (e.g. documentation describing the wrapper) does
+# not produce a false positive.
 
 set -euo pipefail
 
@@ -95,22 +109,65 @@ if [[ -n "$effort_flag" ]]; then
 fi
 
 # detect review prompts and prepend a bob-appropriate adapter.
-# bob exposes no parallel sub-agents, so instruct sequential per-agent review.
+# bob exposes no parallel sub-agents (no Task tool, no spawn_agent/wait_agent), so the
+# adapter rewrites the parallel review-agent flow into a sequential one bob can execute.
 #
-# STRICT TRIGGER: only prepend the adapter when `<<<RALPHEX:REVIEW_DONE>>>` appears as a
-# standalone line in the prompt AND that line is NOT inside a fenced code block
-# (``` ... ``` or ~~~ ... ~~~). This avoids false positives where the token appears inside
-# code blocks, strings, or other embedded contexts (prompt-injection defense). A standalone
-# line check alone is not enough: a fenced code block can contain the token on its own line.
-# We track fence state (toggling on ```/~~~ delimiters) and only consider lines outside any
-# fence. Inline forms (token inside a longer line, inside a string, etc.) are also rejected
-# by the `-x` (exact-match) flag on grep.
+# STRICT TRIGGER: prepend the adapter only when a review START marker appears in the
+# prompt OUTSIDE any fenced code block (``` ... ``` or ~~~ ... ~~~). Start markers:
+#   - "Use the Task tool to launch"   (per-agent {{agent:NAME}} expansion under claude)
+#   - a line matching `Launch.*Review Agents IN PARALLEL` (review_first/review_second
+#     Step 2 headers)
+# The fence-state guard prevents false positives where a marker is quoted inside a code
+# block (e.g. documentation describing the wrapper). REVIEW_DONE is intentionally NOT a
+# trigger: it is a completion signal emitted at the END of a review, not a start marker.
+# Tracking fence state (toggling on ```/~~~ delimiters) is required because a fenced code
+# block can contain a marker on its own line; a standalone-line check alone is not enough.
 if printf '%s\n' "$prompt" | awk '
     /^[[:space:]]*```/ || /^[[:space:]]*~~~/ { in_fence = !in_fence; next }
-    !in_fence && $0 == "<<<RALPHEX:REVIEW_DONE>>>" { found=1; exit }
+    !in_fence && /Use the Task tool to launch/ { found=1; exit }
+    !in_fence && /Launch.*Review Agents IN PARALLEL/ { found=1; exit }
     END { exit !found }
 '; then
-    adapter_text=$'Ralphex review adapter for bob:\n- Interpret review "Task tool" instructions as sequential steps: perform each review agent\'s work one at a time.\n- bob does not support parallel sub-agents, so execute each review task sequentially using bob\'s read, bash, edit, and write tools.\n- Apply fixes after completing all review steps.\n- Keep original review workflow and all <<<RALPHEX:...>>> signals unchanged.'
+    # build the adapter via a quoted heredoc: avoids $'...' backslash-escaping pitfalls
+    # for the apostrophes (bob's, agent's) and the embedded `git commit -m "..."` quote.
+    adapter_text=$(cat <<'ADAPTER_EOF'
+Ralphex review adapter for bob:
+You are running a ralphex code review under the bob CLI. bob has no Task tool, no
+spawn_agent, and no wait_agent — the parallel sub-agent instructions in this prompt
+cannot be executed as written. Translate them into a sequential workflow instead.
+
+For EACH block of the form:
+  Use the Task tool... to launch a ... agent with this prompt:
+  "<agent prompt>"
+  Report findings only - no positive observations.
+do the following, one agent at a time:
+  1. Read the agent prompt between the quotes.
+  2. Perform that agent review work yourself, sequentially, using bob's read, bash,
+     edit, and write tools. Run the git commands the agent prompt tells you to run,
+     read the files it tells you to read, and apply the agent's review criteria.
+  3. Collect that agent's findings (bugs, test gaps, smells, docs issues, etc.).
+  4. Move on to the next agent block. Do NOT try to launch a sub-agent — do the work
+     directly with your own tools.
+
+After ALL review agent blocks have been executed sequentially:
+  - Merge and deduplicate findings across agents (same file:line + same issue = one
+    finding; note both source agents).
+  - Verify every finding against the actual code (read the file at file:line, check
+    20-30 lines of context, confirm the issue is real and not a false positive).
+  - Classify each as CONFIRMED (real, fix it) or FALSE POSITIVE (discard).
+  - Fix all CONFIRMED issues using bob's edit/write tools, run tests and linter to
+    verify, and commit with: git commit -m "fix: address code review findings"
+
+Then follow the original review prompt's signal logic in Step 4 unchanged:
+  - If this iteration found ZERO confirmed issues: output <<<RALPHEX:REVIEW_DONE>>>
+  - If issues were found AND fixed: STOP, output NO signal (the external loop runs
+    another review iteration to verify your fixes).
+  - If issues were found but cannot be fixed: output <<<RALPHEX:TASK_FAILED>>>
+
+Keep the original review workflow and ALL <<<RALPHEX:...>>> signals unchanged. Do NOT
+attempt to call Task tool, spawn_agent, or wait_agent — they do not exist in bob.
+ADAPTER_EOF
+)
     prompt="$adapter_text"$'\n\n'"$prompt"
 fi
 
