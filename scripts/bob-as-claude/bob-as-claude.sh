@@ -106,7 +106,7 @@ fi
 # fence. Inline forms (token inside a longer line, inside a string, etc.) are also rejected
 # by the `-x` (exact-match) flag on grep.
 if printf '%s\n' "$prompt" | awk '
-    /^```/ || /^~~~/ { in_fence = !in_fence; next }
+    /^[[:space:]]*```/ || /^[[:space:]]*~~~/ { in_fence = !in_fence; next }
     !in_fence && $0 == "<<<RALPHEX:REVIEW_DONE>>>" { found=1; exit }
     END { exit !found }
 '; then
@@ -123,8 +123,19 @@ bob_args=(--chat-mode "$BOB_CHAT_MODE" --output-format stream-json --hide-interm
 # append caller-supplied extra args (word-split). guard on element count, not the raw
 # string, so a whitespace-only value does not trip `set -u` on bash 3.2 (macOS system bash).
 if [[ -n "$BOB_EXTRA_ARGS" ]]; then
+    # NOTE: BOB_EXTRA_ARGS undergoes bash word-splitting via `read -ra`. This means:
+    #   - Quotes inside the value are NOT preserved.
+    #   - Arguments are passed literally: globs (*, ?, [...]) and command
+    #     substitution ($(...)) in the value are NOT expanded when the wrapper
+    #     appends them with the quoted expansion `"${bob_extra_args[@]}"`.
+    #     (They would only expand if the expansion were unquoted, which it is not.)
+    # Only use BOB_EXTRA_ARGS for simple flags like "--max-coins 100".
+    # For arguments containing spaces, quotes, or shell-sensitive characters,
+    # use a dedicated wrapper script instead.
     read -ra bob_extra_args <<< "$BOB_EXTRA_ARGS"
-    [[ ${#bob_extra_args[@]} -gt 0 ]] && bob_args+=("${bob_extra_args[@]}")
+    for arg in "${bob_extra_args[@]}"; do
+        [[ -n "$arg" ]] && bob_args+=("$arg")
+    done
 fi
 
 # all temp files live in one private directory: a single rm -rf cleans up, and the private
@@ -194,7 +205,11 @@ jq -Rcn --unbuffered --argjson verbose "$BOB_VERBOSE" '
         {buf: "", out: []};
         if $e.type == "tool_use" and ($e.tool_name // "") == "attempt_completion" then
             (($e.parameters.result // "") | tostring | split("\n")) as $parts
-            | {buf: "", out: ($parts[0:-1] | map(emit(. + "\n")))}
+            | if ($parts[-1] // "") == "" then
+                {buf: "", out: ($parts[0:-1] | map(emit(. + "\n")))}
+              else
+                {buf: "", out: ($parts | map(emit(. + "\n")))}
+              end
         elif $e.type == "result" then
             {buf: "", out: [{type: "result", result: ""}]}
         elif $e.type == "__eof__" then
@@ -217,6 +232,7 @@ wait "$jq_pid" || true
 # wait for bob to finish and capture its exit code
 bob_exit=0
 wait "$bob_pid" || bob_exit=$?
+trap - TERM  # disable the signal trap now that bob has finished
 bob_pid=""
 
 # emit stderr as content_block_delta events so ralphex error/limit pattern detection

@@ -48,6 +48,7 @@ scripts/copilot-as-claude/ # GitHub Copilot CLI wrapper for Claude-compatible ou
 scripts/gemini-as-claude/ # gemini wrapper for Claude-compatible output
 scripts/agy-as-claude/ # Antigravity (agy) CLI wrapper for Claude-compatible output
 scripts/pi-as-claude/ # pi wrapper for Claude-compatible output
+scripts/bob-as-claude/ # IBM Bob Shell CLI wrapper for Claude-compatible output
 scripts/hg2git/     # Mercurial-to-git translation script with tests
 scripts/opencode/   # opencode wrapper scripts with tests
 scripts/internal/   # internal dev/CI scripts (prep-toy-test, init-docker, etc.)
@@ -108,14 +109,16 @@ Key files:
 
 ### Alternative Providers for Claude Phases
 
-`claude_command`/`claude_args` replace Claude Code with any `stream-json`-compatible CLI. Included wrappers: `scripts/codex-as-claude/codex-as-claude.sh`, `scripts/copilot-as-claude/copilot-as-claude.sh`, `scripts/gemini-as-claude/gemini-as-claude.sh`, `scripts/agy-as-claude/agy-as-claude.sh`, `scripts/opencode/opencode-as-claude.sh`, `scripts/pi-as-claude/pi-as-claude.sh`. Wrappers must ignore unknown flags gracefully (`*) shift ;;`) — default Claude flags may still be passed via config fallback. See `docs/custom-providers.md`.
+`claude_command`/`claude_args` replace Claude Code with any `stream-json`-compatible CLI. Included wrappers: `scripts/codex-as-claude/codex-as-claude.sh`, `scripts/copilot-as-claude/copilot-as-claude.sh`, `scripts/gemini-as-claude/gemini-as-claude.sh`, `scripts/agy-as-claude/agy-as-claude.sh`, `scripts/opencode/opencode-as-claude.sh`, `scripts/pi-as-claude/pi-as-claude.sh`, `scripts/bob-as-claude/bob-as-claude.sh`. Wrappers must ignore unknown flags gracefully (`*) shift ;;`) — default Claude flags may still be passed via config fallback. See `docs/custom-providers.md`.
 
 Env vars:
 - Codex: `CODEX_MODEL`, `CODEX_SANDBOX`, `CODEX_VERBOSE`
 - Copilot: `COPILOT_MODEL`, `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN`
 - pi: `PI_PROVIDER`, `PI_MODEL`, `PI_THINKING`, `PI_VERBOSE`, `PI_EXTRA_ARGS`
+- bob: `BOB_CHAT_MODE`, `BOB_MODEL`, `BOB_VERBOSE`, `BOB_EXTRA_ARGS`
 Copilot wrapper: native autopilot mode — `--autopilot --no-ask-user --allow-all` for task/review, `--autopilot --allow-all` for plan runs (so `QUESTION` signals surface).
 pi wrapper: line-buffers pi's token-level text deltas so `<<<RALPHEX:...>>>` signals land intact in one `content_block_delta`; suppressed events emit empty keepalive deltas so `idle_timeout` doesn't fire during silent tool runs; literal `<<<RALPHEX:` on re-emitted stderr is neutralized to `<<< RALPHEX:`; the prompt reaches pi via stdin (temp-file redirect), never argv; translation jq runs in the background with an interruptible `wait` so the TERM-forwarding trap fires while pi is alive. Task/review phases only — plan creation mode has no pi adapter.
+bob wrapper: runs bob with `--chat-mode <mode> --output-format stream-json --hide-intermediary-output --yolo --trust`, extracts the complete result from `attempt_completion.parameters.result`, and emits line-level `content_block_delta` events plus a `result`; suppressed events emit empty keepalive deltas; stderr is re-emitted with `<<<RALPHEX:` neutralized. `--model` is forwarded to bob's `-m` (bob 1.0.6+), `--effort` is stripped. Review adapter is prepended only when `<<<RALPHEX:REVIEW_DONE>>>` appears as a standalone line outside fenced code blocks. Task/review phases only — plan creation mode has no bob adapter.
 
 ### AWS Bedrock Provider (Docker Wrapper Only)
 

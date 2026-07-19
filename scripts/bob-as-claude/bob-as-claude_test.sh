@@ -63,6 +63,26 @@ MOCK_EOF
     echo "$mock_script"
 }
 
+# A second mock that records each argv element on its own line (via printf) so
+# word-splitting can be asserted (echo "$@" would re-join with spaces). This
+# mock writes to bob_args_lines, not bob_args.
+# IMPORTANT: create_mock_bob writes via `cat > "$TMPDIR_TEST/bob"`, which FOLLOWS
+# the bob->bob_lines symlink and overwrites bob_lines itself. So after any call
+# to create_mock_bob, bob_lines is corrupted (replaced by the standard mock).
+# Any test needing the line-recording mock MUST call this helper to recreate
+# bob_lines before re-symlinking bob -> bob_lines.
+create_bob_lines_mock() {
+    cat > "$TMPDIR_TEST/bob_lines" << 'LINES_EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$@" > "$TMPDIR_TEST/bob_args_lines"
+cat > /dev/null  # consume stdin
+cat "$MOCK_STDOUT_FILE"
+exit 0
+LINES_EOF
+    chmod +x "$TMPDIR_TEST/bob_lines"
+    ln -sf "$TMPDIR_TEST/bob_lines" "$TMPDIR_TEST/bob"
+}
+
 create_mock_bob > /dev/null
 
 # minimal valid bob event stream: one attempt_completion produces output.
@@ -271,7 +291,12 @@ MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
     BOB_EXTRA_ARGS='--flag "a b"' \
     PATH="$TMPDIR_TEST:$PATH" \
     bash "$WRAPPER" -p "test prompt" >/dev/null 2>&1
-# restore the standard mock for subsequent tests
+# restore the standard mock for subsequent tests.
+# NOTE: create_mock_bob writes via `cat > "$TMPDIR_TEST/bob"`, which FOLLOWS the
+# symlink and overwrites bob_lines itself. Any later test that re-symlinks bob
+# -> bob_lines would inherit the standard mock (writing bob_args, not
+# bob_args_lines). Tests below that need the line-recording mock must recreate
+# bob_lines before re-symlinking.
 create_mock_bob > /dev/null
 # The args should be split into 3 lines: --flag, "a, b"
 args_line_count=$(wc -l < "$TMPDIR_TEST/bob_args_lines" | tr -d ' ')
@@ -1032,6 +1057,122 @@ if grep -q "jq is required" "$TMPDIR_TEST/no_jq_err"; then
     pass "error message mentions jq requirement"
 else
     fail "no error about missing jq" "stderr: $(cat "$TMPDIR_TEST/no_jq_err")"
+fi
+
+# ---------------------------------------------------------------------------
+# test: trailing newline edge case — result without trailing newline
+# ---------------------------------------------------------------------------
+echo "test: attempt_completion result without trailing newline"
+
+cat > "$TMPDIR_TEST/no_trailing_newline.jsonl" << 'EOF'
+{"type":"tool_use","timestamp":"t","tool_name":"attempt_completion","tool_id":"tool-1","parameters":{"result":"line one\nline two"}}
+{"type":"result","timestamp":"t","status":"success","stats":{}}
+EOF
+
+output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/no_trailing_newline.jsonl" \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "test prompt" 2>/dev/null)
+
+line_one=$(echo "$output" | grep '"content_block_delta"' \
+    | jq -rc 'select(.delta.text == "line one\n") | .delta.text' 2>/dev/null)
+line_two=$(echo "$output" | grep '"content_block_delta"' \
+    | jq -rc 'select(.delta.text == "line two\n") | .delta.text' 2>/dev/null)
+if [[ -n "$line_one" && -n "$line_two" ]]; then
+    pass "result without trailing newline preserves last line"
+else
+    fail "last line lost when result lacks trailing newline" "got: $output"
+fi
+
+# ---------------------------------------------------------------------------
+# test: review-adapter trigger with language-specified fence
+# ---------------------------------------------------------------------------
+echo "test: review adapter with language fence"
+
+rm -f "$TMPDIR_TEST/bob_prompt"
+MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p $'```python\n<<<RALPHEX:REVIEW_DONE>>>\n```\n<<<RALPHEX:REVIEW_DONE>>>' >/dev/null 2>&1
+sent_prompt=$(cat "$TMPDIR_TEST/bob_prompt")
+
+# Count occurrences: the token appears twice, but only the standalone one outside
+# the ```python fence should trigger the adapter.
+if echo "$sent_prompt" | grep -q "Ralphex review adapter for bob"; then
+    pass "adapter injected for standalone line after language fence closes"
+else
+    fail "adapter not injected for standalone line after language fence" "got: $sent_prompt"
+fi
+
+# Verify the token inside the fence is still present in the prompt
+if echo "$sent_prompt" | grep -c "<<<RALPHEX:REVIEW_DONE>>>" | grep -q "^2$"; then
+    pass "both signal tokens preserved in adapted prompt"
+else
+    fail "signal tokens missing in adapted prompt" "got: $sent_prompt"
+fi
+
+# ---------------------------------------------------------------------------
+# test: BOB_EXTRA_ARGS does not expand globs or command substitution
+# ---------------------------------------------------------------------------
+echo "test: BOB_EXTRA_ARGS literal passthrough (no glob expansion)"
+
+# Create files that would match if the glob expanded.
+touch "$TMPDIR_TEST/should_not_expand.txt"
+rm -f "$TMPDIR_TEST/bob_args_lines"
+# recreate the line-recording mock: create_mock_bob (called after the word-split
+# test above) followed the bob->bob_lines symlink and overwrote bob_lines with
+# the standard mock, so a bare `ln -sf bob_lines bob` would inherit the wrong
+# mock. create_bob_lines_mock rewrites bob_lines AND re-symlinks bob to it.
+create_bob_lines_mock
+(
+    cd "$TMPDIR_TEST"
+    export MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt"
+    BOB_EXTRA_ARGS='--file *.txt' \
+        PATH="$TMPDIR_TEST:$PATH" \
+        bash "$WRAPPER" -p "test prompt" >/dev/null 2>&1
+)
+# restore the standard mock for subsequent tests
+create_mock_bob > /dev/null
+
+if [[ -f "$TMPDIR_TEST/bob_args_lines" ]]; then
+    # The wrapper uses quoted array expansion, so *.txt should remain literal.
+    if grep -qx -- '\*.txt' "$TMPDIR_TEST/bob_args_lines" || grep -qx -- '*.txt' "$TMPDIR_TEST/bob_args_lines"; then
+        pass "BOB_EXTRA_ARGS passes *.txt literally (no glob expansion)"
+    else
+        fail "BOB_EXTRA_ARGS glob expansion unexpected" "lines: $(cat "$TMPDIR_TEST/bob_args_lines")"
+    fi
+else
+    fail "BOB_EXTRA_ARGS literal test did not record args"
+fi
+
+# Command substitution inside BOB_EXTRA_ARGS should also stay literal.
+rm -f "$TMPDIR_TEST/bob_args_lines"
+# recreate the line-recording mock (create_mock_bob above corrupted bob_lines).
+create_bob_lines_mock
+(
+    cd "$TMPDIR_TEST"
+    export MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt"
+    BOB_EXTRA_ARGS='--label $(echo pwned)' \
+        PATH="$TMPDIR_TEST:$PATH" \
+        bash "$WRAPPER" -p "test prompt" >/dev/null 2>&1
+)
+create_mock_bob > /dev/null
+
+if [[ -f "$TMPDIR_TEST/bob_args_lines" ]]; then
+    # With quoted expansion, command substitution does NOT occur: the $, (, and
+    # ) survive as literal characters. The wrapper word-splits BOB_EXTRA_ARGS on
+    # whitespace (documented limitation: quotes/spaces are not preserved), so
+    # '$(echo pwned)' becomes two argv tokens: '$(echo' and 'pwned)'. If command
+    # substitution HAD occurred, we would see 'pwned' alone (no $ or parens).
+    # Verify both literal tokens are present (no substitution) and that the
+    # substituted form 'pwned' alone is NOT present.
+    if grep -qx -- '$(echo' "$TMPDIR_TEST/bob_args_lines" \
+        && grep -qx -- 'pwned)' "$TMPDIR_TEST/bob_args_lines" \
+        && ! grep -qx -- 'pwned' "$TMPDIR_TEST/bob_args_lines"; then
+        pass "BOB_EXTRA_ARGS passes \$(echo pwned) literally (no command substitution)"
+    else
+        fail "BOB_EXTRA_ARGS command substitution unexpected" "lines: $(cat "$TMPDIR_TEST/bob_args_lines")"
+    fi
+else
+    fail "BOB_EXTRA_ARGS command-substitution test did not record args"
 fi
 
 # ---------------------------------------------------------------------------

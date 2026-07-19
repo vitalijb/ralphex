@@ -417,6 +417,86 @@ For review prompts (detected by `<<<RALPHEX:REVIEW_DONE>>>` in the prompt text),
 
 The wrapper covers task and review phases only. Plan creation mode (`ralphex --plan`) has no pi-specific adapter for `QUESTION`/`PLAN_DRAFT` handling (unlike the Copilot wrapper) and is untested with pi.
 
+## IBM Bob Shell CLI wrapper (included example)
+
+The repository includes a wrapper at `scripts/bob-as-claude/bob-as-claude.sh` that translates the IBM Bob Shell CLI's (`bob`) `--output-format stream-json` JSONL event stream to Claude stream-json format. It uses `jq` for JSON parsing.
+
+The wrapper runs bob with `--chat-mode <mode> --output-format stream-json --hide-intermediary-output --yolo --trust` and passes the prompt on stdin (avoiding the per-arg command-line length cap). With `--hide-intermediary-output`, bob emits only lifecycle events plus a final `attempt_completion` tool event; the wrapper extracts the complete result text from `attempt_completion.parameters.result`, splits it into line-level `content_block_delta` events, and emits a terminal `result` event.
+
+### Setup
+
+```ini
+# in ~/.config/ralphex/config or .ralphex/config
+claude_command = /path/to/scripts/bob-as-claude/bob-as-claude.sh
+```
+
+For a one-off run without editing config:
+
+```bash
+ralphex --claude-command=/path/to/scripts/bob-as-claude/bob-as-claude.sh docs/plans/feature.md
+```
+
+### Environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `BOB_CHAT_MODE` | `code` | bob chat mode: `ask`, `code`, `plan`, or `advanced`. Use `code` for task/review, `plan` for plan creation (untested). |
+| `BOB_MODEL` | (bob default) | Model passed as `-m` when ralphex does not append a `--model` flag. bob 1.0.6+ supports `-m`/`--model`. |
+| `BOB_VERBOSE` | `0` | Set to `1` to include `tool_result` output and `[tool]` markers in the stream (default: only `attempt_completion` result text is shown). |
+| `BOB_EXTRA_ARGS` | (none) | Extra flags appended verbatim to the bob invocation (word-split on whitespace, **no quote preservation**); e.g. `--max-coins 100` to cap spend. |
+
+### Model and effort mapping
+
+ralphex appends `--model <m>` / `--effort <e>` per phase. The wrapper forwards `--model` to bob's `-m`/`--model` (bob 1.0.6+ supports it). `--effort` is **accepted but ignored** — bob has no `--effort` flag, and passing it would make bob exit with an "Unknown argument" error, so the wrapper strips it. A one-line note is printed to stderr when a non-empty `--effort` value is received.
+
+### Chat modes
+
+ralphex does not tell the wrapper which phase it is in, so a single `BOB_CHAT_MODE` applies to all phases driven by the wrapper.
+
+| Mode | Recommended use |
+|---|---|
+| `ask` | Read-only explanations. Note: bob may still invoke tools, including write tools, in `ask` mode. |
+| `code` | Task execution and review that applies fixes (default). |
+| `plan` | Plan creation (`ralphex --plan`). Untested with bob. |
+| `advanced` | Complex multi-step operations. |
+
+### Event translation
+
+The wrapper translates bob JSONL events as follows:
+
+| bob event | Claude event |
+|---|---|
+| `tool_use` + `tool_name == "attempt_completion"` | `content_block_delta` for each line of `parameters.result` |
+| `tool_result` + `status == "error"` | `content_block_delta` with `[tool_error] <output>` (always emitted) |
+| `tool_result` + `status == "success"` | skipped by default; `[tool_result] <output>` when `BOB_VERBOSE=1` |
+| `tool_use` + other tool names | skipped by default; `[tool] <name>` when `BOB_VERBOSE=1` |
+| `init`, `message` (user echo), suppressed events | empty keepalive delta |
+| `result` | `{"type":"result","result":""}` (end of execution) |
+
+bob sometimes emits a bare plaintext line between `tool_result` and `result` (the final answer echo). The wrapper's `jq` pipeline tolerates non-JSON lines, so this line is silently skipped — the same text is already captured from `attempt_completion.parameters.result`.
+
+A fallback `{"type":"result","result":""}` is always emitted, covering bob exiting without a `result` event. Stderr is captured and emitted as `content_block_delta` events after the main stream for error/limit pattern detection, and bob's exit code is preserved. Any literal `<<<RALPHEX:` token on stderr is neutralized first (rewritten to `<<< RALPHEX:` with an inserted space), so a stray signal token echoed in bob diagnostics cannot be mistaken for a real completion signal — rate-limit and `API Error:` phrases pass through verbatim.
+
+### Permissions and sandbox
+
+The wrapper invokes bob with `--yolo --trust` so tool calls are auto-approved and filesystem writes persist on the real FS. If you override this via `BOB_EXTRA_ARGS` (for example with `--sandbox`), bob writes to a sandbox and changes do not persist.
+
+### How it works
+
+```bash
+# bob emits JSONL like:
+{"type":"tool_use","tool_name":"attempt_completion","parameters":{"result":"fixed the bug\n"}}
+{"type":"result","status":"success","stats":{}}
+
+# wrapper translates to:
+{"type":"content_block_delta","delta":{"type":"text_delta","text":"fixed the bug\n"}}
+{"type":"result","result":""}
+```
+
+For review prompts, the wrapper prepends adapter instructions telling bob to execute review agent tasks sequentially using its `read`/`bash`/`edit`/`write` tools, since bob has no parallel sub-agent support. The adapter is only injected when `<<<RALPHEX:REVIEW_DONE>>>` appears as a standalone line outside fenced code blocks.
+
+The wrapper covers task and review phases only. Plan creation mode (`ralphex --plan`) has no bob-specific adapter for `QUESTION`/`PLAN_DRAFT` handling and is untested with bob.
+
 ## Writing your own wrapper
 
 A wrapper script must:
