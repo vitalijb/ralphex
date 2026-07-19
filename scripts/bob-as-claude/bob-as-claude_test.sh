@@ -136,6 +136,22 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# test: prompt via stdin (primary path used by ralphex, without -p flag)
+# ---------------------------------------------------------------------------
+echo "test: prompt via stdin"
+
+rm -f "$TMPDIR_TEST/bob_prompt" "$TMPDIR_TEST/bob_args"
+echo "stdin prompt content" | MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" --dangerously-skip-permissions --output-format stream-json >/dev/null 2>&1
+
+if [[ "$(cat "$TMPDIR_TEST/bob_prompt")" == "stdin prompt content" ]]; then
+    pass "stdin prompt forwarded to bob via stdin"
+else
+    fail "stdin prompt not forwarded to bob" "got: $(cat "$TMPDIR_TEST/bob_prompt")"
+fi
+
+# ---------------------------------------------------------------------------
 # test: --model flag forwarded to bob as -m
 # ---------------------------------------------------------------------------
 echo "test: --model forwarding"
@@ -471,7 +487,14 @@ fi
 # ---------------------------------------------------------------------------
 echo "test: tool_result success verbose"
 
-output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/tool_error_events.jsonl" \
+cat > "$TMPDIR_TEST/tool_success_events.jsonl" << 'EOF'
+{"type":"tool_use","timestamp":"t","tool_name":"bash","tool_id":"tool-1","parameters":{"cmd":"echo ok"}}
+{"type":"tool_result","timestamp":"t","tool_id":"tool-1","status":"success","output":"ok\n"}
+{"type":"tool_use","timestamp":"t","tool_name":"attempt_completion","tool_id":"tool-2","parameters":{"result":"done\n"}}
+{"type":"result","timestamp":"t","status":"success","stats":{}}
+EOF
+
+output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/tool_success_events.jsonl" \
     BOB_VERBOSE=1 \
     PATH="$TMPDIR_TEST:$PATH" \
     bash "$WRAPPER" -p "test prompt" 2>/dev/null)
@@ -483,8 +506,12 @@ else
     fail "tool_use [tool] marker missing with BOB_VERBOSE=1" "got: $output"
 fi
 
-# A success tool_result does not appear in this fixture (only error), but we
-# can verify the verbose tool_use marker is present (covered above).
+# With BOB_VERBOSE=1, the success tool_result emits [tool_result] marker
+if echo "$output" | grep -q "\[tool_result\] ok"; then
+    pass "tool_result success emitted as [tool_result] marker with BOB_VERBOSE=1"
+else
+    fail "tool_result success [tool_result] marker missing with BOB_VERBOSE=1" "got: $output"
+fi
 
 # ---------------------------------------------------------------------------
 # test: tool events skipped by default (BOB_VERBOSE=0)
@@ -1119,6 +1146,44 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# test: awk not found — the review adapter uses awk for fence-state tracking.
+# when awk is missing, the adapter detection must not crash the wrapper; the
+# review prompt should pass through unmodified (no adapter prepended).
+# ---------------------------------------------------------------------------
+echo "test: awk not found"
+
+set +e
+no_awk_bin="$TMPDIR_TEST/no_awk_bin"
+mkdir -p "$no_awk_bin"
+for tool in jq bash mktemp mkfifo cat rm kill env; do
+    tool_path=$(command -v "$tool" 2>/dev/null) && ln -sf "$tool_path" "$no_awk_bin/$tool"
+done
+# include a bob so the failure is attributable to awk, not a missing bob
+ln -sf "$TMPDIR_TEST/bob" "$no_awk_bin/bob"
+# a review prompt that would normally trigger the adapter
+rm -f "$TMPDIR_TEST/bob_prompt"
+MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
+    PATH="$no_awk_bin" \
+    bash "$WRAPPER" -p $'Use the Task tool to launch a general-purpose agent with this prompt:\n"review quality"' >/dev/null 2>&1
+no_awk_exit=$?
+rm -r "$no_awk_bin"
+set -e
+
+if [[ $no_awk_exit -eq 0 ]]; then
+    pass "wrapper exits 0 when awk is missing (adapter skipped, not crashed)"
+else
+    fail "wrapper crashed when awk missing" "got exit $no_awk_exit"
+fi
+
+# the prompt should pass through without the adapter (awk failure = no match)
+sent_prompt=$(cat "$TMPDIR_TEST/bob_prompt" 2>/dev/null || echo "")
+if echo "$sent_prompt" | grep -q "Ralphex review adapter for bob"; then
+    fail "adapter injected despite missing awk (should have been skipped)" "got: $sent_prompt"
+else
+    pass "no adapter injected when awk is missing (graceful degradation)"
+fi
+
+# ---------------------------------------------------------------------------
 # test: trailing newline edge case — result without trailing newline
 # ---------------------------------------------------------------------------
 echo "test: attempt_completion result without trailing newline"
@@ -1140,6 +1205,28 @@ if [[ -n "$line_one" && -n "$line_two" ]]; then
     pass "result without trailing newline preserves last line"
 else
     fail "last line lost when result lacks trailing newline" "got: $output"
+fi
+
+# ---------------------------------------------------------------------------
+# test: __eof__ sentinel flushes buffered text when no result event and no
+# trailing newline on the last line (the jq pipeline's __eof__ handler must
+# emit the buffered partial line, not drop it).
+# ---------------------------------------------------------------------------
+echo "test: __eof__ sentinel flushes buffered text"
+
+cat > "$TMPDIR_TEST/eof_flush_events.jsonl" << 'EOF'
+{"type":"tool_use","timestamp":"t","tool_name":"attempt_completion","tool_id":"tool-1","parameters":{"result":"partial text without newline"}}
+EOF
+
+output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/eof_flush_events.jsonl" \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "test prompt" 2>/dev/null)
+
+# the buffered "partial text without newline" must surface as a content_block_delta
+if echo "$output" | jq -e 'select(.type == "content_block_delta") | .delta.text == "partial text without newline\n"' >/dev/null 2>&1; then
+    pass "__eof__ sentinel flushes buffered text when last line lacks trailing newline"
+else
+    fail "buffered text dropped on eof when last line lacks trailing newline" "got: $output"
 fi
 
 # ---------------------------------------------------------------------------

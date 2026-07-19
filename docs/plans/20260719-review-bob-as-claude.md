@@ -88,9 +88,9 @@ The wrapper is well-implemented, follows all ralphex guidelines, has comprehensi
 **Files:**
 - Modify: `scripts/bob-as-claude/bob-as-claude_test.sh`
 
-- [ ] review test coverage for any edge cases not covered
-- [ ] add tests for any identified gaps
-- [ ] run full test suite - must pass
+- [x] review test coverage for any edge cases not covered
+- [x] add tests for any identified gaps
+- [x] run full test suite - must pass
 
 ### Task 3: Verify documentation consistency
 
