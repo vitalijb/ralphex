@@ -64,11 +64,11 @@ Confirmed findings:
 - Modify: `scripts/bob-as-claude/README.md` (line ~48)
 - Modify: `docs/custom-providers.md` (line ~496, bob section only — do NOT touch the pi section at line ~416)
 
-- [ ] In the `adapter_text` heredoc of `bob-as-claude.sh`, replace `using bob's read, bash, edit, and write tools` with bob's actual tool names per the tools doc, e.g. `using bob's read_file, execute_command, write_to_file, and apply_diff tools`. Keep the rest of the adapter instruction (sequential per-agent review, git commands, criteria, fix/commit) unchanged.
-- [ ] Update README.md line ~48 to use the same corrected tool-name wording.
-- [ ] Update `docs/custom-providers.md` line ~496 (bob review-adapter paragraph) to use the same corrected tool-name wording. Do NOT modify the pi paragraph at line ~416.
-- [ ] Add a unit-test assertion in `bob-as-claude_test.sh` (in the existing review-adapter injection test block) that the prepended adapter text contains bob's actual tool name `read_file` (and `execute_command`), and does NOT contain the old inaccurate phrase `read, bash, edit, and write tools`.
-- [ ] Run `bash scripts/bob-as-claude/bob-as-claude_test.sh` and `bash scripts/bob-as-claude/bob-as-claude_docs_test.sh` — both must pass before Task 4.
+- [x] In the `adapter_text` heredoc of `bob-as-claude.sh`, replace `using bob's read, bash, edit, and write tools` with bob's actual tool names per the tools doc, e.g. `using bob's read_file, execute_command, write_to_file, and apply_diff tools`. Keep the rest of the adapter instruction (sequential per-agent review, git commands, criteria, fix/commit) unchanged.
+- [x] Update README.md line ~48 to use the same corrected tool-name wording.
+- [x] Update `docs/custom-providers.md` line ~496 (bob review-adapter paragraph) to use the same corrected tool-name wording. Do NOT modify the pi paragraph at line ~416.
+- [x] Add a unit-test assertion in `bob-as-claude_test.sh` (in the existing review-adapter injection test block) that the prepended adapter text contains bob's actual tool name `read_file` (and `execute_command`), and does NOT contain the old inaccurate phrase `read, bash, edit, and write tools`.
+- [x] Run `bash scripts/bob-as-claude/bob-as-claude_test.sh` and `bash scripts/bob-as-claude/bob-as-claude_docs_test.sh` — both must pass before Task 4.
 
 ### Task 4: Verify acceptance criteria
 

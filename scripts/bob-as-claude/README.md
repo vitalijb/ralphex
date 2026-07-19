@@ -47,7 +47,7 @@ Custom mode slugs defined in `~/.bob/custom_modes.yaml` (e.g. `shell-debug`) are
 
 ### Review adapter
 
-bob exposes no parallel sub-agents (no `Task` tool, no `spawn_agent`/`wait_agent`), so the wrapper prepends a sequential-review adapter when a review prompt is detected. The adapter instructs bob to interpret each `Use the Task tool to launch a ... agent with this prompt: "..."` block as a sequential review task — perform each agent's review work one at a time using bob's `read`, `bash`, `edit`, and `write` tools, collect findings, verify and fix confirmed issues, then follow the original prompt's `<<<RALPHEX:...>>>` signal logic unchanged.
+bob exposes no parallel sub-agents (no `Task` tool, no `spawn_agent`/`wait_agent`), so the wrapper prepends a sequential-review adapter when a review prompt is detected. The adapter instructs bob to interpret each `Use the Task tool to launch a ... agent with this prompt: "..."` block as a sequential review task — perform each agent's review work one at a time using bob's `read_file`, `execute_command`, `write_to_file`, and `apply_diff` tools, collect findings, verify and fix confirmed issues, then follow the original prompt's `<<<RALPHEX:...>>>` signal logic unchanged.
 
 **Strict trigger:** the adapter is prepended when a review START marker appears in the prompt OUTSIDE any fenced code block (` ``` ` or `~~~`). Start markers are the strings ralphex's review prompts emit at the BEGINNING of a review pass:
 

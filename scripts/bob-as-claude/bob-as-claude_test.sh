@@ -657,6 +657,24 @@ else
     fail "original review prompt lost" "got: $sent_prompt"
 fi
 
+# adapter text must reference bob's actual tool names, not the inaccurate
+# read/bash/edit/write phrasing
+if echo "$sent_prompt" | grep -q "read_file"; then
+    pass "adapter text contains bob tool name read_file"
+else
+    fail "adapter text missing bob tool name read_file" "got: $sent_prompt"
+fi
+if echo "$sent_prompt" | grep -q "execute_command"; then
+    pass "adapter text contains bob tool name execute_command"
+else
+    fail "adapter text missing bob tool name execute_command" "got: $sent_prompt"
+fi
+if echo "$sent_prompt" | grep -q "read, bash, edit, and write tools"; then
+    fail "adapter text still contains old inaccurate phrase 'read, bash, edit, and write tools'" "got: $sent_prompt"
+else
+    pass "adapter text does NOT contain old inaccurate 'read, bash, edit, and write tools' phrase"
+fi
+
 # non-review prompts are NOT adapted
 rm -f "$TMPDIR_TEST/bob_prompt"
 run_wrapper -p "just a task prompt" >/dev/null 2>&1

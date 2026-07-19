@@ -153,8 +153,9 @@ For EACH block of the form:
   Report findings only - no positive observations.
 do the following, one agent at a time:
   1. Read the agent prompt between the quotes.
-  2. Perform that agent review work yourself, sequentially, using bob's read, bash,
-     edit, and write tools. Run the git commands the agent prompt tells you to run,
+  2. Perform that agent review work yourself, sequentially, using bob's read_file,
+     execute_command, write_to_file, and apply_diff tools. Run the git commands the
+     agent prompt tells you to run,
      read the files it tells you to read, and apply the agent's review criteria.
   3. Collect that agent's findings (bugs, test gaps, smells, docs issues, etc.).
   4. Move on to the next agent block. Do NOT try to launch a sub-agent — do the work

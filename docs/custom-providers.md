@@ -495,7 +495,7 @@ The wrapper invokes bob with `--yolo --trust` so tool calls are auto-approved an
 {"type":"result","result":""}
 ```
 
-For review prompts, the wrapper prepends adapter instructions telling bob to execute review agent tasks sequentially using its `read`/`bash`/`edit`/`write` tools, since bob has no parallel sub-agent support (no `Task` tool, no `spawn_agent`/`wait_agent`). The adapter is injected when a review START marker appears in the prompt OUTSIDE fenced code blocks: `Use the Task tool to launch` (per-agent `{{agent:NAME}}` expansion under the claude executor), or a line matching `Launch.*Review Agents IN PARALLEL` (the `review_first.txt` / `review_second.txt` Step 2 headers). The completion signal `<<<RALPHEX:REVIEW_DONE>>>` is NOT a trigger — it is an end-of-review output signal, not a start marker.
+For review prompts, the wrapper prepends adapter instructions telling bob to execute review agent tasks sequentially using its `read_file`/`execute_command`/`write_to_file`/`apply_diff` tools, since bob has no parallel sub-agent support (no `Task` tool, no `spawn_agent`/`wait_agent`). The adapter is injected when a review START marker appears in the prompt OUTSIDE fenced code blocks: `Use the Task tool to launch` (per-agent `{{agent:NAME}}` expansion under the claude executor), or a line matching `Launch.*Review Agents IN PARALLEL` (the `review_first.txt` / `review_second.txt` Step 2 headers). The completion signal `<<<RALPHEX:REVIEW_DONE>>>` is NOT a trigger — it is an end-of-review output signal, not a start marker.
 
 The wrapper covers task and review phases only. Plan creation mode (`ralphex --plan`) has no bob-specific adapter for `QUESTION`/`PLAN_DRAFT` handling and is untested with bob.
 
