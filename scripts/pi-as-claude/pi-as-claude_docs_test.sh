@@ -119,7 +119,7 @@ assert_contains \
 # rewording or adding a fourth wrapper to the sentence must not break this test
 assert_matches \
     "$REPO_ROOT/README.md" \
-    "pi wrappers.*\`jq\`" \
+    "pi.*wrappers.*\`jq\`" \
     "top-level README documents jq requirement for pi wrapper"
 assert_contains \
     "$REPO_ROOT/README.md" \

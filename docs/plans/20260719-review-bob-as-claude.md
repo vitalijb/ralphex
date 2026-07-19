@@ -78,10 +78,10 @@ The wrapper is well-implemented, follows all ralphex guidelines, has comprehensi
 - Run: `scripts/bob-as-claude/bob-as-claude_test.sh`
 - Run: `scripts/bob-as-claude/bob-as-claude_docs_test.sh`
 
-- [ ] run `bash scripts/bob-as-claude/bob-as-claude_test.sh` - all tests must pass
-- [ ] run `bash scripts/bob-as-claude/bob-as-claude_docs_test.sh` - all tests must pass
-- [ ] run `bash scripts/pi-as-claude/pi-as-claude_test.sh` - verify reference tests still pass
-- [ ] run `bash scripts/pi-as-claude/pi-as-claude_docs_test.sh` - verify reference docs tests still pass
+- [x] run `bash scripts/bob-as-claude/bob-as-claude_test.sh` - all tests must pass
+- [x] run `bash scripts/bob-as-claude/bob-as-claude_docs_test.sh` - all tests must pass
+- [x] run `bash scripts/pi-as-claude/pi-as-claude_test.sh` - verify reference tests still pass
+- [x] run `bash scripts/pi-as-claude/pi-as-claude_docs_test.sh` - verify reference docs tests still pass
 
 ### Task 2: Add missing test coverage (if any gaps found)
 
