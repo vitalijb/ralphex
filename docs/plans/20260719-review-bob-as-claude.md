@@ -101,9 +101,9 @@ The wrapper is well-implemented, follows all ralphex guidelines, has comprehensi
 - Modify: `README.md` (if needed)
 - Modify: `llms.txt` (if needed)
 
-- [ ] verify all documentation references to bob-as-claude are accurate
-- [ ] verify the docs test assertions match actual documentation content
-- [ ] run docs test suite - must pass
+- [x] verify all documentation references to bob-as-claude are accurate
+- [x] verify the docs test assertions match actual documentation content
+- [x] run docs test suite - must pass
 
 ### Task 4: Verify acceptance criteria
 
