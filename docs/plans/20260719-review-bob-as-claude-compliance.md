@@ -72,11 +72,11 @@ Confirmed findings:
 
 ### Task 4: Verify acceptance criteria
 
-- [ ] Run `bash scripts/bob-as-claude/bob-as-claude_test.sh` — all tests pass.
-- [ ] Run `bash scripts/bob-as-claude/bob-as-claude_docs_test.sh` — all tests pass.
-- [ ] Confirm `scripts/pi-as-claude/pi-as-claude.sh` and the pi section of `docs/custom-providers.md` (line ~416) are unchanged (grep the pi file's review-adapter line to confirm it still uses the REVIEW_DONE substring trigger — pi is intentionally left as-is per scope).
-- [ ] Run `make test` and `make lint` as a sanity check that no Go-side expectations broke (these wrapper changes are bash/docs only; expected no-op, but confirms nothing else regressed).
-- [ ] Verify CLAUDE.md, README.md, and docs/custom-providers.md bob sections now consistently describe the strict START-marker trigger and bob's actual tool names (no remaining `read, bash, edit, and write` wording in bob sections; no remaining claim that REVIEW_DONE is the trigger).
+- [x] Run `bash scripts/bob-as-claude/bob-as-claude_test.sh` — all tests pass. (88 passed, 0 failed)
+- [x] Run `bash scripts/bob-as-claude/bob-as-claude_docs_test.sh` — all tests pass. (26 passed, 0 failed)
+- [x] Confirm `scripts/pi-as-claude/pi-as-claude.sh` and the pi section of `docs/custom-providers.md` (line ~416) are unchanged (grep the pi file's review-adapter line to confirm it still uses the REVIEW_DONE substring trigger — pi is intentionally left as-is per scope). (pi-as-claude.sh line 90 still uses REVIEW_DONE substring trigger; custom-providers.md line 416 pi section unchanged)
+- [x] Run `make test` and `make lint` as a sanity check that no Go-side expectations broke (these wrapper changes are bash/docs only; expected no-op, but confirms nothing else regressed). (make test: only pre-existing TestAutoPlanModeDetection failure at commit 35b0cf7 — confirmed unrelated to bash/docs changes; no Go files modified. make lint: golangci-lint not installed in environment — environment issue, not caused by changes)
+- [x] Verify CLAUDE.md, README.md, and docs/custom-providers.md bob sections now consistently describe the strict START-marker trigger and bob's actual tool names (no remaining `read, bash, edit, and write` wording in bob sections; no remaining claim that REVIEW_DONE is the trigger). (verified: all three docs use read_file/execute_command/write_to_file/apply_diff and START-marker trigger; no leftover inaccurate wording in bob sections)
 
 ### Task 5: Update documentation inventory
 
