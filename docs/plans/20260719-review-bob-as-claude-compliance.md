@@ -80,5 +80,5 @@ Confirmed findings:
 
 ### Task 5: Update documentation inventory
 
-- [ ] Confirm `llms.txt` and the top-level `README.md` wrapper inventory entries reference only the wrapper path (not behavior), so no update is needed beyond what Tasks 2-3 already made; if any inventory line mentions the chat-mode set or trigger, align it — otherwise leave unchanged.
-- [ ] No new files created; no CLAUDE.md internal-patterns changes beyond the Task 1 trigger-description fix.
+- [x] Confirm `llms.txt` and the top-level `README.md` wrapper inventory entries reference only the wrapper path (not behavior), so no update is needed beyond what Tasks 2-3 already made; if any inventory line mentions the chat-mode set or trigger, align it — otherwise leave unchanged. (llms.txt references only the wrapper path — no alignment needed. Top-level README.md line 1158 mentioned the chat-mode set without custom slug support — aligned to mention custom slugs from `~/.bob/custom_modes.yaml` and the stderr warning, consistent with the bob wrapper README and docs/custom-providers.md. No trigger wording found in either inventory file.)
+- [x] No new files created; no CLAUDE.md internal-patterns changes beyond the Task 1 trigger-description fix. (git diff HEAD~4..HEAD shows only modified files — no new files. CLAUDE.md diff is exactly the one-line trigger-description fix from Task 1; no other CLAUDE.md changes.)

@@ -1155,7 +1155,7 @@ Provider-specific environment variables:
 - `PI_PROVIDER`, `PI_MODEL`, `PI_THINKING` - pi provider, model, and thinking-level selection (used when ralphex does not append `--model`/`--effort`)
 - `PI_VERBOSE` - set to `1` to include tool execution events in the stream (default: `0`, only assistant text is shown)
 - `PI_EXTRA_ARGS` - extra flags appended verbatim to the pi invocation (word-split on whitespace); e.g. `--nolo-mode full` to auto-approve tools in non-interactive runs
-- `BOB_CHAT_MODE`, `BOB_MODEL` - bob chat mode (`ask`/`code`/`plan`/`advanced`, default `code`) and model selection (bob 1.0.6+)
+- `BOB_CHAT_MODE`, `BOB_MODEL` - bob chat mode (built-in: `ask`/`code`/`plan`/`advanced`, default `code`; custom slugs from `~/.bob/custom_modes.yaml` also accepted, with a stderr warning for non-builtin values) and model selection (bob 1.0.6+)
 - `BOB_VERBOSE` - set to `1` to include `tool_result` output and `[tool]` markers in the stream (default: `0`, only `attempt_completion` result text is shown)
 - `BOB_EXTRA_ARGS` - extra flags appended verbatim to the bob invocation (word-split on whitespace, no quote preservation); e.g. `--max-coins 100` to cap spend
 
