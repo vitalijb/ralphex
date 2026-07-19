@@ -404,16 +404,42 @@ fi
 # ---------------------------------------------------------------------------
 echo "test: non-builtin slug warning"
 
-if grep -qi "not a built-in mode" "$TMPDIR_TEST/custom_err"; then
+# re-run the wrapper with a non-builtin slug so this test is self-contained
+rm -f "$TMPDIR_TEST/bob_args"
+set +e
+MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
+    BOB_CHAT_MODE="shell-debug" \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "test prompt" 2>"$TMPDIR_TEST/warn_err" >/dev/null
+warn_exit=$?
+set -e
+
+if grep -qi "not a built-in mode" "$TMPDIR_TEST/warn_err"; then
     pass "non-builtin slug emits warning on stderr"
 else
-    fail "non-builtin slug warning missing" "stderr: $(cat "$TMPDIR_TEST/custom_err")"
+    fail "non-builtin slug warning missing" "stderr: $(cat "$TMPDIR_TEST/warn_err")"
 fi
 
-if echo "$recorded" | grep -q -- "--chat-mode shell-debug" && [[ $custom_exit -eq 0 ]]; then
+warn_recorded=$(cat "$TMPDIR_TEST/bob_args")
+if echo "$warn_recorded" | grep -q -- "--chat-mode shell-debug" && [[ $warn_exit -eq 0 ]]; then
     pass "non-builtin slug proceeds despite warning"
 else
-    fail "non-builtin slug did not proceed" "args: $recorded, exit: $custom_exit"
+    fail "non-builtin slug did not proceed" "args: $warn_recorded, exit: $warn_exit"
+fi
+
+# built-in modes must NOT emit the "not a built-in mode" warning
+set +e
+MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
+    BOB_CHAT_MODE="code" \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "test prompt" 2>"$TMPDIR_TEST/builtin_err" >/dev/null
+builtin_exit=$?
+set -e
+
+if grep -qi "not a built-in mode" "$TMPDIR_TEST/builtin_err"; then
+    fail "built-in mode code emits spurious warning" "stderr: $(cat "$TMPDIR_TEST/builtin_err")"
+else
+    pass "built-in mode code does NOT emit warning"
 fi
 
 # ---------------------------------------------------------------------------
