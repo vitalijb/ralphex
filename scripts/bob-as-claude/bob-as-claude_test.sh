@@ -5,11 +5,15 @@
 #   bash scripts/bob-as-claude/bob-as-claude_test.sh
 #
 # requires: jq, bash, awk
-# uses a mock bob — NO real API calls are made.
+# uses a mock bob — no real api calls are made.
 
 set -euo pipefail
 
+unset BOB_CHAT_MODE BOB_MODEL BOB_VERBOSE BOB_EXTRA_ARGS
+unset BOB_CUSTOM_MODES_FILE MOCK_STDOUT_FILE MOCK_STDERR_FILE MOCK_EXIT_CODE
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 WRAPPER="$SCRIPT_DIR/bob-as-claude.sh"
 TMPDIR_TEST=$(mktemp -d)
 # exported so the wrapper and the mock bob subprocess inherit it without a
@@ -47,27 +51,24 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"reflect"
 	"strings"
 
 	"gopkg.in/yaml.v3"
 )
 
-var requiredFields = []string{
-	"slug",
-	"name",
-	"description",
-	"roleDefinition",
-	"whenToUse",
-	"customInstructions",
-	"groups",
+type modeDocument struct {
+	CustomModes []mode `yaml:"customModes"`
 }
 
-var allowedGroups = map[string]bool{
-	"read":    true,
-	"edit":    true,
-	"command": true,
-	"browser": true,
-	"mcp":     true,
+type mode struct {
+	Slug               string   `yaml:"slug"`
+	Name               string   `yaml:"name"`
+	Description        string   `yaml:"description"`
+	RoleDefinition     string   `yaml:"roleDefinition"`
+	WhenToUse          string   `yaml:"whenToUse"`
+	CustomInstructions string   `yaml:"customInstructions"`
+	Groups             []string `yaml:"groups"`
 }
 
 var ralphexGroups = map[string][]string{
@@ -76,148 +77,119 @@ var ralphexGroups = map[string][]string{
 	"ralphex-plan":   {"read", "command", "browser"},
 }
 
+var requiredInstructions = map[string][]string{
+	"ralphex-task": {
+		"one task at a time",
+		"Commit completed work",
+		"<<<RALPHEX:ALL_TASKS_DONE>>>",
+		"<<<RALPHEX:TASK_FAILED>>>",
+	},
+	"ralphex-review": {
+		"sequentially",
+		"verify every finding",
+		"Fix every confirmed issue",
+		"run the requested tests",
+		"git commit",
+		"<<<RALPHEX:REVIEW_DONE>>>",
+		"<<<RALPHEX:TASK_FAILED>>>",
+	},
+	"ralphex-plan": {
+		"Do not edit source files",
+		"<<<RALPHEX:QUESTION>>>",
+		"<<<RALPHEX:PLAN_DRAFT>>>",
+		"<<<RALPHEX:PLAN_READY>>>",
+	},
+}
+
 func invalid(format string, args ...interface{}) {
 	fmt.Fprintf(os.Stderr, format+"\n", args...)
 	os.Exit(1)
 }
 
-func mapping(node *yaml.Node, label string) map[string]*yaml.Node {
-	if node.Kind != yaml.MappingNode || len(node.Content)%2 != 0 {
-		invalid("%s is not a mapping", label)
-	}
-	fields := make(map[string]*yaml.Node, len(node.Content)/2)
-	for index := 0; index < len(node.Content); index += 2 {
-		key := node.Content[index]
-		if key.Kind != yaml.ScalarNode {
-			invalid("%s has a non-scalar key", label)
-		}
-		if _, exists := fields[key.Value]; exists {
-			invalid("%s has duplicate key %q", label, key.Value)
-		}
-		fields[key.Value] = node.Content[index+1]
-	}
-	return fields
-}
-
-func scalar(fields map[string]*yaml.Node, key string, label string) string {
-	node, ok := fields[key]
-	if !ok || node.Kind != yaml.ScalarNode || strings.TrimSpace(node.Value) == "" {
-		invalid("%s has missing or invalid %s", label, key)
-	}
-	return node.Value
-}
-
-func checkGroups(node *yaml.Node, slug string, strict bool, label string) {
-	if node.Kind != yaml.SequenceNode {
-		invalid("mode %s has non-sequence groups", slug)
-	}
-	groups := make([]string, 0, len(node.Content))
-	seen := make(map[string]bool, len(node.Content))
-	for _, group := range node.Content {
-		if group.Kind != yaml.ScalarNode || !allowedGroups[group.Value] {
-			invalid("mode %s has unsupported tool group %q", slug, group.Value)
-		}
-		if seen[group.Value] {
-			invalid("mode %s has duplicate tool group %q", slug, group.Value)
-		}
-		seen[group.Value] = true
-		groups = append(groups, group.Value)
-	}
-	expected, known := ralphexGroups[slug]
-	if strict && !known {
-		invalid("%s contains unknown strict mode %q", label, slug)
-	}
-	if strict || known && label != "installed override" {
-		if len(groups) != len(expected) {
-			invalid("mode %s has groups %v, expected %v", slug, groups, expected)
-		}
-		for index := range expected {
-			if groups[index] != expected[index] {
-				invalid("mode %s has groups %v, expected %v", slug, groups, expected)
-			}
-		}
-	}
-}
-
-func validate(path string, strict bool, label string) {
+func validate(path string, strict bool) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		invalid("read %s: %v", path, err)
 	}
 	decoder := yaml.NewDecoder(bytes.NewReader(data))
-	var document yaml.Node
+	decoder.KnownFields(strict)
+	var document modeDocument
 	if err := decoder.Decode(&document); err != nil {
 		invalid("parse %s: %v", path, err)
 	}
-	var extra yaml.Node
+	var extra modeDocument
 	if err := decoder.Decode(&extra); err != io.EOF {
 		if err == nil {
 			invalid("%s contains multiple YAML documents", path)
 		}
 		invalid("parse trailing content in %s: %v", path, err)
 	}
-	if document.Kind != yaml.DocumentNode || len(document.Content) != 1 {
-		invalid("%s is not a YAML document", path)
-	}
-	top := mapping(document.Content[0], "top level")
-	modesNode, ok := top["customModes"]
-	if !ok || modesNode.Kind != yaml.SequenceNode || len(modesNode.Content) == 0 {
+	if len(document.CustomModes) == 0 {
 		invalid("%s has no customModes sequence", path)
 	}
-	seenSlugs := make(map[string]bool, len(modesNode.Content))
-	for index, modeNode := range modesNode.Content {
-		modeLabel := fmt.Sprintf("%s mode %d", path, index+1)
-		fields := mapping(modeNode, modeLabel)
-		for _, field := range requiredFields {
-			if field == "groups" {
-				if _, ok := fields[field]; !ok {
-					invalid("%s has missing %s", modeLabel, field)
-				}
-				continue
-			}
-			scalar(fields, field, modeLabel)
+	seenSlugs := make(map[string]bool, len(document.CustomModes))
+	for _, current := range document.CustomModes {
+		if strings.TrimSpace(current.Slug) == "" {
+			invalid("%s contains a mode without a slug", path)
 		}
-		slug := scalar(fields, "slug", modeLabel)
-		instructions := scalar(fields, "customInstructions", modeLabel)
-		if seenSlugs[slug] {
-			invalid("%s contains duplicate slug %q", path, slug)
+		if seenSlugs[current.Slug] {
+			invalid("%s contains duplicate slug %q", path, current.Slug)
 		}
-		seenSlugs[slug] = true
-		checkGroups(fields["groups"], slug, strict, label)
-		if strict && slug == "ralphex-review" {
-			for _, requirement := range []string{
-				"sequentially",
-				"verify every finding",
-				"Fix every confirmed issue",
-				"run the requested tests",
-				"git commit",
-				"<<<RALPHEX:REVIEW_DONE>>>",
-				"<<<RALPHEX:TASK_FAILED>>>",
-			} {
-				if !strings.Contains(instructions, requirement) {
-					invalid("review mode is missing custom instruction %q", requirement)
-				}
+		seenSlugs[current.Slug] = true
+		if !strict {
+			continue
+		}
+		if strings.TrimSpace(current.Name) == "" ||
+			strings.TrimSpace(current.Description) == "" ||
+			strings.TrimSpace(current.RoleDefinition) == "" ||
+			strings.TrimSpace(current.WhenToUse) == "" ||
+			strings.TrimSpace(current.CustomInstructions) == "" {
+			invalid("mode %s has an empty required field", current.Slug)
+		}
+		expectedGroups, known := ralphexGroups[current.Slug]
+		if !known {
+			invalid("shipped document contains unknown mode %q", current.Slug)
+		}
+		if !reflect.DeepEqual(current.Groups, expectedGroups) {
+			invalid(
+				"mode %s has groups %v, expected %v",
+				current.Slug,
+				current.Groups,
+				expectedGroups,
+			)
+		}
+		for _, requirement := range requiredInstructions[current.Slug] {
+			if !strings.Contains(current.CustomInstructions, requirement) {
+				invalid(
+					"mode %s is missing custom instruction %q",
+					current.Slug,
+					requirement,
+				)
 			}
 		}
 	}
-	if strict && len(modesNode.Content) != 1 {
-		invalid("%s strict mode document contains %d modes", path, len(modesNode.Content))
+	if strict && len(document.CustomModes) != 1 {
+		invalid(
+			"%s strict mode document contains %d modes",
+			path,
+			len(document.CustomModes),
+		)
 	}
 }
 
 func main() {
 	strict := false
-	label := "installed override"
+	validated := 0
 	for _, path := range os.Args[1:] {
 		switch path {
 		case "--strict":
 			strict = true
-			label = "shipped mode"
 		default:
-			validate(path, strict, label)
+			validate(path, strict)
+			validated++
 		}
 	}
-	if len(os.Args) == 1 {
+	if validated == 0 {
 		invalid("no YAML documents supplied")
 	}
 }
@@ -248,14 +220,16 @@ assert_yaml_valid() {
 # MOCK_STDOUT_FILE: file containing text to emit on stdout
 # MOCK_STDERR_FILE: file containing text to emit on stderr
 # MOCK_EXIT_CODE:   exit code to return (default 0)
-# bob_args:         arguments written to $TMPDIR_TEST/bob_args
+# bob_args:         space-joined arguments written to $TMPDIR_TEST/bob_args
+# bob_args_lines:   one argument per line for exact token assertions
 # bob_prompt:       stdin captured to $TMPDIR_TEST/bob_prompt (the prompt arrives
 #                   via stdin now, not as a positional arg)
 create_mock_bob() {
     local mock_script="$TMPDIR_TEST/bob"
     cat > "$mock_script" << 'MOCK_EOF'
 #!/usr/bin/env bash
-echo "$@" > "$TMPDIR_TEST/bob_args"
+printf '%s\n' "$*" > "$TMPDIR_TEST/bob_args"
+printf '%s\n' "$@" > "$TMPDIR_TEST/bob_args_lines"
 # capture stdin (the prompt) separately for assertions
 cat > "$TMPDIR_TEST/bob_prompt"
 
@@ -269,26 +243,6 @@ exit "${MOCK_EXIT_CODE:-0}"
 MOCK_EOF
     chmod +x "$mock_script"
     echo "$mock_script"
-}
-
-# A second mock that records each argv element on its own line (via printf) so
-# word-splitting can be asserted (echo "$@" would re-join with spaces). This
-# mock writes to bob_args_lines, not bob_args.
-# IMPORTANT: create_mock_bob writes via `cat > "$TMPDIR_TEST/bob"`, which FOLLOWS
-# the bob->bob_lines symlink and overwrites bob_lines itself. So after any call
-# to create_mock_bob, bob_lines is corrupted (replaced by the standard mock).
-# Any test needing the line-recording mock MUST call this helper to recreate
-# bob_lines before re-symlinking bob -> bob_lines.
-create_bob_lines_mock() {
-    cat > "$TMPDIR_TEST/bob_lines" << 'LINES_EOF'
-#!/usr/bin/env bash
-printf '%s\n' "$@" > "$TMPDIR_TEST/bob_args_lines"
-cat > /dev/null  # consume stdin
-cat "$MOCK_STDOUT_FILE"
-exit 0
-LINES_EOF
-    chmod +x "$TMPDIR_TEST/bob_lines"
-    ln -sf "$TMPDIR_TEST/bob_lines" "$TMPDIR_TEST/bob"
 }
 
 create_mock_bob > /dev/null
@@ -329,7 +283,7 @@ rm -f "$TMPDIR_TEST/bob_args" "$TMPDIR_TEST/bob_prompt"
 run_wrapper -p "test prompt" >/dev/null 2>&1
 
 recorded=$(cat "$TMPDIR_TEST/bob_args")
-for flag in "--chat-mode=ralphex-task" "--output-format stream-json" "--hide-intermediary-output" "--yolo" "--trust"; do
+for flag in "--chat-mode=ralphex-task" "--output-format=stream-json" "--hide-intermediary-output" "--yolo" "--trust"; do
     if echo "$recorded" | grep -q -- "$flag"; then
         pass "bob invoked with $flag"
     else
@@ -363,6 +317,16 @@ if echo "$recorded" | grep -q -- "-m anthropic/claude-x"; then
     pass "--model forwarded to bob as -m"
 else
     fail "--model not forwarded as -m" "args: $recorded"
+fi
+
+# direct invocations may use the documented equals form.
+rm -f "$TMPDIR_TEST/bob_args"
+run_wrapper --model=anthropic/claude-equals -p "test prompt" >/dev/null 2>&1
+recorded=$(cat "$TMPDIR_TEST/bob_args")
+if echo "$recorded" | grep -q -- "-m anthropic/claude-equals"; then
+    pass "--model=<value> forwarded to bob as -m"
+else
+    fail "--model=<value> not forwarded as -m" "args: $recorded"
 fi
 
 # ---------------------------------------------------------------------------
@@ -428,6 +392,17 @@ else
     fail "stderr note missing for --effort" "stderr: $err_out"
 fi
 
+# the equals form is also accepted and stripped.
+rm -f "$TMPDIR_TEST/bob_args"
+err_out=$(run_wrapper --effort=medium -p "test prompt" 2>&1 >/dev/null)
+recorded=$(cat "$TMPDIR_TEST/bob_args")
+if ! echo "$recorded" | grep -q -- "--effort" &&
+    echo "$err_out" | grep -qi "bob has no --effort flag"; then
+    pass "--effort=<value> accepted, reported, and stripped"
+else
+    fail "--effort=<value> handling is incorrect" "args: $recorded; stderr: $err_out"
+fi
+
 # empty --effort must NOT emit a note (avoids noise on default empty)
 rm -f "$TMPDIR_TEST/bob_args"
 err_out=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
@@ -489,30 +464,13 @@ fi
 # BOB_EXTRA_ARGS word-splitting does NOT preserve quotes: a value like
 # '--flag "a b"' is split into ['--flag', '"a', 'b"'] (three tokens), not
 # ['--flag', 'a b'] (two tokens). This is a documented limitation.
-# To verify word-splitting, we record each arg on its own line by using
-# printf '%s\n' "$@" in a dedicated mock (echo "$@" would re-join with
-# spaces and hide the split).
+# the shared mock records each argument on its own line so the split remains
+# observable instead of being hidden by a space-joined argv string.
 rm -f "$TMPDIR_TEST/bob_args_lines"
-cat > "$TMPDIR_TEST/bob_lines" << 'LINES_EOF'
-#!/usr/bin/env bash
-printf '%s\n' "$@" > "$TMPDIR_TEST/bob_args_lines"
-cat > /dev/null  # consume stdin
-cat "$MOCK_STDOUT_FILE"
-exit 0
-LINES_EOF
-chmod +x "$TMPDIR_TEST/bob_lines"
-ln -sf "$TMPDIR_TEST/bob_lines" "$TMPDIR_TEST/bob"
 MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
     BOB_EXTRA_ARGS='--flag "a b"' \
     PATH="$TMPDIR_TEST:$PATH" \
     bash "$WRAPPER" -p "test prompt" >/dev/null 2>&1
-# restore the standard mock for subsequent tests.
-# NOTE: create_mock_bob writes via `cat > "$TMPDIR_TEST/bob"`, which FOLLOWS the
-# symlink and overwrites bob_lines itself. Any later test that re-symlinks bob
-# -> bob_lines would inherit the standard mock (writing bob_args, not
-# bob_args_lines). Tests below that need the line-recording mock must recreate
-# bob_lines before re-symlinking.
-create_mock_bob > /dev/null
 # The args should be split into 3 lines: --flag, "a, b"
 args_line_count=$(wc -l < "$TMPDIR_TEST/bob_args_lines" | tr -d ' ')
 if [[ "$args_line_count" -ge 3 ]]; then
@@ -820,6 +778,44 @@ assert_selected_mode "ralphex-review" $'<<<RALPHEX:QUESTION>>>\nLaunch Review Ag
 assert_selected_mode "ralphex-task" $'  ```text\nUse the Task tool to launch an agent\n```'
 assert_selected_mode "ralphex-task" $'  ~~~\n<<<RALPHEX:QUESTION>>>\n<<<RALPHEX:PLAN_DRAFT>>>\n<<<RALPHEX:PLAN_READY>>>\n~~~'
 
+# detection resumes after either fence style closes.
+assert_selected_mode "ralphex-review" $'```text\nLaunch Review Agents IN PARALLEL\n```\nUse the Task tool to launch a reviewer'
+assert_selected_mode "ralphex-review" $'~~~\nUse the Task tool to launch a fake reviewer\n~~~\nLaunch Review Agents IN PARALLEL'
+
+# a fenced plan marker cannot combine with two outside markers.
+assert_selected_mode "ralphex-task" $'```\n<<<RALPHEX:QUESTION>>>\n```\n<<<RALPHEX:PLAN_DRAFT>>>\n<<<RALPHEX:PLAN_READY>>>'
+
+# exercise the exact embedded prompts through the stdin path used by ralphex.
+assert_prompt_file_mode() {
+    local expected="$1"
+    local prompt_file="$2"
+    local expected_prompt
+
+    rm -f "$TMPDIR_TEST/bob_args" "$TMPDIR_TEST/bob_prompt"
+    MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
+        PATH="$TMPDIR_TEST:$PATH" \
+        bash "$WRAPPER" < "$prompt_file" >/dev/null 2>&1
+    if grep -q -- "--chat-mode=$expected" "$TMPDIR_TEST/bob_args"; then
+        pass "$(basename "$prompt_file") selected $expected"
+    else
+        fail "$(basename "$prompt_file") did not select $expected" \
+            "args: $(cat "$TMPDIR_TEST/bob_args")"
+    fi
+    expected_prompt=$(cat "$prompt_file")
+    if [[ "$(cat "$TMPDIR_TEST/bob_prompt")" == "$expected_prompt" ]]; then
+        pass "$(basename "$prompt_file") passed unchanged through stdin"
+    else
+        fail "$(basename "$prompt_file") changed on stdin delivery"
+    fi
+}
+
+prompt_dir="$REPO_ROOT/pkg/config/defaults/prompts"
+assert_prompt_file_mode "ralphex-task" "$prompt_dir/task.txt"
+assert_prompt_file_mode "ralphex-task" "$prompt_dir/finalize.txt"
+assert_prompt_file_mode "ralphex-review" "$prompt_dir/review_first.txt"
+assert_prompt_file_mode "ralphex-review" "$prompt_dir/review_second.txt"
+assert_prompt_file_mode "ralphex-plan" "$prompt_dir/make_plan.txt"
+
 # an explicit custom slug wins over every automatic marker.
 rm -f "$TMPDIR_TEST/bob_args" "$TMPDIR_TEST/bob_prompt"
 override_prompt=$'Launch ALL 5 Review Agents IN PARALLEL\n<<<RALPHEX:QUESTION>>>\n<<<RALPHEX:PLAN_DRAFT>>>\n<<<RALPHEX:PLAN_READY>>>'
@@ -1092,9 +1088,9 @@ for ralphex_flag in "--dangerously-skip-permissions" "--verbose" "--print"; do
         pass "ralphex flag $ralphex_flag not forwarded to bob"
     fi
 done
-# the wrapper's own --output-format stream-json should override any ralphex one
-if echo "$recorded" | grep -c -- "--output-format stream-json" | grep -q "^1$"; then
-    pass "exactly one --output-format stream-json in bob args"
+# the wrapper's own output-format setting should replace any ralphex one.
+if echo "$recorded" | grep -c -- "--output-format=stream-json" | grep -q "^1$"; then
+    pass "exactly one --output-format=stream-json in bob args"
 else
     fail "unexpected --output-format count" "args: $recorded"
 fi
@@ -1290,11 +1286,6 @@ echo "test: BOB_EXTRA_ARGS literal passthrough (no glob expansion)"
 # Create files that would match if the glob expanded.
 touch "$TMPDIR_TEST/should_not_expand.txt"
 rm -f "$TMPDIR_TEST/bob_args_lines"
-# recreate the line-recording mock: create_mock_bob (called after the word-split
-# test above) followed the bob->bob_lines symlink and overwrote bob_lines with
-# the standard mock, so a bare `ln -sf bob_lines bob` would inherit the wrong
-# mock. create_bob_lines_mock rewrites bob_lines AND re-symlinks bob to it.
-create_bob_lines_mock
 (
     cd "$TMPDIR_TEST"
     export MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt"
@@ -1302,8 +1293,6 @@ create_bob_lines_mock
         PATH="$TMPDIR_TEST:$PATH" \
         bash "$WRAPPER" -p "test prompt" >/dev/null 2>&1
 )
-# restore the standard mock for subsequent tests
-create_mock_bob > /dev/null
 
 if [[ -f "$TMPDIR_TEST/bob_args_lines" ]]; then
     # The wrapper uses quoted array expansion, so *.txt should remain literal.
@@ -1318,8 +1307,6 @@ fi
 
 # Command substitution inside BOB_EXTRA_ARGS should also stay literal.
 rm -f "$TMPDIR_TEST/bob_args_lines"
-# recreate the line-recording mock (create_mock_bob above corrupted bob_lines).
-create_bob_lines_mock
 (
     cd "$TMPDIR_TEST"
     export MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt"
@@ -1327,7 +1314,6 @@ create_bob_lines_mock
         PATH="$TMPDIR_TEST:$PATH" \
         bash "$WRAPPER" -p "test prompt" >/dev/null 2>&1
 )
-create_mock_bob > /dev/null
 
 if [[ -f "$TMPDIR_TEST/bob_args_lines" ]]; then
     # With quoted expansion, command substitution does NOT occur: the $, (, and
@@ -1355,10 +1341,10 @@ echo "test: custom-mode installer"
 
 INSTALLER="$SCRIPT_DIR/install-modes.sh"
 installer_home="$TMPDIR_TEST/home with spaces"
-installer_target="$installer_home/.bob/custom_modes.yaml"
+installer_target="$installer_home/.bob/settings/custom_modes.yaml"
 rm -rf "$installer_home"
 
-# an absent target is created below an isolated HOME path containing spaces.
+# an absent target is created at bob's active global path.
 env -u BOB_CUSTOM_MODES_FILE HOME="$installer_home" bash "$INSTALLER" >/dev/null
 if [[ -f "$installer_target" ]]; then
     pass "installer creates missing custom-mode document"
@@ -1379,7 +1365,7 @@ done
 
 # a user-owned mode and a user-owned ralphex slug are preserved during a merge.
 merge_home="$TMPDIR_TEST/merge-home"
-merge_target="$merge_home/.bob/custom_modes.yaml"
+merge_target="$merge_home/.bob/settings/custom_modes.yaml"
 mkdir -p "$(dirname "$merge_target")"
 cat > "$merge_target" << 'EOF'
 customModes:
@@ -1429,7 +1415,7 @@ fi
 
 # a document with only some ralphex modes receives only the missing modes.
 partial_home="$TMPDIR_TEST/partial-home"
-partial_target="$partial_home/.bob/custom_modes.yaml"
+partial_target="$partial_home/.bob/settings/custom_modes.yaml"
 mkdir -p "$(dirname "$partial_target")"
 cat > "$partial_target" << 'EOF'
 customModes:
@@ -1462,7 +1448,7 @@ fi
 
 # malformed input must fail before replacing the target.
 bad_home="$TMPDIR_TEST/bad-home"
-bad_target="$bad_home/.bob/custom_modes.yaml"
+bad_target="$bad_home/.bob/settings/custom_modes.yaml"
 mkdir -p "$(dirname "$bad_target")"
 printf '%s\n' 'this is not a safe customModes document' > "$bad_target"
 cp "$bad_target" "$TMPDIR_TEST/bad-before-install"
@@ -1481,12 +1467,154 @@ else
     fail "unsafe installer merge changed target"
 fi
 
-# wrapper regression tests use the mock bob and no network/api executable.
-if grep -q -- "create_mock_bob" "$SCRIPT_DIR/bob-as-claude_test.sh" \
-    && grep -q -- 'PATH="$TMPDIR_TEST:$PATH"' "$SCRIPT_DIR/bob-as-claude_test.sh"; then
-    pass "wrapper regression tests use mock Bob on PATH"
+# a syntactically malformed nested value must also be rejected unchanged.
+malformed_target="$TMPDIR_TEST/malformed/custom_modes.yaml"
+mkdir -p "$(dirname "$malformed_target")"
+cat > "$malformed_target" << 'EOF'
+customModes:
+  - slug: malformed-mode
+    name: Malformed Mode
+    groups: [
+EOF
+cp "$malformed_target" "$TMPDIR_TEST/malformed-before-install"
+set +e
+BOB_CUSTOM_MODES_FILE="$malformed_target" bash "$INSTALLER" \
+    >/dev/null 2>"$TMPDIR_TEST/malformed-installer-error"
+malformed_exit=$?
+set -e
+if [[ $malformed_exit -ne 0 ]] &&
+    cmp -s "$malformed_target" "$TMPDIR_TEST/malformed-before-install"; then
+    pass "installer rejects malformed nested yaml without replacing it"
 else
-    fail "wrapper regression tests do not prove mock Bob usage"
+    fail "installer changed or accepted malformed nested yaml"
+fi
+
+# an unterminated quoted scalar is another shape the previous indentation-only
+# check accepted even though a yaml parser rejects it.
+quoted_target="$TMPDIR_TEST/quoted-malformed/custom_modes.yaml"
+mkdir -p "$(dirname "$quoted_target")"
+cat > "$quoted_target" << 'EOF'
+customModes:
+  - slug: quoted-malformed
+    name: "unterminated
+    groups:
+      - read
+EOF
+cp "$quoted_target" "$TMPDIR_TEST/quoted-before-install"
+set +e
+BOB_CUSTOM_MODES_FILE="$quoted_target" bash "$INSTALLER" >/dev/null 2>&1
+quoted_exit=$?
+set -e
+if [[ $quoted_exit -ne 0 ]] &&
+    cmp -s "$quoted_target" "$TMPDIR_TEST/quoted-before-install"; then
+    pass "installer rejects an unterminated quoted scalar unchanged"
+else
+    fail "installer changed or accepted an unterminated quoted scalar"
+fi
+
+# an explicit override path may contain spaces and bypasses the global target.
+override_target="$TMPDIR_TEST/override path/custom modes.yaml"
+BOB_CUSTOM_MODES_FILE="$override_target" bash "$INSTALLER" >/dev/null
+if [[ -f "$override_target" ]]; then
+    pass "BOB_CUSTOM_MODES_FILE selects a path containing spaces"
+else
+    fail "BOB_CUSTOM_MODES_FILE override was not created"
+fi
+assert_yaml_valid "override installation parses as yaml" "$override_target"
+
+# bob migrates a legacy global file on startup, so merge it when no canonical
+# settings file exists instead of hiding its user-owned modes.
+legacy_home="$TMPDIR_TEST/legacy-home"
+legacy_target="$legacy_home/.bob/custom_modes.yaml"
+mkdir -p "$(dirname "$legacy_target")"
+cat > "$legacy_target" << 'EOF'
+customModes:
+  - slug: legacy-user-mode
+    name: Legacy User Mode
+    roleDefinition: Preserve the legacy user mode.
+    groups:
+      - read
+EOF
+HOME="$legacy_home" BOB_CUSTOM_MODES_FILE= bash "$INSTALLER" >/dev/null
+if grep -q -- "slug: legacy-user-mode" "$legacy_target" &&
+    grep -q -- "slug: ralphex-plan" "$legacy_target" &&
+    [[ ! -e "$legacy_home/.bob/settings/custom_modes.yaml" ]]; then
+    pass "installer preserves bob's legacy migration source"
+else
+    fail "installer hid or replaced the legacy global mode document"
+fi
+assert_yaml_valid "legacy installation remains valid yaml" "$legacy_target"
+
+# an explicit empty sequence is converted before the shipped modes are added.
+empty_target="$TMPDIR_TEST/empty-sequence/custom_modes.yaml"
+mkdir -p "$(dirname "$empty_target")"
+printf '%s\n' 'customModes: []' > "$empty_target"
+BOB_CUSTOM_MODES_FILE="$empty_target" bash "$INSTALLER" >/dev/null
+assert_yaml_valid "customModes empty sequence installs valid modes" "$empty_target"
+if ! grep -q -- 'customModes: \[\]' "$empty_target"; then
+    pass "empty customModes sequence converted to block form"
+else
+    fail "empty customModes sequence was not converted"
+fi
+
+# alternate valid indentation and a non-leading slug stay valid after append.
+indented_target="$TMPDIR_TEST/four-space/custom_modes.yaml"
+mkdir -p "$(dirname "$indented_target")"
+cat > "$indented_target" << 'EOF'
+customModes:
+    - name: Four Space Mode
+      slug: four-space-mode
+      roleDefinition: Preserve four-space sequence indentation.
+      groups:
+        - read
+EOF
+BOB_CUSTOM_MODES_FILE="$indented_target" bash "$INSTALLER" >/dev/null
+assert_yaml_valid "four-space-indented installation remains valid yaml" \
+    "$indented_target"
+if grep -q -- '^    - slug: ralphex-task$' "$indented_target"; then
+    pass "installer matches existing sequence indentation"
+else
+    fail "installer appended modes with the wrong indentation"
+fi
+
+# defensive target checks must fail before following or replacing special files.
+sentinel="$TMPDIR_TEST/symlink-sentinel"
+symlink_target="$TMPDIR_TEST/symlink-target"
+printf '%s\n' 'sentinel content' > "$sentinel"
+ln -s "$sentinel" "$symlink_target"
+set +e
+BOB_CUSTOM_MODES_FILE="$symlink_target" bash "$INSTALLER" >/dev/null 2>&1
+symlink_exit=$?
+set -e
+if [[ $symlink_exit -ne 0 ]] &&
+    [[ "$(cat "$sentinel")" == "sentinel content" ]]; then
+    pass "installer refuses a symlink without changing its target"
+else
+    fail "installer followed or accepted a symlink target"
+fi
+
+directory_target="$TMPDIR_TEST/non-regular-directory"
+mkdir -p "$directory_target"
+set +e
+BOB_CUSTOM_MODES_FILE="$directory_target" bash "$INSTALLER" >/dev/null 2>&1
+directory_exit=$?
+set -e
+if [[ $directory_exit -ne 0 && -d "$directory_target" ]]; then
+    pass "installer refuses a directory target"
+else
+    fail "installer accepted or replaced a directory target"
+fi
+
+fifo_target="$TMPDIR_TEST/non-regular-fifo"
+mkfifo "$fifo_target"
+set +e
+BOB_CUSTOM_MODES_FILE="$fifo_target" bash "$INSTALLER" >/dev/null 2>&1
+fifo_exit=$?
+set -e
+if [[ $fifo_exit -ne 0 && -p "$fifo_target" ]]; then
+    pass "installer refuses a fifo target"
+else
+    fail "installer accepted or replaced a fifo target"
 fi
 
 # ---------------------------------------------------------------------------

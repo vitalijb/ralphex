@@ -1107,7 +1107,7 @@ When running ralphex in Docker, your script must be accessible inside the contai
 
 ### Using Alternative Providers for Claude Phases
 
-The `claude_command` and `claude_args` config options let you replace Claude Code with any CLI that produces compatible `stream-json` output. This means codex, GitHub Copilot CLI, Gemini CLI, local LLMs, or any other tool can drive task execution and review phases — you just need a wrapper script that translates the tool's output format. Use `--claude-command` and `--claude-args` to choose a wrapper for a single run without changing config.
+The `claude_command` and `claude_args` config options let you replace Claude Code with any CLI that produces compatible `stream-json` output. Compatible wrappers can drive plan creation, task execution, internal reviews, and finalize; each wrapper's section documents which phases and signal workflows it supports. Use `--claude-command` and `--claude-args` to choose a wrapper for a single run without changing config.
 
 Working examples are included:
 
@@ -1119,7 +1119,7 @@ Working examples are included:
 - [`scripts/pi-as-claude/pi-as-claude.sh`](https://github.com/umputun/ralphex/blob/master/scripts/pi-as-claude/pi-as-claude.sh) wraps the pi CLI, translating its `--mode json` JSONL events into Claude-compatible events
 - [`scripts/bob-as-claude/bob-as-claude.sh`](https://github.com/umputun/ralphex/blob/master/scripts/bob-as-claude/bob-as-claude.sh) wraps the IBM Bob Shell CLI, translating its `--output-format=stream-json` events into Claude-compatible events
 
-The Bob wrapper ships `scripts/bob-as-claude/modes/ralphex-task.yaml`, `ralphex-review.yaml`, and `ralphex-plan.yaml`. Install them with `bash scripts/bob-as-claude/install-modes.sh` before automatic phase selection. The installer safely merges into `~/.bob/custom_modes.yaml`, preserves unrelated modes, and leaves existing ralphex slugs as user-owned overrides. Automatic selection maps review start markers to `ralphex-review`, the complete `QUESTION`/`PLAN_DRAFT`/`PLAN_READY` signal set to `ralphex-plan`, and task/finalize prompts to `ralphex-task`; `BOB_CHAT_MODE=<slug>` overrides this mapping with any built-in or custom slug.
+The Bob wrapper ships `scripts/bob-as-claude/modes/ralphex-task.yaml`, `ralphex-review.yaml`, and `ralphex-plan.yaml`. Install them with `bash scripts/bob-as-claude/install-modes.sh` before automatic phase selection. The installer safely merges into Bob's active global `~/.bob/settings/custom_modes.yaml`, preserves a legacy `~/.bob/custom_modes.yaml` for Bob's migration path, preserves unrelated modes, and leaves existing ralphex slugs as user-owned overrides. Project-level `.bob/custom_modes.yaml` entries take precedence; remove an existing ralphex entry before reinstalling when you want the latest shipped definition. Automatic selection maps review start markers to `ralphex-review`, the complete `QUESTION`/`PLAN_DRAFT`/`PLAN_READY` signal set to `ralphex-plan`, and task/finalize prompts to `ralphex-task`; `BOB_CHAT_MODE=<slug>` overrides this mapping with any built-in or custom slug.
 
 To use the included Copilot wrapper:
 
@@ -1147,7 +1147,7 @@ ralphex --claude-command=/path/to/scripts/codex-as-claude/codex-as-claude.sh doc
 
 Wrapper scripts should ignore unknown flags gracefully — the included script does this via its `*) shift ;;` catch-all. If a wrapper cannot tolerate the default Claude flags (`--dangerously-skip-permissions`, `--output-format stream-json`, `--verbose`), use `--claude-args=` to explicitly clear configured/default args for that single run.
 
-The included Codex, Copilot, pi, and bob wrappers require `jq` on `PATH` for JSON translation.
+The included Codex, Copilot, pi, and bob wrappers require `jq` on `PATH` for JSON translation. The Bob wrapper also requires `awk` for fence-aware phase detection.
 
 Provider-specific environment variables:
 - `COPILOT_MODEL`, `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN` - Copilot model selection and headless authentication

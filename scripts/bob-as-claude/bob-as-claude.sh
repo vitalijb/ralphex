@@ -24,7 +24,9 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         -p)       prompt="${2:-}"; shift; shift 2>/dev/null || true ;;
         --model)  model_flag="${2:-}"; shift; shift 2>/dev/null || true ;;
+        --model=*) model_flag="${1#*=}"; shift ;;
         --effort) effort_flag="${2:-}"; shift; shift 2>/dev/null || true ;;
+        --effort=*) effort_flag="${1#*=}"; shift ;;
         *)        shift ;;
     esac
 done
@@ -74,7 +76,7 @@ if [[ -z "$selected_chat_mode" ]]; then
 fi
 
 # build bob arguments. the prompt is delivered through stdin, not argv.
-bob_args=("--chat-mode=$selected_chat_mode" --output-format stream-json --hide-intermediary-output --yolo --trust)
+bob_args=("--chat-mode=$selected_chat_mode" --output-format=stream-json --hide-intermediary-output --yolo --trust)
 [[ -n "$model" ]] && bob_args+=(-m "$model")
 if [[ -n "$BOB_EXTRA_ARGS" ]]; then
     read -ra bob_extra_args <<< "$BOB_EXTRA_ARGS"
@@ -112,30 +114,25 @@ bob_pid=$!
 # translate bob events into claude-compatible text deltas and terminal results.
 jq -Rcn --unbuffered --argjson verbose "$BOB_VERBOSE" '
     def emit($t): {type: "content_block_delta", delta: {type: "text_delta", text: $t}};
-    foreach ((inputs | fromjson? | objects), {type: "__eof__"}) as $e (
-        {buf: "", out: []};
-        if $e.type == "tool_use" and ($e.tool_name // "") == "attempt_completion" then
-            (($e.parameters.result // "") | tostring | split("\n")) as $parts
+    inputs | fromjson? | objects |
+        if .type == "tool_use" and (.tool_name // "") == "attempt_completion" then
+            ((.parameters.result // "") | tostring | split("\n")) as $parts
             | if ($parts[-1] // "") == "" then
-                {buf: "", out: ($parts[0:-1] | map(emit(. + "\n")))}
+                $parts[0:-1][] | emit(. + "\n")
               else
-                {buf: "", out: ($parts | map(emit(. + "\n")))}
+                $parts[] | emit(. + "\n")
               end
-        elif $e.type == "result" then
-            {buf: .buf, out: [{type: "result", result: ""}]}
-        elif $e.type == "__eof__" then
-            {buf: .buf, out: (if .buf != "" then [emit(.buf + "\n")] else [] end)}
-        elif $verbose == 1 and $e.type == "tool_result" and ($e.status // "") == "success" then
-            {buf: .buf, out: [emit(("[tool_result] " + (($e.output // "") | tostring) + "\n"))]}
-        elif $e.type == "tool_result" and ($e.status // "") == "error" then
-            {buf: .buf, out: [emit(("[tool_error] " + (($e.output // "") | tostring) + "\n"))]}
-        elif $verbose == 1 and $e.type == "tool_use" then
-            {buf: .buf, out: [emit(("[tool] " + (($e.tool_name // "") | tostring) + "\n"))]}
+        elif .type == "result" then
+            {type: "result", result: ""}
+        elif $verbose == 1 and .type == "tool_result" and (.status // "") == "success" then
+            emit(("[tool_result] " + ((.output // "") | tostring) + "\n"))
+        elif .type == "tool_result" and (.status // "") == "error" then
+            emit(("[tool_error] " + ((.output // "") | tostring) + "\n"))
+        elif $verbose == 1 and .type == "tool_use" then
+            emit(("[tool] " + ((.tool_name // "") | tostring) + "\n"))
         else
-            {buf: .buf, out: [emit("")]}
-        end;
-        .out[]
-    )
+            emit("")
+        end
 ' < "$stdout_pipe" 2>/dev/null &
 jq_pid=$!
 wait "$jq_pid" || true

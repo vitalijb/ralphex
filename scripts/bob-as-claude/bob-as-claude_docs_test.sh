@@ -180,6 +180,14 @@ assert_contains \
     "wrapper README documents custom-mode target override"
 assert_contains \
     "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "~/.bob/settings/custom_modes.yaml" \
+    "wrapper README documents bob's active global mode path"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    ".bob/custom_modes.yaml" \
+    "wrapper README documents project mode precedence"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
     "does not silently fall back" \
     "wrapper README documents installation requirement"
 assert_contains \
@@ -254,6 +262,14 @@ assert_contains \
     "custom providers doc documents explicit override"
 assert_contains \
     "$REPO_ROOT/docs/custom-providers.md" \
+    "<<<RALPHEX:ALL_TASKS_DONE>>>" \
+    "custom providers doc uses the task completion signal"
+assert_not_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "<<<RALPHEX:COMPLETED>>>" \
+    "custom providers doc removes the nonexistent completion signal"
+assert_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
     "passes review prompts unchanged" \
     "custom providers doc removes prompt adapter mutation"
 assert_not_contains \
@@ -275,6 +291,10 @@ assert_contains \
     "$REPO_ROOT/README.md" \
     "BOB_CHAT_MODE" \
     "top-level README documents bob-specific environment variables"
+assert_contains \
+    "$REPO_ROOT/README.md" \
+    "Bob wrapper also requires" \
+    "top-level README documents awk requirement for bob wrapper"
 assert_contains \
     "$REPO_ROOT/README.md" \
     "scripts/bob-as-claude/" \
@@ -305,6 +325,10 @@ assert_contains \
     "$REPO_ROOT/llms.txt" \
     "scripts/bob-as-claude/install-modes.sh" \
     "llms.txt inventories Bob installer"
+assert_contains \
+    "$REPO_ROOT/llms.txt" \
+    "~/.bob/settings/custom_modes.yaml" \
+    "llms.txt documents bob's active global mode path"
 
 # CLAUDE.md
 assert_contains \
@@ -325,54 +349,16 @@ assert_contains \
     "CLAUDE inventory includes Bob installer"
 assert_contains \
     "$REPO_ROOT/CLAUDE.md" \
+    "~/.bob/settings/custom_modes.yaml" \
+    "CLAUDE documents bob's active global mode path"
+assert_contains \
+    "$REPO_ROOT/CLAUDE.md" \
     'Review start markers select `ralphex-review`' \
     "CLAUDE documents current Bob review trigger"
 assert_not_contains \
     "$REPO_ROOT/CLAUDE.md" \
     "Review adapter is prepended" \
     "CLAUDE removes stale Bob review-adapter trigger"
-
-# regression-test hardening
-assert_contains \
-    "$REPO_ROOT/scripts/bob-as-claude/bob-as-claude_test.sh" \
-    "GOFLAGS=-mod=vendor" \
-    "wrapper tests validate YAML with vendored yaml.v3"
-assert_contains \
-    "$REPO_ROOT/scripts/bob-as-claude/bob-as-claude_test.sh" \
-    "ralphexGroups" \
-    "wrapper tests assert exact shipped tool groups"
-assert_contains \
-    "$REPO_ROOT/scripts/bob-as-claude/bob-as-claude_test.sh" \
-    "verify every finding" \
-    "wrapper tests assert review finding verification instructions"
-assert_contains \
-    "$REPO_ROOT/scripts/bob-as-claude/bob-as-claude_test.sh" \
-    "<<<RALPHEX:REVIEW_DONE>>>" \
-    "wrapper tests assert review signal instructions"
-assert_contains \
-    "$REPO_ROOT/scripts/bob-as-claude/bob-as-claude_test.sh" \
-    "<<<RALPHEX:QUESTION>>>" \
-    "wrapper tests cover individual plan markers"
-assert_contains \
-    "$REPO_ROOT/scripts/bob-as-claude/bob-as-claude_test.sh" \
-    "BOB_CHAT_MODE=\"code\"" \
-    "wrapper tests cover built-in overrides"
-assert_contains \
-    "$REPO_ROOT/scripts/bob-as-claude/bob-as-claude_test.sh" \
-    "partial_target" \
-    "wrapper tests cover partially installed modes"
-assert_contains \
-    "$REPO_ROOT/scripts/bob-as-claude/bob-as-claude_test.sh" \
-    "env -u BOB_CUSTOM_MODES_FILE" \
-    "wrapper tests isolate the installer's HOME"
-assert_contains \
-    "$REPO_ROOT/scripts/bob-as-claude/bob-as-claude_test.sh" \
-    "create_mock_bob" \
-    "wrapper tests define a mock Bob"
-assert_not_contains \
-    "$REPO_ROOT/scripts/bob-as-claude/bob-as-claude_test.sh" \
-    "curl " \
-    "wrapper tests do not invoke a network client"
 
 echo ""
 echo "summary: $passed passed, $failed failed, $total total"

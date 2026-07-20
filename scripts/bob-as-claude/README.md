@@ -35,7 +35,9 @@ Install the shipped modes into Bob's global custom-mode document before the firs
 bash scripts/bob-as-claude/install-modes.sh
 ```
 
-The installer creates `~/.bob/custom_modes.yaml` when needed. It preserves unrelated modes, appends only missing ralphex slugs, treats an existing ralphex slug as a user-owned override, and is idempotent. It validates the existing document before writing and uses an atomic replacement; malformed or otherwise unsafe input causes a failure without changing the target. Set `BOB_CUSTOM_MODES_FILE=/path/to/custom_modes.yaml` to use another target.
+The installer creates Bob's active global `~/.bob/settings/custom_modes.yaml` when needed. If only the legacy `~/.bob/custom_modes.yaml` exists, it merges that file so Bob can migrate the complete document on its next start. It preserves unrelated modes, appends only missing ralphex slugs, treats an existing ralphex slug as a user-owned override, and is idempotent. Conservative syntax checks run before and after the merge, followed by an atomic replacement; malformed or unsupported input fails without changing the target. Set `BOB_CUSTOM_MODES_FILE=/path/to/custom_modes.yaml` to use another target.
+
+Bob gives a project-level `.bob/custom_modes.yaml` precedence over global modes. A project entry with the same slug shadows the installed ralphex mode; set `BOB_CUSTOM_MODES_FILE=.bob/custom_modes.yaml` to install intentionally at project scope. Existing ralphex slugs are never overwritten, so remove an old entry before rerunning the installer when you want the latest shipped definition.
 
 The shipped modes have these exact tool groups:
 
@@ -48,11 +50,11 @@ The shipped modes have these exact tool groups:
 **Environment variables:**
 
 - `BOB_CHAT_MODE` — explicit chat-mode slug override. Any non-empty built-in slug (`ask`, `code`, `plan`, or `advanced`) or custom-mode slug is passed through unchanged and overrides automatic phase detection. Empty: select a shipped ralphex mode from the prompt markers.
-- `BOB_MODEL` — model to use (passed as `-m` when ralphex does not append a `--model=<m>` flag)
+- `BOB_MODEL` — model to use (passed as `-m` when ralphex does not supply `--model`)
 - `BOB_VERBOSE` — set to `1` to include `tool_result` output and `[tool]` markers in the stream (default: `0`, only `attempt_completion` result text is shown)
 - `BOB_EXTRA_ARGS` — extra flags appended verbatim to the bob invocation (word-split on whitespace). The wrapper builds the bob command line itself and ignores unknown flags, so this is the only way to pass through arbitrary bob options. Example: `BOB_EXTRA_ARGS="--max-coins=100"`. **Limitation:** word-splitting does NOT preserve quotes; arguments containing spaces or quotes cannot be expressed via `BOB_EXTRA_ARGS`. Use a wrapper script instead.
 
-**Model and effort:** ralphex appends `--model=<m>` / `--effort=<e>` per phase. `--model=<m>` is forwarded to bob's `-m` (bob 1.0.6 supports it; verified empirically). `--effort=<e>` is accepted but **ignored** — bob has no `--effort` flag and rejects it with exit 1 (`Unknown argument: effort`), so the wrapper must strip it. A one-line note is printed to stderr when a non-empty `--effort` value is passed.
+**Model and effort:** ralphex supplies `--model` and `--effort` with each value in the following argv entry. The wrapper also accepts `--model=<m>` and `--effort=<e>` for direct invocations. Model values are forwarded to bob's `-m` option (bob 1.0.6 supports it; verified empirically). Effort is accepted but **ignored** — bob has no `--effort` flag and rejects it with exit 1 (`Unknown argument: effort`), so the wrapper strips it and prints a one-line stderr note for non-empty values.
 
 ### Automatic phase selection
 
@@ -120,7 +122,7 @@ Ensure `--trust` is present (it is by default — the wrapper passes `--yolo --t
 
 ### Model selection not working
 
-bob 1.0.6 supports `-m`/`--model`. If using an older bob, upgrade. `--model=<m>` from ralphex config forwards to bob's `-m`. Set `BOB_MODEL` in the environment for a model that applies when ralphex does not append `--model`.
+bob 1.0.6 supports `-m`/`--model`. If using an older bob, upgrade. Ralphex supplies `--model` and its value as separate argv entries; direct wrapper calls may also use `--model=<m>`. Both forms forward to bob's `-m`. Set `BOB_MODEL` in the environment for a model that applies when ralphex does not supply `--model`.
 
 ### `--effort` ignored
 

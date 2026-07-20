@@ -1,6 +1,6 @@
 # Custom Providers for Claude Phases
 
-ralphex uses Claude Code as the primary agent for task execution and code reviews. The `claude_command` and `claude_args` configuration options allow replacing Claude Code with any CLI tool that produces compatible output — codex, Gemini CLI, local LLMs, or custom scripts. The same provider can also be selected per run with `--claude-command` and `--claude-args`.
+ralphex uses Claude Code as the primary agent for plan creation, task execution, code reviews, and finalize. The `claude_command` and `claude_args` configuration options allow replacing Claude Code with any CLI tool that produces compatible output — codex, Gemini CLI, local LLMs, or custom scripts. Provider capabilities vary by wrapper; the same provider can also be selected per run with `--claude-command` and `--claude-args`.
 
 **For codex specifically, use the first-class `--codex` flag** described in the next section when you want codex to be the primary executor. The `claude_command` wrapper path remains supported for backwards compatibility and for tools without first-class integration (Gemini, Copilot, OpenCode, local LLMs).
 
@@ -66,7 +66,7 @@ The executor also recognizes `message_stop` events, but wrapper scripts don't ne
 
 ### Signal detection
 
-ralphex prompts instruct the agent to emit signals like `<<<RALPHEX:COMPLETED>>>` or `<<<RALPHEX:FAILED>>>` in its output. These signals must appear in the text content of `content_block_delta` or `result` events. The wrapper doesn't need to handle signals — as long as the underlying tool follows the prompt instructions and the text passes through, signals will be detected automatically.
+ralphex prompts use phase-specific signals: task completion emits `<<<RALPHEX:ALL_TASKS_DONE>>>`, unrecoverable failure emits `<<<RALPHEX:TASK_FAILED>>>`, review completion emits `<<<RALPHEX:REVIEW_DONE>>>`, and plan creation uses `QUESTION`, `PLAN_DRAFT`, and `PLAN_READY`. These signals must appear in the text content of `content_block_delta` or `result` events. The wrapper does not interpret them; it must preserve the exact markers supplied by the active prompt.
 
 ### Argument handling
 
@@ -419,7 +419,7 @@ The wrapper covers task and review phases only. Plan creation mode (`ralphex --p
 
 ## IBM Bob Shell CLI wrapper (included example)
 
-The repository includes a wrapper at `scripts/bob-as-claude/bob-as-claude.sh` that translates the IBM Bob Shell CLI's (`bob`) `--output-format=stream-json` JSONL event stream to Claude stream-json format. It uses `jq` for JSON parsing.
+The repository includes a wrapper at `scripts/bob-as-claude/bob-as-claude.sh` that translates the IBM Bob Shell CLI's (`bob`) `--output-format=stream-json` JSONL event stream to Claude stream-json format. It uses `jq` for JSON parsing and `awk` for fence-aware phase detection.
 
 The wrapper runs bob with an automatically selected `--chat-mode=<slug>`, `--output-format=stream-json`, `--hide-intermediary-output`, `--yolo`, and `--trust`, then passes the prompt on stdin (avoiding the per-arg command-line length cap). With `--hide-intermediary-output`, bob emits only lifecycle events plus a final `attempt_completion` tool event; the wrapper extracts the complete result text from `attempt_completion.parameters.result`, splits it into line-level `content_block_delta` events, and emits a terminal `result` event.
 
@@ -444,7 +444,9 @@ Install the three shipped modes before automatic phase selection:
 bash scripts/bob-as-claude/install-modes.sh
 ```
 
-The installer creates `~/.bob/custom_modes.yaml` when absent, preserves unrelated modes, appends missing ralphex modes, skips an existing ralphex slug as a user-owned override, and is idempotent. It validates the document before an atomic replacement; malformed or unsafe input fails without changing the target. Set `BOB_CUSTOM_MODES_FILE=/path/to/custom_modes.yaml` to select another target. Automatic selection requires these modes to be installed; the wrapper does not silently fall back to Bob's built-in modes.
+The installer creates Bob's active global `~/.bob/settings/custom_modes.yaml` when absent. If only the legacy `~/.bob/custom_modes.yaml` exists, it merges that file so Bob can migrate the complete document on its next start. It preserves unrelated modes, appends missing ralphex modes, skips an existing ralphex slug as a user-owned override, and is idempotent. Conservative syntax checks run before and after the merge, followed by an atomic replacement; malformed or unsupported input fails without changing the target. Set `BOB_CUSTOM_MODES_FILE=/path/to/custom_modes.yaml` to select another target. Automatic selection requires these modes to be installed; the wrapper does not silently fall back to Bob's built-in modes.
+
+Bob gives project-level `.bob/custom_modes.yaml` entries precedence over global modes. A project entry with a ralphex slug shadows the globally installed definition; set `BOB_CUSTOM_MODES_FILE=.bob/custom_modes.yaml` to install intentionally at project scope. Existing ralphex slugs are treated as user-owned, so remove an old entry before rerunning the installer when you want the latest shipped definition.
 
 The shipped mode tool groups are exact:
 
@@ -459,13 +461,13 @@ The shipped mode tool groups are exact:
 | Variable | Default | Description |
 |---|---|---|
 | `BOB_CHAT_MODE` | automatic | Any non-empty built-in slug (`ask`, `code`, `plan`, or `advanced`) or custom-mode slug is passed through unchanged and overrides prompt detection. Empty selects a shipped ralphex mode. |
-| `BOB_MODEL` | (bob default) | Model passed as `-m` when ralphex does not append a `--model=<m>` flag. bob 1.0.6+ supports `-m`/`--model`. |
+| `BOB_MODEL` | (bob default) | Model passed as `-m` when ralphex does not supply `--model`. bob 1.0.6+ supports `-m`/`--model`. |
 | `BOB_VERBOSE` | `0` | Set to `1` to include `tool_result` output and `[tool]` markers in the stream (default: only `attempt_completion` result text is shown). |
 | `BOB_EXTRA_ARGS` | (none) | Extra flags appended verbatim to the bob invocation (word-split on whitespace, **no quote preservation**); e.g. `--max-coins=100` to cap spend. |
 
 ### Model and effort mapping
 
-ralphex appends `--model=<m>` / `--effort=<e>` per phase. The wrapper forwards `--model=<m>` to bob's `-m`/`--model` (bob 1.0.6+ supports it). `--effort=<e>` is **accepted but ignored** — bob has no `--effort` flag, and passing it would make bob exit with an "Unknown argument" error, so the wrapper strips it. A one-line note is printed to stderr when a non-empty `--effort` value is received.
+ralphex supplies `--model` and `--effort` with each value in the following argv entry. The wrapper also accepts equals forms for direct calls. It forwards the model to bob's `-m`/`--model` option (bob 1.0.6+ supports it). Effort is **accepted but ignored** — bob has no `--effort` flag, and passing it would make bob exit with an "Unknown argument" error, so the wrapper strips it and prints a one-line stderr note for non-empty values.
 
 ### Automatic phase mapping
 
@@ -677,7 +679,7 @@ echo '{"type":"result","result":""}'
 - Ensure `jq` is installed and accessible
 
 **Signals not detected:**
-- The model must include `<<<RALPHEX:COMPLETED>>>` or `<<<RALPHEX:FAILED>>>` in its text output
+- The model must preserve the phase's exact signal, such as `<<<RALPHEX:ALL_TASKS_DONE>>>`, `<<<RALPHEX:TASK_FAILED>>>`, `<<<RALPHEX:REVIEW_DONE>>>`, or the plan-creation signals
 - Check that the prompt is passed through correctly (not truncated or escaped)
 - Test manually: run the wrapper with a prompt that includes signal instructions
 
