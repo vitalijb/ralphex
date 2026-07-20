@@ -15,7 +15,7 @@
 # claude_command: the command to run claude code
 # default: "claude"
 # claude_command = claude
-claude_command=/home/fg-arch/IdeaProjects/ralphex/scripts/pi-as-claude/pi-as-claude.sh
+#claude_command=/home/fg-arch/IdeaProjects/ralphex/scripts/pi-as-claude/pi-as-claude.sh
 
 # claude_args: arguments passed to claude command
 # --dangerously-skip-permissions: bypass permission prompts for autonomous execution
@@ -52,13 +52,13 @@ claude_command=/home/fg-arch/IdeaProjects/ralphex/scripts/pi-as-claude/pi-as-cla
 # executor: primary executor for task, review, and finalize phases
 # empty/default uses Claude Code; "codex" runs the full pipeline through codex
 # and skips the external review phase
-# executor =
+executor = codex
 
 # pass_claude_md: when executor = codex, let codex read project CLAUDE.md via
 # project_doc_fallback_filenames. user-level ~/.claude/CLAUDE.md is not
 # auto-passed; ralphex prints a one-time symlink hint instead.
 # default: false
-# pass_claude_md = false
+pass_claude_md = true
 
 # codex_enabled: whether to run codex external review phase
 # set to false to skip codex review entirely
@@ -75,6 +75,10 @@ claude_command=/home/fg-arch/IdeaProjects/ralphex/scripts/pi-as-claude/pi-as-cla
 # (set to an empty value, "codex_model =", to inherit from ~/.codex/config.toml instead;
 # commenting the line out keeps the gpt-5.5 default)
 # codex_model = gpt-5.5
+
+plan_model = sol:xhigh
+task_model = terra:xhigh
+review_model = sol:xhigh
 
 # codex_reasoning_effort: reasoning effort level for codex
 # available: low, medium, high, xhigh
