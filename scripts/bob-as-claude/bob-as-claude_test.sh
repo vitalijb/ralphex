@@ -74,7 +74,7 @@ type mode struct {
 var ralphexGroups = map[string][]string{
 	"ralphex-task":   {"read", "edit", "command", "browser"},
 	"ralphex-review": {"read", "edit", "command", "browser"},
-	"ralphex-plan":   {"read", "command", "browser"},
+	"ralphex-plan":   {"read", "edit", "command", "browser"},
 }
 
 var requiredInstructions = map[string][]string{
@@ -95,6 +95,9 @@ var requiredInstructions = map[string][]string{
 	},
 	"ralphex-plan": {
 		"Do not edit source files",
+		"use the edit tool to write only the requested plan file under docs/plans",
+		"attempt_completion",
+		"ralphex alone owns that log",
 		"<<<RALPHEX:QUESTION>>>",
 		"<<<RALPHEX:PLAN_DRAFT>>>",
 		"<<<RALPHEX:PLAN_READY>>>",
@@ -268,6 +271,14 @@ cat > "$TMPDIR_TEST/minimal_events.txt" << 'EOF'
 {"type":"message","timestamp":"t","role":"user","content":"test\n"}
 {"type":"tool_use","timestamp":"t","tool_name":"attempt_completion","tool_id":"tool-1","parameters":{"result":"hello world\n"}}
 {"type":"tool_result","timestamp":"t","tool_id":"tool-1","status":"success","output":"hello world\n"}
+{"type":"result","timestamp":"t","status":"success","stats":{}}
+EOF
+
+cat > "$TMPDIR_TEST/plan_ready_events.txt" << 'EOF'
+{"type":"init","timestamp":"t","session_id":"s","model":"premium"}
+{"type":"message","timestamp":"t","role":"user","content":"test\n"}
+{"type":"tool_use","timestamp":"t","tool_name":"attempt_completion","tool_id":"tool-1","parameters":{"result":"<<<RALPHEX:PLAN_READY>>>"}}
+{"type":"tool_result","timestamp":"t","tool_id":"tool-1","status":"success","output":"<<<RALPHEX:PLAN_READY>>>"}
 {"type":"result","timestamp":"t","status":"success","stats":{}}
 EOF
 
@@ -729,16 +740,19 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# test: automatic phase selection and unchanged prompt delivery
+# test: automatic phase selection and prompt delivery
 # ---------------------------------------------------------------------------
 echo "test: automatic phase selection"
 
 assert_selected_mode() {
     local expected="$1"
     local test_prompt="$2"
+    local events_file="$TMPDIR_TEST/minimal_events.txt"
+
+    [[ "$expected" == "ralphex-plan" ]] && events_file="$TMPDIR_TEST/plan_ready_events.txt"
 
     rm -f "$TMPDIR_TEST/bob_args" "$TMPDIR_TEST/bob_prompt"
-    MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
+    MOCK_STDOUT_FILE="$events_file" \
         PATH="$TMPDIR_TEST:$PATH" \
         bash "$WRAPPER" -p "$test_prompt" >/dev/null 2>&1
 
@@ -747,7 +761,11 @@ assert_selected_mode() {
     else
         fail "prompt did not select $expected" "args: $(cat "$TMPDIR_TEST/bob_args")"
     fi
-    if [[ "$(cat "$TMPDIR_TEST/bob_prompt")" == "$test_prompt" ]]; then
+    if [[ "$expected" == "ralphex-plan" ]] &&
+        grep -qi 'call attempt_completion exactly once' "$TMPDIR_TEST/bob_prompt" &&
+        [[ "$(cat "$TMPDIR_TEST/bob_prompt")" == *"$test_prompt" ]]; then
+        pass "plan protocol adapter prepended while preserving original prompt"
+    elif [[ "$expected" != "ralphex-plan" && "$(cat "$TMPDIR_TEST/bob_prompt")" == "$test_prompt" ]]; then
         pass "prompt delivered unchanged for $expected"
     else
         fail "prompt changed while selecting $expected" "got: $(cat "$TMPDIR_TEST/bob_prompt")"
@@ -813,9 +831,12 @@ assert_prompt_file_mode() {
     local expected="$1"
     local prompt_file="$2"
     local expected_prompt
+    local events_file="$TMPDIR_TEST/minimal_events.txt"
+
+    [[ "$expected" == "ralphex-plan" ]] && events_file="$TMPDIR_TEST/plan_ready_events.txt"
 
     rm -f "$TMPDIR_TEST/bob_args" "$TMPDIR_TEST/bob_prompt"
-    MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
+    MOCK_STDOUT_FILE="$events_file" \
         PATH="$TMPDIR_TEST:$PATH" \
         bash "$WRAPPER" < "$prompt_file" >/dev/null 2>&1
     if grep -q -- "--chat-mode=$expected" "$TMPDIR_TEST/bob_args"; then
@@ -825,7 +846,11 @@ assert_prompt_file_mode() {
             "args: $(cat "$TMPDIR_TEST/bob_args")"
     fi
     expected_prompt=$(cat "$prompt_file")
-    if [[ "$(cat "$TMPDIR_TEST/bob_prompt")" == "$expected_prompt" ]]; then
+    if [[ "$expected" == "ralphex-plan" ]] &&
+        grep -qi 'call attempt_completion exactly once' "$TMPDIR_TEST/bob_prompt" &&
+        [[ "$(cat "$TMPDIR_TEST/bob_prompt")" == *"$expected_prompt" ]]; then
+        pass "$(basename "$prompt_file") received plan protocol adapter and original prompt"
+    elif [[ "$expected" != "ralphex-plan" && "$(cat "$TMPDIR_TEST/bob_prompt")" == "$expected_prompt" ]]; then
         pass "$(basename "$prompt_file") passed unchanged through stdin"
     else
         fail "$(basename "$prompt_file") changed on stdin delivery"
@@ -880,6 +905,143 @@ if [[ "$(cat "$TMPDIR_TEST/bob_prompt")" == "$override_prompt" ]]; then
     pass "built-in override preserves original prompt"
 else
     fail "built-in override changed original prompt" "got: $(cat "$TMPDIR_TEST/bob_prompt")"
+fi
+
+# ---------------------------------------------------------------------------
+# test: plan mode exposes intermediary deltas and injects Bob protocol
+# ---------------------------------------------------------------------------
+echo "test: plan mode invocation and protocol adapter"
+
+plan_prompt=$'<<<RALPHEX:QUESTION>>>\n<<<RALPHEX:PLAN_DRAFT>>>\n<<<RALPHEX:PLAN_READY>>>'
+rm -f "$TMPDIR_TEST/bob_args" "$TMPDIR_TEST/bob_prompt"
+MOCK_STDOUT_FILE="$TMPDIR_TEST/plan_ready_events.txt" \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "$plan_prompt" >/dev/null 2>&1
+recorded=$(cat "$TMPDIR_TEST/bob_args")
+if echo "$recorded" | grep -q -- "--hide-intermediary-output"; then
+    fail "plan mode must expose intermediary assistant deltas" "args: $recorded"
+else
+    pass "plan mode omits --hide-intermediary-output"
+fi
+if grep -qi 'attempt_completion exactly once' "$TMPDIR_TEST/bob_prompt" &&
+    grep -qi 'ralphex alone owns that log' "$TMPDIR_TEST/bob_prompt"; then
+    pass "plan prompt contains terminal-tool and progress ownership rules"
+else
+    fail "plan protocol adapter missing required rules" "prompt: $(cat "$TMPDIR_TEST/bob_prompt")"
+fi
+
+# ---------------------------------------------------------------------------
+# regression: Bob emits a valid intermediary QUESTION, then would replace it
+# with a malformed attempt_completion summary. The wrapper must stop at END.
+# ---------------------------------------------------------------------------
+echo "test: intermediary QUESTION boundary recovery"
+
+cat > "$TMPDIR_TEST/plan_intermediary_question.jsonl" << 'EOF'
+{"type":"init","timestamp":"t","session_id":"s","model":"premium"}
+{"type":"message","timestamp":"t","role":"assistant","content":"<thinking>Example only: <<<RALPHEX:QUESTION>>> {bad} <<<RALPHEX:END>>></thinking>\n","delta":true}
+{"type":"message","timestamp":"t","role":"assistant","content":"<<<RALPHEX:QUES","delta":true}
+{"type":"message","timestamp":"t","role":"assistant","content":"TION>>>\n{\"question\":\"Which mode?\",\"options\":[\"TCP\",\"UDP\"]}\n","delta":true}
+{"type":"message","timestamp":"t","role":"assistant","content":"<<<RALPHEX:END>>>\n","delta":true}
+{"type":"message","timestamp":"t","role":"user","content":"This is an automated message: use a tool"}
+{"type":"tool_use","timestamp":"t","tool_name":"attempt_completion","parameters":{"result":"Signal: <<<RALPHEX:QUESTION>>>\nQuestion: Which mode?"}}
+{"type":"result","timestamp":"t","status":"success","stats":{}}
+EOF
+
+output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/plan_intermediary_question.jsonl" \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "$plan_prompt" 2>/dev/null)
+question_text=$(echo "$output" | jq -r 'select(.type=="content_block_delta" and .delta.text != "") | .delta.text')
+if [[ "$question_text" == $'<<<RALPHEX:QUESTION>>>\n{"question":"Which mode?","options":["TCP","UDP"]}\n<<<RALPHEX:END>>>' ]]; then
+    pass "complete intermediary QUESTION recovered as one boundary"
+else
+    fail "intermediary QUESTION was not recovered exactly" "text: $question_text"
+fi
+if echo "$question_text" | grep -q 'automated message\|Signal:'; then
+    fail "post-boundary Bob continuation leaked" "text: $question_text"
+else
+    pass "post-boundary Bob continuation suppressed"
+fi
+
+# ---------------------------------------------------------------------------
+# test: correctly formatted attempt_completion QUESTION remains the fast path
+# ---------------------------------------------------------------------------
+echo "test: attempt_completion QUESTION validation"
+
+cat > "$TMPDIR_TEST/plan_completion_question.jsonl" << 'EOF'
+{"type":"tool_use","timestamp":"t","tool_name":"attempt_completion","parameters":{"result":"<<<RALPHEX:QUESTION>>>\n{\"question\":\"Choose stack?\",\"options\":[\"JS\",\"TS\"]}\n<<<RALPHEX:END>>>"}}
+{"type":"result","timestamp":"t","status":"success","stats":{}}
+EOF
+output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/plan_completion_question.jsonl" \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "$plan_prompt" 2>/dev/null)
+if echo "$output" | jq -e 'select(.type=="content_block_delta" and (.delta.text | contains("\"question\":\"Choose stack?\"")) and (.delta.text | contains("<<<RALPHEX:END>>>")))' >/dev/null 2>&1; then
+    pass "valid attempt_completion QUESTION forwarded"
+else
+    fail "valid attempt_completion QUESTION rejected" "output: $output"
+fi
+
+# Bob may ignore the prompt's preferred 2-4 option count. Ralphex's parser only
+# requires a non-empty string array, so the adapter must not reject an otherwise
+# valid boundary before ralphex can display it.
+cat > "$TMPDIR_TEST/plan_completion_many_options.jsonl" << 'EOF'
+{"type":"tool_use","timestamp":"t","tool_name":"attempt_completion","parameters":{"result":"\n<<<RALPHEX:QUESTION>>>\n{\"question\": \"Which planet?\", \"options\": [\"Mercury\", \"Venus\", \"Earth\", \"Mars\", \"Outer planet\", \"Multiple planets\"]}\n<<<RALPHEX:END>>>\n"}}
+{"type":"result","timestamp":"t","status":"success","stats":{}}
+EOF
+output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/plan_completion_many_options.jsonl" \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "$plan_prompt" 2>/dev/null)
+if echo "$output" | jq -e 'select(.type=="content_block_delta" and (.delta.text | contains("Multiple planets")) and (.delta.text | contains("<<<RALPHEX:END>>>")))' >/dev/null 2>&1; then
+    pass "QUESTION with more than four options follows ralphex parser contract"
+else
+    fail "valid QUESTION with many options rejected" "output: $output"
+fi
+
+# ---------------------------------------------------------------------------
+# test: malformed terminal QUESTION fails closed instead of starting iteration 2
+# ---------------------------------------------------------------------------
+echo "test: malformed plan boundary fails closed"
+
+cat > "$TMPDIR_TEST/plan_malformed_question.jsonl" << 'EOF'
+{"type":"tool_use","timestamp":"t","tool_name":"attempt_completion","parameters":{"result":"Signal: <<<RALPHEX:QUESTION>>>\nQuestion: Choose stack?\nOptions: JS, TS"}}
+{"type":"result","timestamp":"t","status":"success","stats":{}}
+EOF
+set +e
+output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/plan_malformed_question.jsonl" \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "$plan_prompt" 2>/dev/null)
+malformed_exit=$?
+set -e
+if [[ $malformed_exit -ne 0 ]]; then
+    pass "malformed QUESTION exits non-zero"
+else
+    fail "malformed QUESTION should fail closed" "output: $output"
+fi
+if echo "$output" | jq -e 'select(.type=="content_block_delta" and (.delta.text | contains("complete valid ralphex plan boundary")))' >/dev/null 2>&1; then
+    pass "malformed QUESTION reports a clear adapter error"
+else
+    fail "malformed QUESTION error missing" "output: $output"
+fi
+
+# ---------------------------------------------------------------------------
+# test: intermediary PLAN_DRAFT stops at END and discards trailing prose
+# ---------------------------------------------------------------------------
+echo "test: intermediary PLAN_DRAFT boundary"
+
+cat > "$TMPDIR_TEST/plan_intermediary_draft.jsonl" << 'EOF'
+{"type":"message","timestamp":"t","role":"assistant","content":"<thinking>planning</thinking>\n<<<RALPHEX:PLAN_DRAFT>>>\n# Draft\n\n## Overview\nBody.\n","delta":true}
+{"type":"message","timestamp":"t","role":"assistant","content":"<<<RALPHEX:END>>>\nThis must not leak","delta":true}
+{"type":"result","timestamp":"t","status":"success","stats":{}}
+EOF
+output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/plan_intermediary_draft.jsonl" \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "$plan_prompt" 2>/dev/null)
+draft_text=$(echo "$output" | jq -r 'select(.type=="content_block_delta" and .delta.text != "") | .delta.text')
+if echo "$draft_text" | grep -q '<<<RALPHEX:PLAN_DRAFT>>>' &&
+    echo "$draft_text" | grep -q '<<<RALPHEX:END>>>' &&
+    ! echo "$draft_text" | grep -q 'must not leak'; then
+    pass "PLAN_DRAFT boundary preserved and truncated"
+else
+    fail "PLAN_DRAFT boundary handling failed" "text: $draft_text"
 fi
 
 # ---------------------------------------------------------------------------

@@ -421,7 +421,7 @@ The wrapper covers task and review phases only. Plan creation mode (`ralphex --p
 
 The repository includes a wrapper at `scripts/bob-as-claude/bob-as-claude.sh` that translates the IBM Bob Shell CLI's (`bob`) `--output-format=stream-json` JSONL event stream to Claude stream-json format. It uses `jq` for JSON parsing and `awk` for fence-aware phase detection.
 
-The wrapper runs bob with an automatically selected `--chat-mode=<slug>`, `--output-format=stream-json`, `--hide-intermediary-output`, `--yolo`, and `--trust`, then passes the prompt on stdin (avoiding the per-arg command-line length cap). With `--hide-intermediary-output`, bob emits only lifecycle events plus a final `attempt_completion` tool event; the wrapper extracts the complete result text from `attempt_completion.parameters.result`, splits it into line-level `content_block_delta` events, and emits a terminal `result` event.
+The wrapper runs bob with an automatically selected `--chat-mode=<slug>`, `--output-format=stream-json`, `--yolo`, and `--trust`, then passes the prompt on stdin. Task and review runs use `--hide-intermediary-output` and translate the final `attempt_completion` result. Plan runs expose and buffer assistant deltas, prepend a strict Bob terminal-tool protocol, validate the first complete ralphex plan boundary, and terminate Bob before its forced continuation can replace that boundary with a prose summary.
 
 ### Setup
 
@@ -454,7 +454,7 @@ The shipped mode tool groups are exact:
 |---|---|---|
 | `ralphex-task` | `read`, `edit`, `command`, `browser` | Complete one task section at a time; also handles finalize prompts. |
 | `ralphex-review` | `read`, `edit`, `command`, `browser` | Run review assignments sequentially, verify findings, apply fixes, test, commit, and emit ralphex signals. |
-| `ralphex-plan` | `read`, `command`, `browser` | Explore and create a plan without editing source files. |
+| `ralphex-plan` | `read`, `edit`, `command`, `browser` | Explore without source edits and write the accepted plan under `docs/plans`. |
 
 ### Environment variables
 
@@ -462,7 +462,7 @@ The shipped mode tool groups are exact:
 |---|---|---|
 | `BOB_CHAT_MODE` | automatic | Any non-empty built-in slug (`ask`, `code`, `plan`, or `advanced`) or custom-mode slug is passed through unchanged and overrides prompt detection. Empty selects a shipped ralphex mode. |
 | `BOB_MODEL` | (bob default) | Model passed as `-m` when ralphex does not supply `--model`. bob 1.0.6+ supports `-m`/`--model`. |
-| `BOB_VERBOSE` | `0` | Set to `1` to include `tool_result` output and `[tool]` markers in the stream (default: only `attempt_completion` result text is shown). |
+| `BOB_VERBOSE` | `0` | Set to `1` to include task/review `tool_result` output and `[tool]` markers. Plan mode emits only its validated boundary. |
 | `BOB_EXTRA_ARGS` | (none) | Extra flags appended verbatim to the bob invocation (word-split on whitespace, **no quote preservation**); e.g. `--max-coins=100` to cap spend. |
 
 ### Model and effort mapping
@@ -486,13 +486,14 @@ The wrapper translates bob JSONL events as follows:
 | bob event | Claude event |
 |---|---|
 | `tool_use` + `tool_name == "attempt_completion"` | `content_block_delta` for each line of `parameters.result` |
+| plan-mode assistant `message` deltas containing a complete valid boundary | one `content_block_delta` through `<<<RALPHEX:END>>>`, or the exact terminal marker |
 | `tool_result` + `status == "error"` | `content_block_delta` with `[tool_error] <output>` (always emitted) |
 | `tool_result` + `status == "success"` | skipped by default; `[tool_result] <output>` when `BOB_VERBOSE=1` |
 | `tool_use` + other tool names | skipped by default; `[tool] <name>` when `BOB_VERBOSE=1` |
 | `init`, `message` (user echo), suppressed events | empty keepalive delta |
 | `result` | `{"type":"result","result":""}` (end of execution) |
 
-bob sometimes emits a bare plaintext line between `tool_result` and `result` (the final answer echo). The wrapper's `jq` pipeline tolerates non-JSON lines, so this line is silently skipped — the same text is already captured from `attempt_completion.parameters.result`.
+bob sometimes emits a bare plaintext line between `tool_result` and `result` (the final answer echo). The task/review pipeline silently skips it because the same text is captured from `attempt_completion.parameters.result`. In plan mode, complete thinking sections and non-boundary text are suppressed. `QUESTION` JSON is validated, `PLAN_DRAFT` must be nonempty, and a run without a complete valid boundary exits non-zero.
 
 A fallback `{"type":"result","result":""}` is always emitted, covering bob exiting without a `result` event. Stderr is captured and emitted as `content_block_delta` events after the main stream for error/limit pattern detection, and bob's exit code is preserved. Any literal `<<<RALPHEX:` token on stderr is neutralized first (rewritten to `<<< RALPHEX:` with an inserted space), so a stray signal token echoed in bob diagnostics cannot be mistaken for a real completion signal — rate-limit and `API Error:` phrases pass through verbatim.
 
@@ -512,7 +513,7 @@ The wrapper invokes bob with `--yolo --trust` so tool calls are auto-approved an
 {"type":"result","result":""}
 ```
 
-Review instructions are stored in the `customInstructions` field of `ralphex-review`, not injected into the prompt. The wrapper passes review prompts unchanged. Plan instructions, including the `QUESTION`, `PLAN_DRAFT`, and `PLAN_READY` workflow, are stored in `ralphex-plan`; task and finalize instructions are stored in `ralphex-task`.
+Review instructions are stored in the `customInstructions` field of `ralphex-review`; the wrapper passes review prompts unchanged. Plan instructions are stored in `ralphex-plan` and reinforced by a wrapper-prepended protocol requiring the exact boundary in `attempt_completion.result` and forbidding writes to the ralphex progress log. The wrapper can recover a valid intermediary boundary if Bob ignores that instruction. Task and finalize instructions are stored in `ralphex-task`.
 
 ## Writing your own wrapper
 

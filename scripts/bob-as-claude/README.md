@@ -8,7 +8,7 @@ IBM Bob Shell CLI (`bob`) wrapper for ralphex, allowing bob to replace Claude Co
 
 Wraps the IBM Bob Shell CLI to produce Claude-compatible stream-json output. It translates bob's `--output-format=stream-json` JSONL event stream into the `content_block_delta` / `result` events that ralphex's `ClaudeExecutor` parses.
 
-The wrapper runs bob with an automatically selected `--chat-mode=<slug>`, `--output-format=stream-json`, `--hide-intermediary-output`, `--yolo`, and `--trust`, then passes the prompt on stdin (not argv) to avoid the 128KB per-arg cap on large review prompts. `--hide-intermediary-output` suppresses token-level assistant deltas, giving a clean event stream where `attempt_completion.parameters.result` carries the complete result text. `--yolo --trust` auto-approve tool calls and write to the real filesystem (without `--trust`, bob's writes go to a sandbox and don't persist).
+The wrapper runs bob with an automatically selected `--chat-mode=<slug>`, `--output-format=stream-json`, `--yolo`, and `--trust`, then passes the prompt on stdin (not argv) to avoid the 128KB per-arg cap on large prompts. Task and review runs add `--hide-intermediary-output` and translate `attempt_completion.parameters.result`. Plan runs keep assistant deltas visible, prepend a Bob-specific terminal-tool protocol, and stop at the first complete validated `QUESTION`, `PLAN_DRAFT`, `PLAN_READY`, or `TASK_FAILED` boundary. This prevents Bob's forced tool-use continuation from replacing a valid interactive boundary with a malformed prose summary.
 
 Automatic selection uses the shipped `ralphex-task`, `ralphex-review`, and `ralphex-plan` custom modes. Install them before using automatic selection; the wrapper does not silently fall back to a built-in mode when a shipped mode is absent.
 
@@ -45,13 +45,13 @@ The shipped modes have these exact tool groups:
 |---|---|---|
 | `ralphex-task` | `read`, `edit`, `command`, `browser` | One task section at a time, including task and finalize prompts. |
 | `ralphex-review` | `read`, `edit`, `command`, `browser` | Sequential review-agent work, verified fixes, tests, commits, and ralphex signals. |
-| `ralphex-plan` | `read`, `command`, `browser` | Interactive plan creation without source edits. |
+| `ralphex-plan` | `read`, `edit`, `command`, `browser` | Interactive plan creation without source edits; writes the accepted plan under `docs/plans`. |
 
 **Environment variables:**
 
 - `BOB_CHAT_MODE` — explicit chat-mode slug override. Any non-empty built-in slug (`ask`, `code`, `plan`, or `advanced`) or custom-mode slug is passed through unchanged and overrides automatic phase detection. Empty: select a shipped ralphex mode from the prompt markers.
 - `BOB_MODEL` — model to use (passed as `-m` when ralphex does not supply `--model`)
-- `BOB_VERBOSE` — set to `1` to include `tool_result` output and `[tool]` markers in the stream (default: `0`, only `attempt_completion` result text is shown)
+- `BOB_VERBOSE` — set to `1` to include task/review `tool_result` output and `[tool]` markers (default: `0`; plan mode emits only the validated boundary)
 - `BOB_EXTRA_ARGS` — extra flags appended verbatim to the bob invocation (word-split on whitespace). The wrapper builds the bob command line itself and ignores unknown flags, so this is the only way to pass through arbitrary bob options. Example: `BOB_EXTRA_ARGS="--max-coins=100"`. **Limitation:** word-splitting does NOT preserve quotes; arguments containing spaces or quotes cannot be expressed via `BOB_EXTRA_ARGS`. Use a wrapper script instead.
 
 **Model and effort:** ralphex supplies `--model` and `--effort` with each value in the following argv entry. The wrapper also accepts `--model=<m>` and `--effort=<e>` for direct invocations. Model values are forwarded to bob's `-m` option (bob 1.0.6 supports it; verified empirically). Effort is accepted but **ignored** — bob has no `--effort` flag and rejects it with exit 1 (`Unknown argument: effort`), so the wrapper strips it and prints a one-line stderr note for non-empty values.
@@ -64,7 +64,7 @@ With an empty `BOB_CHAT_MODE`, the wrapper scans prompt text outside fenced ` ``
 - the complete plan signal set `<<<RALPHEX:QUESTION>>>`, `<<<RALPHEX:PLAN_DRAFT>>>`, and `<<<RALPHEX:PLAN_READY>>>` selects `ralphex-plan`;
 - all other prompts, including task and finalize prompts, select `ralphex-task`.
 
-Review markers take precedence over the complete plan signal set. Review instructions live in `ralphex-review.customInstructions`; the wrapper passes the original prompt unchanged and does not prepend a review adapter. `<<<RALPHEX:REVIEW_DONE>>>` is an output signal and is not a phase-selection marker.
+Review markers take precedence over the complete plan signal set. Review instructions live in `ralphex-review.customInstructions`; the wrapper passes review prompts unchanged. Plan prompts receive the strict Bob terminal-tool protocol described below. `<<<RALPHEX:REVIEW_DONE>>>` is an output signal and is not a phase-selection marker.
 
 ### `--trust` and `--yolo`
 
@@ -72,7 +72,9 @@ The wrapper passes `--yolo --trust` so bob auto-approves all tool calls and writ
 
 ### `--hide-intermediary-output`
 
-The wrapper uses `--hide-intermediary-output` to get a clean event stream: only `init`, `message`, `tool_use`, `tool_result`, and `result` events arrive, and `attempt_completion.parameters.result` carries the full result text (not token-split). Without this flag, bob emits token-level `message` deltas that would require line-buffering machinery (like the pi wrapper). Do not override this via `BOB_EXTRA_ARGS`.
+Task and review runs use `--hide-intermediary-output` so `attempt_completion.parameters.result` carries the full result text. Plan runs intentionally omit the flag and buffer token-level assistant `message` deltas. Complete `<thinking>...</thinking>` sections are excluded from boundary detection; the first valid plan boundary is emitted as one Claude text delta, Bob is terminated, and trailing autonomous output is discarded. A correctly formatted `attempt_completion.result` remains the preferred fast path. If Bob exits without any complete valid boundary, the wrapper reports an error and exits non-zero instead of silently starting another plan iteration.
+
+The prepended plan protocol also tells Bob to place the exact boundary in `attempt_completion.result` and never write questions, drafts, or status messages into the ralphex progress log. The shipped `ralphex-plan` mode repeats these rules. Because the installer preserves existing user-owned slugs, remove an older installed `ralphex-plan` entry before rerunning `install-modes.sh` if you want the updated mode instructions; the wrapper-level protocol applies immediately regardless.
 
 ## Testing
 
@@ -109,7 +111,7 @@ The unit test uses a mock bob — no real API calls are made.
 
 ### No assistant text in the progress log
 
-The wrapper emits only `attempt_completion` result text by default and skips tool execution events as noise. To see tool activity (file reads, shell commands, edits), export `BOB_VERBOSE=1` before running ralphex (ralphex passes `claude_command` to the OS verbatim as the executable, so an inline `env VAR=val` prefix would not work — the child inherits the exported environment instead):
+For task and review runs, the wrapper emits only `attempt_completion` result text by default and skips tool execution events as noise. Plan mode intentionally emits only a validated interactive boundary. To see task/review tool activity, export `BOB_VERBOSE=1` before running ralphex (ralphex passes `claude_command` to the OS verbatim as the executable, so an inline `env VAR=val` prefix would not work — the child inherits the exported environment instead):
 
 ```bash
 export BOB_VERBOSE=1

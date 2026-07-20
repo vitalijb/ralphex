@@ -132,10 +132,10 @@ assert_contains \
     "$REPO_ROOT/scripts/bob-as-claude/modes/ralphex-plan.yaml" \
     "- browser" \
     "plan mode allows browser"
-assert_not_contains \
+assert_contains \
     "$REPO_ROOT/scripts/bob-as-claude/modes/ralphex-plan.yaml" \
     "- edit" \
-    "plan mode excludes edit"
+    "plan mode allows accepted plan write"
 
 # wrapper README
 assert_contains \

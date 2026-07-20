@@ -106,8 +106,23 @@ if [[ -z "$selected_chat_mode" ]]; then
     ')
 fi
 
-# build bob arguments. the prompt is delivered through stdin, not argv.
-bob_args=("--chat-mode=$selected_chat_mode" --output-format=stream-json --hide-intermediary-output --yolo --trust)
+# Bob only exposes attempt_completion when intermediary output is hidden. In plan
+# mode that is not sufficient: Bob may print a valid QUESTION / PLAN_DRAFT as an
+# assistant message, then replace it with a prose summary in attempt_completion.
+# Tell it which channel is authoritative, and keep intermediary deltas available
+# as a recovery path if it still fails to follow the terminal-tool contract.
+if [[ "$selected_chat_mode" == "ralphex-plan" ]]; then
+    plan_adapter=$'BOB/RALPHEX PLAN PROTOCOL (strict):\n- Never emit QUESTION, PLAN_DRAFT, PLAN_READY, or TASK_FAILED as ordinary assistant prose.\n- When a plan boundary is ready, call attempt_completion exactly once and put the complete boundary in its result argument.\n- QUESTION result must be exactly <<<RALPHEX:QUESTION>>> followed by one valid JSON object and <<<RALPHEX:END>>>; include no summary or surrounding prose.\n- PLAN_DRAFT result must be exactly the complete <<<RALPHEX:PLAN_DRAFT>>> body through <<<RALPHEX:END>>>; include no trailing prose.\n- PLAN_READY result must be exactly <<<RALPHEX:PLAN_READY>>>. TASK_FAILED result must be exactly <<<RALPHEX:TASK_FAILED>>>.\n- Do not append questions, answers, drafts, markers, or status text to the ralphex progress file; ralphex alone owns that log.\n- Once you call attempt_completion, stop.'
+    prompt="$plan_adapter"$'\n\n'"$prompt"
+fi
+
+# build bob arguments. the prompt is delivered through stdin, not argv. Task and
+# review runs retain the clean terminal-only stream. Plan runs expose assistant
+# deltas so the wrapper can stop on a valid boundary before Bob's forced
+# "you must use a tool" continuation discards it.
+bob_args=("--chat-mode=$selected_chat_mode" --output-format=stream-json)
+[[ "$selected_chat_mode" != "ralphex-plan" ]] && bob_args+=(--hide-intermediary-output)
+bob_args+=(--yolo --trust)
 [[ -n "$model" ]] && bob_args+=(-m "$model")
 if [[ -n "$BOB_EXTRA_ARGS" ]]; then
     read -ra bob_extra_args <<< "$BOB_EXTRA_ARGS"
@@ -142,31 +157,185 @@ trap forward_signal TERM
 bob "${bob_args[@]}" < "$prompt_file" 2>"$stderr_file" > "$stdout_pipe" &
 bob_pid=$!
 
-# translate bob events into claude-compatible text deltas and terminal results.
-jq -Rcn --unbuffered --argjson verbose "$BOB_VERBOSE" '
-    def emit($t): {type: "content_block_delta", delta: {type: "text_delta", text: $t}};
-    inputs | fromjson? | objects |
-        if .type == "tool_use" and (.tool_name // "") == "attempt_completion" then
-            ((.parameters.result // "") | tostring | split("\n")) as $parts
-            | if ($parts[-1] // "") == "" then
-                $parts[0:-1][] | emit(. + "\n")
-              else
-                $parts[] | emit(. + "\n")
-              end
-        elif .type == "result" then
-            {type: "result", result: ""}
-        elif $verbose == 1 and .type == "tool_result" and (.status // "") == "success" then
-            emit(("[tool_result] " + ((.output // "") | tostring) + "\n"))
-        elif .type == "tool_result" and (.status // "") == "error" then
-            emit(("[tool_error] " + ((.output // "") | tostring) + "\n"))
-        elif $verbose == 1 and .type == "tool_use" then
-            emit(("[tool] " + ((.tool_name // "") | tostring) + "\n"))
-        else
-            emit("")
-        end
-' < "$stdout_pipe" 2>/dev/null &
-jq_pid=$!
-wait "$jq_pid" || true
+emit_text_delta() {
+    jq -cn --arg text "$1" \
+        '{type: "content_block_delta", delta: {type: "text_delta", text: $text}}'
+}
+
+emit_keepalive() {
+    printf '%s\n' '{"type":"content_block_delta","delta":{"type":"text_delta","text":""}}'
+}
+
+# Remove complete Bob thinking sections before looking for protocol markers.
+# An unfinished thinking section is hidden as well, so marker examples in model
+# reasoning can never become plan boundaries.
+strip_thinking_blocks() {
+    local text="$1"
+    local before=""
+    local rest=""
+    local after=""
+
+    while [[ "$text" == *"<thinking>"* ]]; do
+        before=${text%%"<thinking>"*}
+        rest=${text#*"<thinking>"}
+        if [[ "$rest" != *"</thinking>"* ]]; then
+            text="$before"
+            break
+        fi
+        after=${rest#*"</thinking>"}
+        text="$before$after"
+    done
+    printf '%s' "$text"
+}
+
+plan_boundary_text=""
+plan_boundary_error=""
+extract_plan_boundary() {
+    local text="$1"
+    local marker=""
+    local rest=""
+    local body=""
+    local candidate=""
+    local candidate_pos=-1
+    local pos=-1
+    local current=""
+    local prefix=""
+
+    plan_boundary_text=""
+    plan_boundary_error=""
+
+    for marker in '<<<RALPHEX:QUESTION>>>' '<<<RALPHEX:PLAN_DRAFT>>>'; do
+        [[ "$text" == *"$marker"* ]] || continue
+        rest=${text#*"$marker"}
+        [[ "$rest" == *'<<<RALPHEX:END>>>'* ]] || continue
+        body=${rest%%'<<<RALPHEX:END>>>'*}
+        current="$marker$body<<<RALPHEX:END>>>"
+        prefix=${text%%"$marker"*}
+        pos=${#prefix}
+
+        if [[ "$marker" == '<<<RALPHEX:QUESTION>>>' ]]; then
+            if ! printf '%s' "$body" | jq -e '
+                type == "object" and
+                (.question | type == "string" and length > 0) and
+                (.options | type == "array" and length > 0) and
+                all(.options[]; type == "string" and length > 0)
+            ' >/dev/null 2>&1; then
+                plan_boundary_error="invalid QUESTION payload from Bob"
+                continue
+            fi
+        elif [[ -z "${body//[[:space:]]/}" ]]; then
+            plan_boundary_error="empty PLAN_DRAFT payload from Bob"
+            continue
+        fi
+
+        if [[ $candidate_pos -lt 0 || $pos -lt $candidate_pos ]]; then
+            candidate="$current"
+            candidate_pos=$pos
+        fi
+    done
+
+    for marker in '<<<RALPHEX:PLAN_READY>>>' '<<<RALPHEX:TASK_FAILED>>>'; do
+        [[ "$text" == *"$marker"* ]] || continue
+        prefix=${text%%"$marker"*}
+        pos=${#prefix}
+        if [[ $candidate_pos -lt 0 || $pos -lt $candidate_pos ]]; then
+            candidate="$marker"
+            candidate_pos=$pos
+        fi
+    done
+
+    [[ $candidate_pos -ge 0 ]] || return 1
+    plan_boundary_text="$candidate"
+    return 0
+}
+
+parse_bob_event() {
+    local line="$1"
+    event_type=""
+    event_role=""
+    event_content=""
+    event_tool=""
+    event_completion=""
+
+    {
+        IFS= read -r -d '' event_type &&
+            IFS= read -r -d '' event_role &&
+            IFS= read -r -d '' event_content &&
+            IFS= read -r -d '' event_tool &&
+            IFS= read -r -d '' event_completion
+    } < <(
+        printf '%s\n' "$line" | jq -j '
+            (.type // ""), "\u0000",
+            (.role // ""), "\u0000",
+            ((.content // "") | tostring), "\u0000",
+            (.tool_name // ""), "\u0000",
+            ((.parameters.result // "") | tostring), "\u0000"
+        ' 2>/dev/null
+    )
+}
+
+intentional_stop=0
+plan_boundary_emitted=0
+
+if [[ "$selected_chat_mode" == "ralphex-plan" ]]; then
+    plan_stream_buffer=""
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -z "$line" ]] && continue
+        if ! parse_bob_event "$line"; then
+            emit_keepalive
+            continue
+        fi
+
+        if [[ "$event_type" == "message" && "$event_role" == "assistant" ]]; then
+            plan_stream_buffer+="$event_content"
+            visible_plan_text=$(strip_thinking_blocks "$plan_stream_buffer")
+            if extract_plan_boundary "$visible_plan_text"; then
+                emit_text_delta "$plan_boundary_text"
+                plan_boundary_emitted=1
+                intentional_stop=1
+                kill -TERM "$bob_pid" 2>/dev/null || true
+                break
+            fi
+        elif [[ "$event_type" == "tool_use" && "$event_tool" == "attempt_completion" ]]; then
+            if extract_plan_boundary "$event_completion"; then
+                emit_text_delta "$plan_boundary_text"
+                plan_boundary_emitted=1
+                intentional_stop=1
+                kill -TERM "$bob_pid" 2>/dev/null || true
+                break
+            fi
+            [[ -n "$plan_boundary_error" ]] || \
+                plan_boundary_error="attempt_completion did not contain a complete valid ralphex plan boundary"
+        fi
+        emit_keepalive
+    done < "$stdout_pipe"
+else
+    # Task/review translation stays terminal-only and line-oriented.
+    jq -Rcn --unbuffered --argjson verbose "$BOB_VERBOSE" '
+        def emit($t): {type: "content_block_delta", delta: {type: "text_delta", text: $t}};
+        inputs | fromjson? | objects |
+            if .type == "tool_use" and (.tool_name // "") == "attempt_completion" then
+                ((.parameters.result // "") | tostring | split("\n")) as $parts
+                | if ($parts[-1] // "") == "" then
+                    $parts[0:-1][] | emit(. + "\n")
+                  else
+                    $parts[] | emit(. + "\n")
+                  end
+            elif .type == "result" then
+                {type: "result", result: ""}
+            elif $verbose == 1 and .type == "tool_result" and (.status // "") == "success" then
+                emit(("[tool_result] " + ((.output // "") | tostring) + "\n"))
+            elif .type == "tool_result" and (.status // "") == "error" then
+                emit(("[tool_error] " + ((.output // "") | tostring) + "\n"))
+            elif $verbose == 1 and .type == "tool_use" then
+                emit(("[tool] " + ((.tool_name // "") | tostring) + "\n"))
+            else
+                emit("")
+            end
+    ' < "$stdout_pipe" 2>/dev/null &
+    jq_pid=$!
+    wait "$jq_pid" || true
+fi
 
 # preserve bob's exit status after the translation process has drained.
 bob_exit=0
@@ -174,8 +343,18 @@ wait "$bob_pid" || bob_exit=$?
 trap - TERM
 bob_pid=""
 
+if [[ "$intentional_stop" == "1" ]]; then
+    bob_exit=0
+fi
+
+if [[ "$selected_chat_mode" == "ralphex-plan" && "$plan_boundary_emitted" == "0" ]]; then
+    [[ -n "$plan_boundary_error" ]] || plan_boundary_error="Bob exited without a complete ralphex plan boundary"
+    emit_text_delta "error: $plan_boundary_error"$'\n'
+    bob_exit=1
+fi
+
 # forward stderr for executor error detection, but neutralize signal-looking text.
-if [[ -s "$stderr_file" ]]; then
+if [[ -s "$stderr_file" && "$intentional_stop" == "0" ]]; then
     while IFS= read -r err_line || [[ -n "$err_line" ]]; do
         [[ -z "$err_line" ]] && continue
         err_line="${err_line//<<<RALPHEX:/<<< RALPHEX:}"
