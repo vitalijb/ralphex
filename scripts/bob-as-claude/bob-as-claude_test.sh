@@ -36,6 +36,214 @@ fail() {
     fi
 }
 
+# build a temporary validator so shipped and installed yaml use the vendored parser.
+yaml_validator_source="$TMPDIR_TEST/yaml_validator.go"
+yaml_validator_bin="$TMPDIR_TEST/yaml-validator"
+cat > "$yaml_validator_source" << 'YAML_VALIDATOR_EOF'
+package main
+
+import (
+	"bytes"
+	"fmt"
+	"io"
+	"os"
+	"strings"
+
+	"gopkg.in/yaml.v3"
+)
+
+var requiredFields = []string{
+	"slug",
+	"name",
+	"description",
+	"roleDefinition",
+	"whenToUse",
+	"customInstructions",
+	"groups",
+}
+
+var allowedGroups = map[string]bool{
+	"read":    true,
+	"edit":    true,
+	"command": true,
+	"browser": true,
+	"mcp":     true,
+}
+
+var ralphexGroups = map[string][]string{
+	"ralphex-task":   {"read", "edit", "command", "browser"},
+	"ralphex-review": {"read", "edit", "command", "browser"},
+	"ralphex-plan":   {"read", "command", "browser"},
+}
+
+func invalid(format string, args ...interface{}) {
+	fmt.Fprintf(os.Stderr, format+"\n", args...)
+	os.Exit(1)
+}
+
+func mapping(node *yaml.Node, label string) map[string]*yaml.Node {
+	if node.Kind != yaml.MappingNode || len(node.Content)%2 != 0 {
+		invalid("%s is not a mapping", label)
+	}
+	fields := make(map[string]*yaml.Node, len(node.Content)/2)
+	for index := 0; index < len(node.Content); index += 2 {
+		key := node.Content[index]
+		if key.Kind != yaml.ScalarNode {
+			invalid("%s has a non-scalar key", label)
+		}
+		if _, exists := fields[key.Value]; exists {
+			invalid("%s has duplicate key %q", label, key.Value)
+		}
+		fields[key.Value] = node.Content[index+1]
+	}
+	return fields
+}
+
+func scalar(fields map[string]*yaml.Node, key string, label string) string {
+	node, ok := fields[key]
+	if !ok || node.Kind != yaml.ScalarNode || strings.TrimSpace(node.Value) == "" {
+		invalid("%s has missing or invalid %s", label, key)
+	}
+	return node.Value
+}
+
+func checkGroups(node *yaml.Node, slug string, strict bool, label string) {
+	if node.Kind != yaml.SequenceNode {
+		invalid("mode %s has non-sequence groups", slug)
+	}
+	groups := make([]string, 0, len(node.Content))
+	seen := make(map[string]bool, len(node.Content))
+	for _, group := range node.Content {
+		if group.Kind != yaml.ScalarNode || !allowedGroups[group.Value] {
+			invalid("mode %s has unsupported tool group %q", slug, group.Value)
+		}
+		if seen[group.Value] {
+			invalid("mode %s has duplicate tool group %q", slug, group.Value)
+		}
+		seen[group.Value] = true
+		groups = append(groups, group.Value)
+	}
+	expected, known := ralphexGroups[slug]
+	if strict && !known {
+		invalid("%s contains unknown strict mode %q", label, slug)
+	}
+	if strict || known && label != "installed override" {
+		if len(groups) != len(expected) {
+			invalid("mode %s has groups %v, expected %v", slug, groups, expected)
+		}
+		for index := range expected {
+			if groups[index] != expected[index] {
+				invalid("mode %s has groups %v, expected %v", slug, groups, expected)
+			}
+		}
+	}
+}
+
+func validate(path string, strict bool, label string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		invalid("read %s: %v", path, err)
+	}
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	var document yaml.Node
+	if err := decoder.Decode(&document); err != nil {
+		invalid("parse %s: %v", path, err)
+	}
+	var extra yaml.Node
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			invalid("%s contains multiple YAML documents", path)
+		}
+		invalid("parse trailing content in %s: %v", path, err)
+	}
+	if document.Kind != yaml.DocumentNode || len(document.Content) != 1 {
+		invalid("%s is not a YAML document", path)
+	}
+	top := mapping(document.Content[0], "top level")
+	modesNode, ok := top["customModes"]
+	if !ok || modesNode.Kind != yaml.SequenceNode || len(modesNode.Content) == 0 {
+		invalid("%s has no customModes sequence", path)
+	}
+	seenSlugs := make(map[string]bool, len(modesNode.Content))
+	for index, modeNode := range modesNode.Content {
+		modeLabel := fmt.Sprintf("%s mode %d", path, index+1)
+		fields := mapping(modeNode, modeLabel)
+		for _, field := range requiredFields {
+			if field == "groups" {
+				if _, ok := fields[field]; !ok {
+					invalid("%s has missing %s", modeLabel, field)
+				}
+				continue
+			}
+			scalar(fields, field, modeLabel)
+		}
+		slug := scalar(fields, "slug", modeLabel)
+		instructions := scalar(fields, "customInstructions", modeLabel)
+		if seenSlugs[slug] {
+			invalid("%s contains duplicate slug %q", path, slug)
+		}
+		seenSlugs[slug] = true
+		checkGroups(fields["groups"], slug, strict, label)
+		if strict && slug == "ralphex-review" {
+			for _, requirement := range []string{
+				"sequentially",
+				"verify every finding",
+				"Fix every confirmed issue",
+				"run the requested tests",
+				"git commit",
+				"<<<RALPHEX:REVIEW_DONE>>>",
+				"<<<RALPHEX:TASK_FAILED>>>",
+			} {
+				if !strings.Contains(instructions, requirement) {
+					invalid("review mode is missing custom instruction %q", requirement)
+				}
+			}
+		}
+	}
+	if strict && len(modesNode.Content) != 1 {
+		invalid("%s strict mode document contains %d modes", path, len(modesNode.Content))
+	}
+}
+
+func main() {
+	strict := false
+	label := "installed override"
+	for _, path := range os.Args[1:] {
+		switch path {
+		case "--strict":
+			strict = true
+			label = "shipped mode"
+		default:
+			validate(path, strict, label)
+		}
+	}
+	if len(os.Args) == 1 {
+		invalid("no YAML documents supplied")
+	}
+}
+YAML_VALIDATOR_EOF
+
+if GOFLAGS=-mod=vendor go build -o "$yaml_validator_bin" "$yaml_validator_source"; then
+    pass "vendored yaml.v3 validator compiled"
+else
+    fail "vendored yaml.v3 validator failed to compile"
+    exit 1
+fi
+
+validate_yaml() {
+    "$yaml_validator_bin" "$@"
+}
+
+assert_yaml_valid() {
+    local label="$1"
+    shift
+    if validate_yaml "$@"; then
+        pass "$label"
+    else
+        fail "$label"
+    fi
+}
+
 # create a mock bob script that records its arguments and emits predefined stdout.
 # MOCK_STDOUT_FILE: file containing text to emit on stdout
 # MOCK_STDERR_FILE: file containing text to emit on stderr
@@ -84,6 +292,13 @@ LINES_EOF
 }
 
 create_mock_bob > /dev/null
+
+# validate every shipped mode against bob's yaml shape and tool allow-list.
+for mode in ralphex-task ralphex-review ralphex-plan; do
+    assert_yaml_valid \
+        "$mode mode parses with the vendored YAML validator" \
+        --strict "$SCRIPT_DIR/modes/$mode.yaml"
+done
 
 # minimal valid bob event stream: one attempt_completion produces output.
 cat > "$TMPDIR_TEST/minimal_events.txt" << 'EOF'
@@ -589,6 +804,22 @@ assert_selected_mode "ralphex-task" $'~~~\nUse the Task tool to launch an agent\
 # an output completion signal alone is not a review start marker.
 assert_selected_mode "ralphex-task" "please review <<<RALPHEX:REVIEW_DONE>>>"
 
+# each plan signal is insufficient on its own, and every incomplete pair stays
+# on the task fallback until the complete signal set is present.
+assert_selected_mode "ralphex-task" "<<<RALPHEX:QUESTION>>>"
+assert_selected_mode "ralphex-task" "<<<RALPHEX:PLAN_DRAFT>>>"
+assert_selected_mode "ralphex-task" "<<<RALPHEX:PLAN_READY>>>"
+assert_selected_mode "ralphex-task" $'<<<RALPHEX:QUESTION>>>\n<<<RALPHEX:PLAN_DRAFT>>>'
+assert_selected_mode "ralphex-task" $'<<<RALPHEX:QUESTION>>>\n<<<RALPHEX:PLAN_READY>>>'
+assert_selected_mode "ralphex-task" $'<<<RALPHEX:PLAN_DRAFT>>>\n<<<RALPHEX:PLAN_READY>>>'
+
+# review markers take precedence even when a plan marker set appears before or
+# after them, while fenced examples remain ordinary task prompt content.
+assert_selected_mode "ralphex-review" "Use the Task tool to launch the reviewer agent"
+assert_selected_mode "ralphex-review" $'<<<RALPHEX:QUESTION>>>\nLaunch Review Agents IN PARALLEL\n<<<RALPHEX:PLAN_READY>>>'
+assert_selected_mode "ralphex-task" $'  ```text\nUse the Task tool to launch an agent\n```'
+assert_selected_mode "ralphex-task" $'  ~~~\n<<<RALPHEX:QUESTION>>>\n<<<RALPHEX:PLAN_DRAFT>>>\n<<<RALPHEX:PLAN_READY>>>\n~~~'
+
 # an explicit custom slug wins over every automatic marker.
 rm -f "$TMPDIR_TEST/bob_args" "$TMPDIR_TEST/bob_prompt"
 override_prompt=$'Launch ALL 5 Review Agents IN PARALLEL\n<<<RALPHEX:QUESTION>>>\n<<<RALPHEX:PLAN_DRAFT>>>\n<<<RALPHEX:PLAN_READY>>>'
@@ -605,6 +836,25 @@ if [[ "$(cat "$TMPDIR_TEST/bob_prompt")" == "$override_prompt" ]]; then
     pass "explicit override preserves original prompt"
 else
     fail "explicit override changed original prompt" "got: $(cat "$TMPDIR_TEST/bob_prompt")"
+fi
+
+# built-in bob slugs remain valid explicit overrides alongside arbitrary custom
+# slugs, and both preserve the prompt byte-for-byte.
+rm -f "$TMPDIR_TEST/bob_args" "$TMPDIR_TEST/bob_prompt"
+override_prompt=$'Launch Review Agents IN PARALLEL\n<<<RALPHEX:PLAN_DRAFT>>>'
+MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
+    BOB_CHAT_MODE="code" \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "$override_prompt" >/dev/null 2>&1
+if grep -q -- "--chat-mode=code" "$TMPDIR_TEST/bob_args"; then
+    pass "built-in BOB_CHAT_MODE override is forwarded"
+else
+    fail "built-in BOB_CHAT_MODE override was not forwarded" "args: $(cat "$TMPDIR_TEST/bob_args")"
+fi
+if [[ "$(cat "$TMPDIR_TEST/bob_prompt")" == "$override_prompt" ]]; then
+    pass "built-in override preserves original prompt"
+else
+    fail "built-in override changed original prompt" "got: $(cat "$TMPDIR_TEST/bob_prompt")"
 fi
 
 # ---------------------------------------------------------------------------
@@ -1108,13 +1358,16 @@ installer_home="$TMPDIR_TEST/home with spaces"
 installer_target="$installer_home/.bob/custom_modes.yaml"
 rm -rf "$installer_home"
 
-# an absent target is created below a HOME path containing spaces.
-HOME="$installer_home" BOB_CUSTOM_MODES_FILE= bash "$INSTALLER" >/dev/null
+# an absent target is created below an isolated HOME path containing spaces.
+env -u BOB_CUSTOM_MODES_FILE HOME="$installer_home" bash "$INSTALLER" >/dev/null
 if [[ -f "$installer_target" ]]; then
     pass "installer creates missing custom-mode document"
 else
     fail "installer did not create missing custom-mode document"
 fi
+assert_yaml_valid \
+    "installer-created document parses with the vendored YAML validator" \
+    "$installer_target"
 for slug in ralphex-task ralphex-review ralphex-plan; do
     slug_count=$(grep -c -- "^  - slug: $slug$" "$installer_target" || true)
     if [[ "$slug_count" -eq 1 ]]; then
@@ -1132,10 +1385,18 @@ cat > "$merge_target" << 'EOF'
 customModes:
   - slug: user-mode
     name: User Mode
+    description: A user-owned mode.
+    roleDefinition: You are a user-owned mode.
+    whenToUse: Use for user-owned work.
+    customInstructions: Follow the user's instructions.
     groups:
       - read
   - slug: ralphex-task
     name: User-Owned Task Mode
+    description: A user-owned task mode.
+    roleDefinition: You are a user-owned task mode.
+    whenToUse: Use for user-owned task work.
+    customInstructions: Follow the user's task instructions.
     groups:
       - read
 EOF
@@ -1145,6 +1406,9 @@ if grep -q -- "name: User Mode" "$merge_target" && grep -q -- "name: User-Owned 
 else
     fail "installer overwrote user-owned modes" "document: $(cat "$merge_target")"
 fi
+assert_yaml_valid \
+    "merged installer document parses and preserves user-owned schemas" \
+    "$merge_target"
 for slug in ralphex-task ralphex-review ralphex-plan; do
     slug_count=$(grep -c -- "^  - slug: $slug$" "$merge_target" || true)
     if [[ "$slug_count" -eq 1 ]]; then
@@ -1161,6 +1425,39 @@ if cmp -s "$merge_target" "$TMPDIR_TEST/merge-before-second-install"; then
     pass "repeated installer run is idempotent"
 else
     fail "repeated installer run changed the document"
+fi
+
+# a document with only some ralphex modes receives only the missing modes.
+partial_home="$TMPDIR_TEST/partial-home"
+partial_target="$partial_home/.bob/custom_modes.yaml"
+mkdir -p "$(dirname "$partial_target")"
+cat > "$partial_target" << 'EOF'
+customModes:
+  - slug: ralphex-review
+    name: Existing Review Override
+    description: An existing review override.
+    roleDefinition: You are an existing review override.
+    whenToUse: Use for an existing review override.
+    customInstructions: Preserve this user-owned review mode.
+    groups:
+      - read
+EOF
+HOME="$partial_home" BOB_CUSTOM_MODES_FILE= bash "$INSTALLER" >/dev/null
+assert_yaml_valid \
+    "partially installed document parses after adding missing modes" \
+    "$partial_target"
+for slug in ralphex-task ralphex-review ralphex-plan; do
+    slug_count=$(grep -c -- "^  - slug: $slug$" "$partial_target" || true)
+    if [[ "$slug_count" -eq 1 ]]; then
+        pass "partial installation contains one $slug"
+    else
+        fail "partial installation contains duplicate or missing $slug" "count: $slug_count"
+    fi
+done
+if grep -q -- "name: Existing Review Override" "$partial_target"; then
+    pass "partial installation preserves existing ralphex slug"
+else
+    fail "partial installation replaced existing ralphex slug"
 fi
 
 # malformed input must fail before replacing the target.
@@ -1182,6 +1479,14 @@ if cmp -s "$bad_target" "$TMPDIR_TEST/bad-before-install"; then
     pass "unsafe installer merge leaves target unchanged"
 else
     fail "unsafe installer merge changed target"
+fi
+
+# wrapper regression tests use the mock bob and no network/api executable.
+if grep -q -- "create_mock_bob" "$SCRIPT_DIR/bob-as-claude_test.sh" \
+    && grep -q -- 'PATH="$TMPDIR_TEST:$PATH"' "$SCRIPT_DIR/bob-as-claude_test.sh"; then
+    pass "wrapper regression tests use mock Bob on PATH"
+else
+    fail "wrapper regression tests do not prove mock Bob usage"
 fi
 
 # ---------------------------------------------------------------------------

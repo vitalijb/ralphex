@@ -332,6 +332,48 @@ assert_not_contains \
     "Review adapter is prepended" \
     "CLAUDE removes stale Bob review-adapter trigger"
 
+# regression-test hardening
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/bob-as-claude_test.sh" \
+    "GOFLAGS=-mod=vendor" \
+    "wrapper tests validate YAML with vendored yaml.v3"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/bob-as-claude_test.sh" \
+    "ralphexGroups" \
+    "wrapper tests assert exact shipped tool groups"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/bob-as-claude_test.sh" \
+    "verify every finding" \
+    "wrapper tests assert review finding verification instructions"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/bob-as-claude_test.sh" \
+    "<<<RALPHEX:REVIEW_DONE>>>" \
+    "wrapper tests assert review signal instructions"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/bob-as-claude_test.sh" \
+    "<<<RALPHEX:QUESTION>>>" \
+    "wrapper tests cover individual plan markers"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/bob-as-claude_test.sh" \
+    "BOB_CHAT_MODE=\"code\"" \
+    "wrapper tests cover built-in overrides"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/bob-as-claude_test.sh" \
+    "partial_target" \
+    "wrapper tests cover partially installed modes"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/bob-as-claude_test.sh" \
+    "env -u BOB_CUSTOM_MODES_FILE" \
+    "wrapper tests isolate the installer's HOME"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/bob-as-claude_test.sh" \
+    "create_mock_bob" \
+    "wrapper tests define a mock Bob"
+assert_not_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/bob-as-claude_test.sh" \
+    "curl " \
+    "wrapper tests do not invoke a network client"
+
 echo ""
 echo "summary: $passed passed, $failed failed, $total total"
 

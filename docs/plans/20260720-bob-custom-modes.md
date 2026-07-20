@@ -103,14 +103,14 @@ Enhance the IBM Bob wrapper with installable ralphex-specific task, review, and 
 - Modify: `scripts/bob-as-claude/bob-as-claude_test.sh`
 - Modify: `scripts/bob-as-claude/bob-as-claude_docs_test.sh`
 
-- [ ] parse every shipped and installer-produced YAML document with a temporary validator using vendored `gopkg.in/yaml.v3`
-- [ ] assert unique slugs, required schema fields, exact tool-group allow-lists, plan-mode exclusion of `edit`, and review-mode inclusion of sequential review and signal instructions
-- [ ] complete the phase-detection matrix, including review precedence, individual plan-signal false positives, fenced markers, built-in overrides, arbitrary custom overrides, and task/finalize fallback
-- [ ] verify installer behavior with absent configuration, unrelated modes, partially installed ralphex modes, repeated installation, malformed input, paths containing spaces, and an isolated `HOME`
-- [ ] verify all tests continue using mock Bob and make no real API calls
-- [ ] run `bash scripts/bob-as-claude/bob-as-claude_test.sh` with zero failures
-- [ ] run `bash scripts/bob-as-claude/bob-as-claude_docs_test.sh` with zero failures
-- [ ] run `make test` and confirm repository coverage remains at least 80%
-- [ ] run `make lint` and resolve all reported issues
-- [ ] verify the working tree contains no unrelated changes and no push was performed
-- [ ] commit the test work as `test(bob-as-claude): add custom mode tests`
+- [x] parse every shipped and installer-produced YAML document with a temporary validator using vendored `gopkg.in/yaml.v3`
+- [x] assert unique slugs, required schema fields, exact tool-group allow-lists, plan-mode exclusion of `edit`, and review-mode inclusion of sequential review and signal instructions
+- [x] complete the phase-detection matrix, including review precedence, individual plan-signal false positives, fenced markers, built-in overrides, arbitrary custom overrides, and task/finalize fallback
+- [x] verify installer behavior with absent configuration, unrelated modes, partially installed ralphex modes, repeated installation, malformed input, paths containing spaces, and an isolated `HOME`
+- [x] verify all tests continue using mock Bob and make no real API calls
+- [x] run `bash scripts/bob-as-claude/bob-as-claude_test.sh` with zero failures
+- [x] run `bash scripts/bob-as-claude/bob-as-claude_docs_test.sh` with zero failures
+- [x] run `make test` and confirm repository coverage remains at least 80%
+- [x] run `make lint` and resolve all reported issues
+- [x] verify the working tree contains no unrelated changes and no push was performed
+- [x] commit the test work as `test(bob-as-claude): add custom mode tests`
