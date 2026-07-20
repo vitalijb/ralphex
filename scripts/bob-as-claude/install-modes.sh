@@ -29,8 +29,12 @@ error() {
 # whose syntax cannot be proved safe without adding a runtime yaml dependency.
 document_is_safe() {
     local file="$1"
-    [[ ! -s "$file" ]] && return 0
-    awk '
+    local wanted_slug="${2:-}"
+    if [[ ! -s "$file" ]]; then
+        [[ -z "$wanted_slug" ]]
+        return
+    fi
+    awk -v wanted_slug="$wanted_slug" '
         function indentation(line) {
             match(line, /^[ ]*/)
             return RLENGTH
@@ -45,7 +49,8 @@ document_is_safe() {
             if (value == "") return 1
             if (value ~ /^[|>][+-]?$/) return 2
             first = substr(value, 1, 1)
-            if (first == "\"" || first == sprintf("%c", 39) ||
+            if (first == "|" || first == ">" || first == "\"" ||
+                first == sprintf("%c", 39) ||
                 index("[]{}&,*!%@`#", first) != 0) return 0
             if (value ~ /^[-?:]([[:space:]]|$)/ ||
                 value ~ /:([[:space:]]|$)/ ||
@@ -163,6 +168,7 @@ document_is_safe() {
         END {
             if (!seen_document || invalid ||
                 (!empty_sequence && (!mode_count || !mode_has_slug))) exit 1
+            if (wanted_slug != "" && !seen_slugs[wanted_slug]) exit 1
         }
     ' "$file"
 }
@@ -170,7 +176,7 @@ document_is_safe() {
 has_slug() {
     local file="$1"
     local slug="$2"
-    grep -Eq -- "^[[:space:]]*(-[[:space:]]+)?slug:[[:space:]]*${slug}[[:space:]]*$" "$file"
+    document_is_safe "$file" "$slug"
 }
 
 mode_indent() {

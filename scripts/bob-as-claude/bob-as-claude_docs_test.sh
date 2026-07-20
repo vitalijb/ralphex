@@ -196,6 +196,14 @@ assert_contains \
     "wrapper README documents plan marker mapping"
 assert_contains \
     "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "exact review headers" \
+    "wrapper README documents strict review markers"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "matching delimiter character" \
+    "wrapper README documents compatible fence closing"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
     "task and finalize prompts" \
     "wrapper README documents task and finalize mapping"
 assert_contains \
@@ -240,6 +248,14 @@ assert_contains \
     "$REPO_ROOT/docs/custom-providers.md" \
     "### Automatic phase mapping" \
     "custom providers doc documents bob chat-mode section"
+assert_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "Exact review headers" \
+    "custom providers doc documents strict review markers"
+assert_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "matching delimiter character" \
+    "custom providers doc documents compatible fence closing"
 assert_contains \
     "$REPO_ROOT/docs/custom-providers.md" \
     "bash scripts/bob-as-claude/install-modes.sh" \

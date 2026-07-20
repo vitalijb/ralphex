@@ -748,16 +748,21 @@ assert_selected_mode() {
 
 assert_selected_mode "ralphex-task" "implement this task"
 assert_selected_mode "ralphex-task" "finalize the completed work"
-assert_selected_mode "ralphex-review" "Launch ALL 5 Review Agents IN PARALLEL"
-assert_selected_mode "ralphex-review" "Launch Review Agents IN PARALLEL"
+assert_selected_mode "ralphex-review" "## Step 2: Launch ALL 5 Review Agents IN PARALLEL"
+assert_selected_mode "ralphex-review" "## Step 2: Launch Review Agents IN PARALLEL"
 assert_selected_mode "ralphex-plan" $'<<<RALPHEX:QUESTION>>>\n<<<RALPHEX:PLAN_DRAFT>>>\n<<<RALPHEX:PLAN_READY>>>'
 
 # review markers take precedence over a complete plan signal set.
-assert_selected_mode "ralphex-review" $'Launch Review Agents IN PARALLEL\n<<<RALPHEX:QUESTION>>>\n<<<RALPHEX:PLAN_DRAFT>>>\n<<<RALPHEX:PLAN_READY>>>'
+assert_selected_mode "ralphex-review" $'## Step 2: Launch Review Agents IN PARALLEL\n<<<RALPHEX:QUESTION>>>\n<<<RALPHEX:PLAN_DRAFT>>>\n<<<RALPHEX:PLAN_READY>>>'
 
 # markers inside either supported fence do not change the task fallback.
-assert_selected_mode "ralphex-task" $'```\nLaunch Review Agents IN PARALLEL\n<<<RALPHEX:QUESTION>>>\n<<<RALPHEX:PLAN_DRAFT>>>\n<<<RALPHEX:PLAN_READY>>>\n```'
-assert_selected_mode "ralphex-task" $'~~~\nUse the Task tool to launch an agent\n~~~'
+assert_selected_mode "ralphex-task" $'```\n## Step 2: Launch Review Agents IN PARALLEL\n<<<RALPHEX:QUESTION>>>\n<<<RALPHEX:PLAN_DRAFT>>>\n<<<RALPHEX:PLAN_READY>>>\n```'
+assert_selected_mode "ralphex-task" $'~~~\nUse the Task tool to launch a general-purpose agent with this prompt:\n~~~'
+
+# only a compatible fence delimiter closes a block; nested shorter and mixed
+# delimiters stay inside the outer fence and cannot expose review markers.
+assert_selected_mode "ralphex-task" $'````markdown\n```text\n## Step 2: Launch Review Agents IN PARALLEL\n```\n````'
+assert_selected_mode "ralphex-task" $'```text\n~~~\nUse the Task tool to launch a general-purpose agent with this prompt:\n~~~\n```'
 
 # an output completion signal alone is not a review start marker.
 assert_selected_mode "ralphex-task" "please review <<<RALPHEX:REVIEW_DONE>>>"
@@ -773,14 +778,19 @@ assert_selected_mode "ralphex-task" $'<<<RALPHEX:PLAN_DRAFT>>>\n<<<RALPHEX:PLAN_
 
 # review markers take precedence even when a plan marker set appears before or
 # after them, while fenced examples remain ordinary task prompt content.
-assert_selected_mode "ralphex-review" "Use the Task tool to launch the reviewer agent"
-assert_selected_mode "ralphex-review" $'<<<RALPHEX:QUESTION>>>\nLaunch Review Agents IN PARALLEL\n<<<RALPHEX:PLAN_READY>>>'
-assert_selected_mode "ralphex-task" $'  ```text\nUse the Task tool to launch an agent\n```'
+assert_selected_mode "ralphex-review" "Use the Task tool to launch a general-purpose agent with this prompt:"
+assert_selected_mode "ralphex-review" "Use the Task tool with model=sonnet to launch a general-purpose agent with this prompt:"
+assert_selected_mode "ralphex-review" $'<<<RALPHEX:QUESTION>>>\n## Step 2: Launch Review Agents IN PARALLEL\n<<<RALPHEX:PLAN_READY>>>'
+assert_selected_mode "ralphex-task" $'  ```text\nUse the Task tool to launch a general-purpose agent with this prompt:\n```'
 assert_selected_mode "ralphex-task" $'  ~~~\n<<<RALPHEX:QUESTION>>>\n<<<RALPHEX:PLAN_DRAFT>>>\n<<<RALPHEX:PLAN_READY>>>\n~~~'
 
 # detection resumes after either fence style closes.
-assert_selected_mode "ralphex-review" $'```text\nLaunch Review Agents IN PARALLEL\n```\nUse the Task tool to launch a reviewer'
-assert_selected_mode "ralphex-review" $'~~~\nUse the Task tool to launch a fake reviewer\n~~~\nLaunch Review Agents IN PARALLEL'
+assert_selected_mode "ralphex-review" $'```text\n## Step 2: Launch Review Agents IN PARALLEL\n```\nUse the Task tool to launch a general-purpose agent with this prompt:'
+assert_selected_mode "ralphex-review" $'~~~\nUse the Task tool to launch a general-purpose agent with this prompt:\n~~~\n## Step 2: Launch Review Agents IN PARALLEL'
+
+# marker-like phrases in ordinary prose are content, not review structure.
+assert_selected_mode "ralphex-task" "Update the Launch Review Agents IN PARALLEL documentation"
+assert_selected_mode "ralphex-task" "Explain how to Use the Task tool to launch an agent"
 
 # a fenced plan marker cannot combine with two outside markers.
 assert_selected_mode "ralphex-task" $'```\n<<<RALPHEX:QUESTION>>>\n```\n<<<RALPHEX:PLAN_DRAFT>>>\n<<<RALPHEX:PLAN_READY>>>'
@@ -816,9 +826,15 @@ assert_prompt_file_mode "ralphex-review" "$prompt_dir/review_first.txt"
 assert_prompt_file_mode "ralphex-review" "$prompt_dir/review_second.txt"
 assert_prompt_file_mode "ralphex-plan" "$prompt_dir/make_plan.txt"
 
+# a user-controlled plan description may mention review marker phrases without
+# overriding the complete plan signal set in the rendered prompt.
+rendered_plan_prompt=$(< "$prompt_dir/make_plan.txt")
+rendered_plan_prompt="${rendered_plan_prompt//\{\{PLAN_DESCRIPTION\}\}/Update the Launch Review Agents IN PARALLEL documentation}"
+assert_selected_mode "ralphex-plan" "$rendered_plan_prompt"
+
 # an explicit custom slug wins over every automatic marker.
 rm -f "$TMPDIR_TEST/bob_args" "$TMPDIR_TEST/bob_prompt"
-override_prompt=$'Launch ALL 5 Review Agents IN PARALLEL\n<<<RALPHEX:QUESTION>>>\n<<<RALPHEX:PLAN_DRAFT>>>\n<<<RALPHEX:PLAN_READY>>>'
+override_prompt=$'## Step 2: Launch ALL 5 Review Agents IN PARALLEL\n<<<RALPHEX:QUESTION>>>\n<<<RALPHEX:PLAN_DRAFT>>>\n<<<RALPHEX:PLAN_READY>>>'
 MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
     BOB_CHAT_MODE="user-defined-mode" \
     PATH="$TMPDIR_TEST:$PATH" \
@@ -837,7 +853,7 @@ fi
 # built-in bob slugs remain valid explicit overrides alongside arbitrary custom
 # slugs, and both preserve the prompt byte-for-byte.
 rm -f "$TMPDIR_TEST/bob_args" "$TMPDIR_TEST/bob_prompt"
-override_prompt=$'Launch Review Agents IN PARALLEL\n<<<RALPHEX:PLAN_DRAFT>>>'
+override_prompt=$'## Step 2: Launch Review Agents IN PARALLEL\n<<<RALPHEX:PLAN_DRAFT>>>'
 MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
     BOB_CHAT_MODE="code" \
     PATH="$TMPDIR_TEST:$PATH" \
@@ -1446,6 +1462,28 @@ else
     fail "partial installation replaced existing ralphex slug"
 fi
 
+# slug-shaped text inside a block scalar is not an installed mode field.
+block_text_target="$TMPDIR_TEST/block-text/custom_modes.yaml"
+mkdir -p "$(dirname "$block_text_target")"
+cat > "$block_text_target" << 'EOF'
+customModes:
+  - slug: user-mode
+    name: User Mode
+    customInstructions: |
+      Example configuration:
+      slug: ralphex-task
+    groups:
+      - read
+EOF
+BOB_CUSTOM_MODES_FILE="$block_text_target" bash "$INSTALLER" >/dev/null
+assert_yaml_valid "block-scalar slug example remains valid after install" \
+    "$block_text_target"
+if [[ "$(grep -c -- '^  - slug: ralphex-task$' "$block_text_target" || true)" -eq 1 ]]; then
+    pass "block-scalar slug text does not suppress mode installation"
+else
+    fail "block-scalar slug text was mistaken for an installed mode"
+fi
+
 # malformed input must fail before replacing the target.
 bad_home="$TMPDIR_TEST/bad-home"
 bad_target="$bad_home/.bob/settings/custom_modes.yaml"
@@ -1511,6 +1549,32 @@ if [[ $quoted_exit -ne 0 ]] &&
 else
     fail "installer changed or accepted an unterminated quoted scalar"
 fi
+
+# malformed block-scalar indicators must fail before replacing the target.
+for invalid_indicator in '|foo' '>foo'; do
+    indicator_name="${invalid_indicator:0:1}"
+    indicator_target="$TMPDIR_TEST/block-indicator-$indicator_name/custom_modes.yaml"
+    mkdir -p "$(dirname "$indicator_target")"
+    cat > "$indicator_target" << EOF
+customModes:
+  - slug: malformed-block
+    name: Malformed Block
+    roleDefinition: $invalid_indicator
+    groups:
+      - read
+EOF
+    indicator_before="$indicator_target.before"
+    cp "$indicator_target" "$indicator_before"
+    set +e
+    BOB_CUSTOM_MODES_FILE="$indicator_target" bash "$INSTALLER" >/dev/null 2>&1
+    indicator_exit=$?
+    set -e
+    if [[ $indicator_exit -ne 0 ]] && cmp -s "$indicator_target" "$indicator_before"; then
+        pass "installer rejects malformed $invalid_indicator block indicator unchanged"
+    else
+        fail "installer changed or accepted malformed $invalid_indicator block indicator"
+    fi
+done
 
 # an explicit override path may contain spaces and bypasses the global target.
 override_target="$TMPDIR_TEST/override path/custom modes.yaml"

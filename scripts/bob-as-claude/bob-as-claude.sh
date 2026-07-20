@@ -61,9 +61,34 @@ fi
 selected_chat_mode="$BOB_CHAT_MODE"
 if [[ -z "$selected_chat_mode" ]]; then
     selected_chat_mode=$(printf '%s\n' "$prompt" | awk '
-        /^[[:space:]]*```/ || /^[[:space:]]*~~~/ { in_fence = !in_fence; next }
-        !in_fence && /Use the Task tool to launch/ { review = 1 }
-        !in_fence && /Launch.*Review Agents IN PARALLEL/ { review = 1 }
+        function fence_run(line, char, i) {
+            sub(/^[[:space:]]*/, "", line)
+            char = substr(line, 1, 1)
+            if (char != "`" && char != "~") return 0
+            for (i = 1; substr(line, i, 1) == char; i++) { }
+            candidate_char = char
+            candidate_rest = substr(line, i)
+            return i - 1
+        }
+        {
+            run = fence_run($0)
+            if (run >= 3) {
+                if (!in_fence) {
+                    in_fence = 1
+                    fence_char = candidate_char
+                    fence_length = run
+                } else if (candidate_char == fence_char &&
+                           run >= fence_length &&
+                           candidate_rest ~ /^[[:space:]]*$/) {
+                    in_fence = 0
+                    fence_char = ""
+                    fence_length = 0
+                }
+                next
+            }
+        }
+        !in_fence && /^[[:space:]]*## Step 2: Launch (ALL 5 )?Review Agents IN PARALLEL[[:space:]]*$/ { review = 1 }
+        !in_fence && /^[[:space:]]*Use the Task tool( with model=[^[:space:]]+)? to launch a [^[:space:]]+ agent with this prompt:[[:space:]]*$/ { review = 1 }
         !in_fence && /<<<RALPHEX:QUESTION>>>/ { question = 1 }
         !in_fence && /<<<RALPHEX:PLAN_DRAFT>>>/ { draft = 1 }
         !in_fence && /<<<RALPHEX:PLAN_READY>>>/ { ready = 1 }

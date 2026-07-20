@@ -471,9 +471,9 @@ ralphex supplies `--model` and `--effort` with each value in the following argv 
 
 ### Automatic phase mapping
 
-When `BOB_CHAT_MODE` is empty, the wrapper scans the prompt outside fenced ` ``` ` and `~~~` blocks. It selects modes in this order:
+When `BOB_CHAT_MODE` is empty, the wrapper scans the prompt outside fenced ` ``` ` and `~~~` blocks. A fence closes only with the matching delimiter character and at least the opening delimiter's length. It selects modes in this order:
 
-1. `Use the Task tool to launch` or `Launch.*Review Agents IN PARALLEL` selects `ralphex-review`.
+1. Exact review headers (`## Step 2: Launch [ALL 5 ]Review Agents IN PARALLEL`) or generated agent lines (`Use the Task tool [with model=...] to launch a <type> agent with this prompt:`) select `ralphex-review`.
 2. The complete set of `<<<RALPHEX:QUESTION>>>`, `<<<RALPHEX:PLAN_DRAFT>>>`, and `<<<RALPHEX:PLAN_READY>>>` selects `ralphex-plan`.
 3. Every other prompt, including task and finalize prompts, selects `ralphex-task`.
 

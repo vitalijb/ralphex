@@ -58,9 +58,9 @@ The shipped modes have these exact tool groups:
 
 ### Automatic phase selection
 
-With an empty `BOB_CHAT_MODE`, the wrapper scans prompt text outside fenced ` ``` ` and `~~~` blocks. The first matching rule wins:
+With an empty `BOB_CHAT_MODE`, the wrapper scans prompt text outside fenced ` ``` ` and `~~~` blocks. A fence closes only with the matching delimiter character and at least the opening delimiter's length. The first matching rule wins:
 
-- review start markers `Use the Task tool to launch` or `Launch.*Review Agents IN PARALLEL` select `ralphex-review`;
+- exact review headers (`## Step 2: Launch [ALL 5 ]Review Agents IN PARALLEL`) or generated agent lines (`Use the Task tool [with model=...] to launch a <type> agent with this prompt:`) select `ralphex-review`;
 - the complete plan signal set `<<<RALPHEX:QUESTION>>>`, `<<<RALPHEX:PLAN_DRAFT>>>`, and `<<<RALPHEX:PLAN_READY>>>` selects `ralphex-plan`;
 - all other prompts, including task and finalize prompts, select `ralphex-task`.
 
