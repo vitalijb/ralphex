@@ -48,6 +48,7 @@ if [[ "$BOB_VERBOSE" != "0" && "$BOB_VERBOSE" != "1" ]]; then
     BOB_VERBOSE=0
 fi
 BOB_EXTRA_ARGS="${BOB_EXTRA_ARGS:-}"
+RALPHEX_EXPECT_SIGNAL="${RALPHEX_EXPECT_SIGNAL:-}"
 
 # resolve the model and retain the existing effort compatibility note.
 model="$model_flag"
@@ -106,6 +107,23 @@ if [[ -z "$selected_chat_mode" ]]; then
     ')
 fi
 
+if [[ "$selected_chat_mode" == "ralphex-plan" ]]; then
+    if [[ -z "$RALPHEX_EXPECT_SIGNAL" ]]; then
+        if [[ "$prompt" == *"<<<RALPHEX:PLAN_READY>>>"* ]]; then
+            RALPHEX_EXPECT_SIGNAL="PLAN_READY"
+        elif [[ "$prompt" == *"<<<RALPHEX:PLAN_DRAFT>>>"* ]]; then
+            RALPHEX_EXPECT_SIGNAL="PLAN_DRAFT"
+        elif [[ "$prompt" == *"<<<RALPHEX:QUESTION>>>"* ]]; then
+            RALPHEX_EXPECT_SIGNAL="QUESTION"
+        fi
+    fi
+    plan_adapter=$'Ralphex plan adapter for Bob:\n- Follow the prompt workflow exactly.\n- Your response is invalid unless it contains the exact required ralphex signal marker for this turn.\n- If planning work is requested, emit <<<RALPHEX:PLAN_DRAFT>>> before any plan body text and emit <<<RALPHEX:END>>> after the draft body.\n- If the user is answering an uncertainty, emit <<<RALPHEX:QUESTION>>> only when the workflow requires it.\n- If the plan file has already been accepted and written, emit <<<RALPHEX:PLAN_READY>>>.\n- Do not replace, rename, or omit any <<<RALPHEX:...>>> marker.'
+    if [[ -n "$RALPHEX_EXPECT_SIGNAL" ]]; then
+        plan_adapter+=$'\n- Required signal for this turn: <<<RALPHEX:'"$RALPHEX_EXPECT_SIGNAL"$'>>>.'
+    fi
+    prompt="$plan_adapter"$'\n\n'"$prompt"
+fi
+
 # build bob arguments. the prompt is delivered through stdin, not argv.
 bob_args=("--chat-mode=$selected_chat_mode" --output-format=stream-json --hide-intermediary-output --yolo --trust)
 [[ -n "$model" ]] && bob_args+=(-m "$model")
@@ -125,6 +143,8 @@ trap cleanup EXIT
 
 stderr_file="$tmp_dir/stderr"
 stdout_pipe="$tmp_dir/stdout.fifo"
+completion_file="$tmp_dir/completion"
+: > "$completion_file"
 mkfifo "$stdout_pipe"
 prompt_file="$tmp_dir/prompt"
 printf '%s' "$prompt" > "$prompt_file"
@@ -143,16 +163,23 @@ bob "${bob_args[@]}" < "$prompt_file" 2>"$stderr_file" > "$stdout_pipe" &
 bob_pid=$!
 
 # translate bob events into claude-compatible text deltas and terminal results.
-jq -Rcn --unbuffered --argjson verbose "$BOB_VERBOSE" '
+jq -Rcn --unbuffered --argjson verbose "$BOB_VERBOSE" --arg completion_file "$completion_file" '
     def emit($t): {type: "content_block_delta", delta: {type: "text_delta", text: $t}};
+    def append_completion($text):
+        ($text + "\u0000")
+        | @sh
+        | "printf %s " + . + " >> " + ($completion_file | @sh)
+        | system;
     inputs | fromjson? | objects |
         if .type == "tool_use" and (.tool_name // "") == "attempt_completion" then
-            ((.parameters.result // "") | tostring | split("\n")) as $parts
+            ((.parameters.result // "") | tostring) as $completion
+            | append_completion($completion)
+            | (($completion | split("\n")) as $parts
             | if ($parts[-1] // "") == "" then
                 $parts[0:-1][] | emit(. + "\n")
               else
                 $parts[] | emit(. + "\n")
-              end
+              end)
         elif .type == "result" then
             {type: "result", result: ""}
         elif $verbose == 1 and .type == "tool_result" and (.status // "") == "success" then
@@ -182,6 +209,46 @@ if [[ -s "$stderr_file" ]]; then
         printf '%s\n' "$err_line" \
             | jq -Rc '{type: "content_block_delta", delta: {type: "text_delta", text: (. + "\n")}}'
     done < "$stderr_file"
+fi
+
+if [[ "$selected_chat_mode" == "ralphex-plan" ]]; then
+    completion_text=$(tr '\0' '\n' < "$completion_file")
+    case "$RALPHEX_EXPECT_SIGNAL" in
+        PLAN_DRAFT)
+            [[ "$completion_text" == *"<<<RALPHEX:PLAN_DRAFT>>>"* ]] || {
+                echo "error: ralphex-plan response missing required signal <<<RALPHEX:PLAN_DRAFT>>>" >&2
+                exit 1
+            }
+            [[ "$completion_text" == *"<<<RALPHEX:END>>>"* ]] || {
+                echo "error: ralphex-plan response missing required signal <<<RALPHEX:END>>>" >&2
+                exit 1
+            }
+            ;;
+        PLAN_READY)
+            [[ "$completion_text" == *"<<<RALPHEX:PLAN_READY>>>"* ]] || {
+                echo "error: ralphex-plan response missing required signal <<<RALPHEX:PLAN_READY>>>" >&2
+                exit 1
+            }
+            ;;
+        QUESTION)
+            [[ "$completion_text" == *"<<<RALPHEX:QUESTION>>>"* ]] || {
+                echo "error: ralphex-plan response missing required signal <<<RALPHEX:QUESTION>>>" >&2
+                exit 1
+            }
+            ;;
+        "")
+            if [[ "$completion_text" != *"<<<RALPHEX:QUESTION>>>"* &&
+                  "$completion_text" != *"<<<RALPHEX:PLAN_DRAFT>>>"* &&
+                  "$completion_text" != *"<<<RALPHEX:PLAN_READY>>>"* ]]; then
+                echo "error: ralphex-plan response missing required ralphex plan signal" >&2
+                exit 1
+            fi
+            ;;
+        *)
+            echo "error: unsupported RALPHEX_EXPECT_SIGNAL value: $RALPHEX_EXPECT_SIGNAL" >&2
+            exit 1
+            ;;
+    esac
 fi
 
 echo '{"type":"result","result":""}'
