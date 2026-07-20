@@ -60,19 +60,19 @@ Enhance the IBM Bob wrapper with installable ralphex-specific task, review, and 
 - Create: `scripts/bob-as-claude/modes/ralphex-review.yaml`
 - Create: `scripts/bob-as-claude/modes/ralphex-plan.yaml`
 
-- [ ] define `ralphex-task` with `read`, `edit`, `command`, and `browser` groups, a one-task-at-a-time implementation role, commit guidance, and interactive `whenToUse` guidance
-- [ ] define `ralphex-review` with `read`, `edit`, `command`, and `browser` groups and move the complete sequential-agent, finding verification, fix, test, commit, and ralphex signal guidance into `customInstructions`
-- [ ] define `ralphex-plan` with only `read`, `command`, and `browser` groups, planning-specific role and selection guidance, and instructions that prevent source edits while retaining the prompt-driven plan-file workflow
-- [ ] add an executable installer that creates `~/.bob/custom_modes.yaml` when absent, preserves unrelated existing modes, appends missing shipped slugs, skips existing slugs as user-owned overrides, and produces no duplicates on repeated runs
-- [ ] make installer updates atomic and fail without changing the target when the existing document cannot be merged safely
-- [ ] replace built-in-only `BOB_CHAT_MODE` validation with explicit override passthrough so arbitrary Bob custom-mode slugs are supported
-- [ ] add fence-aware phase classification with precedence `BOB_CHAT_MODE` override, review start markers, complete plan-creation signal markers, then task/finalize default
-- [ ] pass the selected mode as `--chat-mode=<slug>`, remove review-adapter prompt prepending, and preserve original prompt content
-- [ ] normalize comments touched in the wrapper and tests to the repository's lowercase-comment convention
-- [ ] add focused mock tests for default task/finalize selection, both review-pass markers, plan signal detection, fenced-marker false positives, arbitrary explicit overrides, and unchanged prompt delivery
-- [ ] add isolated installer tests for create, merge, existing-slug preservation, idempotence, and safe failure behavior
-- [ ] run `bash scripts/bob-as-claude/bob-as-claude_test.sh` and resolve all failures
-- [ ] commit the feature as `feat(bob-as-claude): add per-phase custom bob modes`
+- [x] define `ralphex-task` with `read`, `edit`, `command`, and `browser` groups, a one-task-at-a-time implementation role, commit guidance, and interactive `whenToUse` guidance
+- [x] define `ralphex-review` with `read`, `edit`, `command`, and `browser` groups and move the complete sequential-agent, finding verification, fix, test, commit, and ralphex signal guidance into `customInstructions`
+- [x] define `ralphex-plan` with only `read`, `command`, and `browser` groups, planning-specific role and selection guidance, and instructions that prevent source edits while retaining the prompt-driven plan-file workflow
+- [x] add an executable installer that creates `~/.bob/custom_modes.yaml` when absent, preserves unrelated existing modes, appends missing shipped slugs, skips existing slugs as user-owned overrides, and produces no duplicates on repeated runs
+- [x] make installer updates atomic and fail without changing the target when the existing document cannot be merged safely
+- [x] replace built-in-only `BOB_CHAT_MODE` validation with explicit override passthrough so arbitrary Bob custom-mode slugs are supported
+- [x] add fence-aware phase classification with precedence `BOB_CHAT_MODE` override, review start markers, complete plan-creation signal markers, then task/finalize default
+- [x] pass the selected mode as `--chat-mode=<slug>`, remove review-adapter prompt prepending, and preserve original prompt content
+- [x] normalize comments touched in the wrapper and tests to the repository's lowercase-comment convention
+- [x] add focused mock tests for default task/finalize selection, both review-pass markers, plan signal detection, fenced-marker false positives, arbitrary explicit overrides, and unchanged prompt delivery
+- [x] add isolated installer tests for create, merge, existing-slug preservation, idempotence, and safe failure behavior
+- [x] run `bash scripts/bob-as-claude/bob-as-claude_test.sh` and resolve all failures
+- [x] commit the feature as `feat(bob-as-claude): add per-phase custom bob modes`
 
 ### Task 2: Document custom-mode installation and phase mapping
 

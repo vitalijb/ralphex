@@ -105,7 +105,7 @@ echo "running bob-as-claude.sh tests"
 echo ""
 
 # ---------------------------------------------------------------------------
-# test: bob launched with --chat-mode code, --output-format stream-json,
+# test: bob launched with automatic task mode, stream-json output,
 # --hide-intermediary-output, --yolo, --trust, and prompt delivered via stdin
 # ---------------------------------------------------------------------------
 echo "test: bob invocation flags"
@@ -114,7 +114,7 @@ rm -f "$TMPDIR_TEST/bob_args" "$TMPDIR_TEST/bob_prompt"
 run_wrapper -p "test prompt" >/dev/null 2>&1
 
 recorded=$(cat "$TMPDIR_TEST/bob_args")
-for flag in "--chat-mode code" "--output-format stream-json" "--hide-intermediary-output" "--yolo" "--trust"; do
+for flag in "--chat-mode=ralphex-task" "--output-format stream-json" "--hide-intermediary-output" "--yolo" "--trust"; do
     if echo "$recorded" | grep -q -- "$flag"; then
         pass "bob invoked with $flag"
     else
@@ -315,46 +315,21 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# test: BOB_CHAT_MODE env forwarded as --chat-mode
+# test: BOB_CHAT_MODE accepts arbitrary custom slugs
 # ---------------------------------------------------------------------------
-echo "test: BOB_CHAT_MODE env"
+echo "test: arbitrary BOB_CHAT_MODE override"
 
 rm -f "$TMPDIR_TEST/bob_args"
 MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
-    BOB_CHAT_MODE="ask" \
+    BOB_CHAT_MODE="my-custom-mode" \
     PATH="$TMPDIR_TEST:$PATH" \
     bash "$WRAPPER" -p "test prompt" >/dev/null 2>&1
 
 recorded=$(cat "$TMPDIR_TEST/bob_args")
-if echo "$recorded" | grep -q -- "--chat-mode ask"; then
-    pass "BOB_CHAT_MODE=ask forwarded as --chat-mode ask"
+if echo "$recorded" | grep -q -- "--chat-mode=my-custom-mode"; then
+    pass "arbitrary BOB_CHAT_MODE slug forwarded unchanged"
 else
     fail "BOB_CHAT_MODE not forwarded" "args: $recorded"
-fi
-
-# ---------------------------------------------------------------------------
-# test: invalid BOB_CHAT_MODE exits with error
-# ---------------------------------------------------------------------------
-echo "test: invalid BOB_CHAT_MODE"
-
-set +e
-MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
-    BOB_CHAT_MODE="invalid" \
-    PATH="$TMPDIR_TEST:$PATH" \
-    bash "$WRAPPER" -p "test prompt" 2>"$TMPDIR_TEST/chatmode_err" >/dev/null
-chatmode_exit=$?
-set -e
-
-if [[ $chatmode_exit -ne 0 ]]; then
-    pass "invalid BOB_CHAT_MODE exits non-zero"
-else
-    fail "invalid BOB_CHAT_MODE should exit non-zero" "got exit 0"
-fi
-
-if grep -qi "BOB_CHAT_MODE must be one of" "$TMPDIR_TEST/chatmode_err"; then
-    pass "invalid BOB_CHAT_MODE error message is clear"
-else
-    fail "invalid BOB_CHAT_MODE error message missing" "stderr: $(cat "$TMPDIR_TEST/chatmode_err")"
 fi
 
 # ---------------------------------------------------------------------------
@@ -573,148 +548,63 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# test: review-prompt adapter injection (strict trigger on review START markers)
+# test: automatic phase selection and unchanged prompt delivery
 # ---------------------------------------------------------------------------
-echo "test: review-prompt adapter injection (strict trigger)"
+echo "test: automatic phase selection"
 
-# "Use the Task tool to launch" marker triggers the adapter (claude executor's
-# per-agent {{agent:NAME}} expansion form)
-rm -f "$TMPDIR_TEST/bob_prompt"
+assert_selected_mode() {
+    local expected="$1"
+    local test_prompt="$2"
+
+    rm -f "$TMPDIR_TEST/bob_args" "$TMPDIR_TEST/bob_prompt"
+    MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
+        PATH="$TMPDIR_TEST:$PATH" \
+        bash "$WRAPPER" -p "$test_prompt" >/dev/null 2>&1
+
+    if grep -q -- "--chat-mode=$expected" "$TMPDIR_TEST/bob_args"; then
+        pass "prompt selected $expected"
+    else
+        fail "prompt did not select $expected" "args: $(cat "$TMPDIR_TEST/bob_args")"
+    fi
+    if [[ "$(cat "$TMPDIR_TEST/bob_prompt")" == "$test_prompt" ]]; then
+        pass "prompt delivered unchanged for $expected"
+    else
+        fail "prompt changed while selecting $expected" "got: $(cat "$TMPDIR_TEST/bob_prompt")"
+    fi
+}
+
+assert_selected_mode "ralphex-task" "implement this task"
+assert_selected_mode "ralphex-task" "finalize the completed work"
+assert_selected_mode "ralphex-review" "Launch ALL 5 Review Agents IN PARALLEL"
+assert_selected_mode "ralphex-review" "Launch Review Agents IN PARALLEL"
+assert_selected_mode "ralphex-plan" $'<<<RALPHEX:QUESTION>>>\n<<<RALPHEX:PLAN_DRAFT>>>\n<<<RALPHEX:PLAN_READY>>>'
+
+# review markers take precedence over a complete plan signal set.
+assert_selected_mode "ralphex-review" $'Launch Review Agents IN PARALLEL\n<<<RALPHEX:QUESTION>>>\n<<<RALPHEX:PLAN_DRAFT>>>\n<<<RALPHEX:PLAN_READY>>>'
+
+# markers inside either supported fence do not change the task fallback.
+assert_selected_mode "ralphex-task" $'```\nLaunch Review Agents IN PARALLEL\n<<<RALPHEX:QUESTION>>>\n<<<RALPHEX:PLAN_DRAFT>>>\n<<<RALPHEX:PLAN_READY>>>\n```'
+assert_selected_mode "ralphex-task" $'~~~\nUse the Task tool to launch an agent\n~~~'
+
+# an output completion signal alone is not a review start marker.
+assert_selected_mode "ralphex-task" "please review <<<RALPHEX:REVIEW_DONE>>>"
+
+# an explicit custom slug wins over every automatic marker.
+rm -f "$TMPDIR_TEST/bob_args" "$TMPDIR_TEST/bob_prompt"
+override_prompt=$'Launch ALL 5 Review Agents IN PARALLEL\n<<<RALPHEX:QUESTION>>>\n<<<RALPHEX:PLAN_DRAFT>>>\n<<<RALPHEX:PLAN_READY>>>'
 MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
+    BOB_CHAT_MODE="user-defined-mode" \
     PATH="$TMPDIR_TEST:$PATH" \
-    bash "$WRAPPER" -p $'Code review of: feature\n\n## Step 2: Launch ALL 5 Review Agents IN PARALLEL\n\nUse the Task tool to launch a general-purpose agent with this prompt:\n"review quality"\nReport findings only - no positive observations.' >/dev/null 2>&1
-
-sent_prompt=$(cat "$TMPDIR_TEST/bob_prompt")
-if echo "$sent_prompt" | grep -q "Ralphex review adapter for bob"; then
-    pass "review adapter text prepended for review prompts (Task tool marker)"
+    bash "$WRAPPER" -p "$override_prompt" >/dev/null 2>&1
+if grep -q -- "--chat-mode=user-defined-mode" "$TMPDIR_TEST/bob_args"; then
+    pass "explicit custom slug overrides automatic phase selection"
 else
-    fail "review adapter text not prepended" "got: $sent_prompt"
+    fail "explicit custom slug was not forwarded" "args: $(cat "$TMPDIR_TEST/bob_args")"
 fi
-
-# the original review prompt content is preserved after the adapter
-if echo "$sent_prompt" | grep -q "Use the Task tool to launch a general-purpose agent"; then
-    pass "original review prompt preserved in adapted prompt"
+if [[ "$(cat "$TMPDIR_TEST/bob_prompt")" == "$override_prompt" ]]; then
+    pass "explicit override preserves original prompt"
 else
-    fail "original review prompt lost" "got: $sent_prompt"
-fi
-
-# non-review prompts are NOT adapted
-rm -f "$TMPDIR_TEST/bob_prompt"
-run_wrapper -p "just a task prompt" >/dev/null 2>&1
-sent_prompt=$(cat "$TMPDIR_TEST/bob_prompt")
-if echo "$sent_prompt" | grep -q "Ralphex review adapter"; then
-    fail "adapter wrongly injected for non-review prompt" "got: $sent_prompt"
-else
-    pass "non-review prompt left unmodified"
-fi
-
-# ---------------------------------------------------------------------------
-# test: review-adapter trigger on "Launch ALL 5 Review Agents IN PARALLEL" alone
-# (review_first.txt Step 2 header — no per-agent Task tool block needed)
-# ---------------------------------------------------------------------------
-echo "test: review adapter triggers on Launch ALL 5 marker"
-
-rm -f "$TMPDIR_TEST/bob_prompt"
-MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
-    PATH="$TMPDIR_TEST:$PATH" \
-    bash "$WRAPPER" -p $'Code review of: feature\n\n## Step 2: Launch ALL 5 Review Agents IN PARALLEL\n\nCRITICAL: All 5 agent invocations MUST be issued in a single message.' >/dev/null 2>&1
-sent_prompt=$(cat "$TMPDIR_TEST/bob_prompt")
-if echo "$sent_prompt" | grep -q "Ralphex review adapter for bob"; then
-    pass "adapter injected for Launch ALL 5 Review Agents IN PARALLEL marker"
-else
-    fail "adapter NOT injected for Launch ALL 5 marker" "got: $sent_prompt"
-fi
-
-# ---------------------------------------------------------------------------
-# test: review-adapter trigger on "Launch Review Agents IN PARALLEL"
-# (review_second.txt Step 2 header — 2-agent second pass, no "ALL 5")
-# ---------------------------------------------------------------------------
-echo "test: review adapter triggers on Launch Review Agents marker (second pass)"
-
-rm -f "$TMPDIR_TEST/bob_prompt"
-MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
-    PATH="$TMPDIR_TEST:$PATH" \
-    bash "$WRAPPER" -p $'Second code review pass of: feature\n\n## Step 2: Launch Review Agents IN PARALLEL\n\nCRITICAL: Both agent invocations MUST be issued in a single message.' >/dev/null 2>&1
-sent_prompt=$(cat "$TMPDIR_TEST/bob_prompt")
-if echo "$sent_prompt" | grep -q "Ralphex review adapter for bob"; then
-    pass "adapter injected for Launch Review Agents IN PARALLEL marker (second pass)"
-else
-    fail "adapter NOT injected for Launch Review Agents marker" "got: $sent_prompt"
-fi
-
-# ---------------------------------------------------------------------------
-# test: REVIEW_DONE alone (completion signal, NOT a start marker) does NOT trigger
-# ---------------------------------------------------------------------------
-echo "test: REVIEW_DONE alone does NOT trigger adapter"
-
-rm -f "$TMPDIR_TEST/bob_prompt"
-MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
-    PATH="$TMPDIR_TEST:$PATH" \
-    bash "$WRAPPER" -p $'please review\n<<<RALPHEX:REVIEW_DONE>>>' >/dev/null 2>&1
-sent_prompt=$(cat "$TMPDIR_TEST/bob_prompt")
-if echo "$sent_prompt" | grep -q "Ralphex review adapter for bob"; then
-    fail "adapter injected for REVIEW_DONE-only prompt (should NOT fire on completion signal)" "got: $sent_prompt"
-else
-    pass "adapter NOT injected for REVIEW_DONE-only prompt (completion signal, not start)"
-fi
-
-# the REVIEW_DONE signal is still passed through to bob intact
-if echo "$sent_prompt" | grep -q "<<<RALPHEX:REVIEW_DONE>>>"; then
-    pass "REVIEW_DONE signal preserved in prompt even when adapter not injected"
-else
-    fail "REVIEW_DONE signal lost" "got: $sent_prompt"
-fi
-
-# ---------------------------------------------------------------------------
-# test: prompt-injection — review START marker inside code block does NOT trigger
-# ---------------------------------------------------------------------------
-echo "test: prompt-injection false positive avoidance (Task tool in code block)"
-
-rm -f "$TMPDIR_TEST/bob_prompt"
-MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
-    PATH="$TMPDIR_TEST:$PATH" \
-    bash "$WRAPPER" -p $'Look at this code:\n```\nUse the Task tool to launch a general-purpose agent with this prompt:\n"fake"\n```\n' >/dev/null 2>&1
-sent_prompt=$(cat "$TMPDIR_TEST/bob_prompt")
-if echo "$sent_prompt" | grep -q "Ralphex review adapter for bob"; then
-    fail "adapter injected for Task tool marker inside code block (false positive)" "got: $sent_prompt"
-else
-    pass "adapter NOT injected for Task tool marker inside code block"
-fi
-
-# "Launch ALL 5 Review Agents IN PARALLEL" inside a code block also does NOT trigger
-rm -f "$TMPDIR_TEST/bob_prompt"
-MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
-    PATH="$TMPDIR_TEST:$PATH" \
-    bash "$WRAPPER" -p $'```bash\n## Step 2: Launch ALL 5 Review Agents IN PARALLEL\n```\n' >/dev/null 2>&1
-sent_prompt=$(cat "$TMPDIR_TEST/bob_prompt")
-if echo "$sent_prompt" | grep -q "Ralphex review adapter for bob"; then
-    fail "adapter injected for Launch marker inside code block (false positive)" "got: $sent_prompt"
-else
-    pass "adapter NOT injected for Launch marker inside code block"
-fi
-
-# marker after a fenced block closes (valid standalone) DOES trigger
-rm -f "$TMPDIR_TEST/bob_prompt"
-MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
-    PATH="$TMPDIR_TEST:$PATH" \
-    bash "$WRAPPER" -p $'```\ncode here\n```\nUse the Task tool to launch a general-purpose agent with this prompt:\n"real review"\nReport findings only.' >/dev/null 2>&1
-sent_prompt=$(cat "$TMPDIR_TEST/bob_prompt")
-if echo "$sent_prompt" | grep -q "Ralphex review adapter for bob"; then
-    pass "adapter injected for Task tool marker after fence closes"
-else
-    fail "adapter NOT injected for Task tool marker after fence closes" "got: $sent_prompt"
-fi
-
-# ~~~ fence also excluded
-rm -f "$TMPDIR_TEST/bob_prompt"
-MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
-    PATH="$TMPDIR_TEST:$PATH" \
-    bash "$WRAPPER" -p $'~~~\nUse the Task tool to launch a general-purpose agent\n~~~' >/dev/null 2>&1
-sent_prompt=$(cat "$TMPDIR_TEST/bob_prompt")
-if echo "$sent_prompt" | grep -q "Ralphex review adapter for bob"; then
-    fail "adapter injected for Task tool marker inside ~~~ fence" "got: $sent_prompt"
-else
-    pass "adapter NOT injected for Task tool marker inside ~~~ fence"
+    fail "explicit override changed original prompt" "got: $(cat "$TMPDIR_TEST/bob_prompt")"
 fi
 
 # ---------------------------------------------------------------------------
@@ -1143,33 +1033,6 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# test: review-adapter trigger with language-specified fence
-# ---------------------------------------------------------------------------
-echo "test: review adapter with language fence"
-
-rm -f "$TMPDIR_TEST/bob_prompt"
-MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
-    PATH="$TMPDIR_TEST:$PATH" \
-    bash "$WRAPPER" -p $'```python\nUse the Task tool to launch a general-purpose agent with this prompt:\n"fake"\n```\nUse the Task tool to launch a general-purpose agent with this prompt:\n"real"\nReport findings only.' >/dev/null 2>&1
-sent_prompt=$(cat "$TMPDIR_TEST/bob_prompt")
-
-# Count occurrences: the Task tool marker appears twice, but only the standalone
-# one outside the ```python fence should trigger the adapter.
-if echo "$sent_prompt" | grep -q "Ralphex review adapter for bob"; then
-    pass "adapter injected for Task tool marker after language fence closes"
-else
-    fail "adapter not injected for Task tool marker after language fence" "got: $sent_prompt"
-fi
-
-# Verify both Task tool markers are preserved in the prompt
-marker_count=$(echo "$sent_prompt" | grep -c "Use the Task tool to launch a general-purpose agent")
-if [[ "$marker_count" -eq 2 ]]; then
-    pass "both Task tool markers preserved in adapted prompt"
-else
-    fail "Task tool markers missing in adapted prompt" "expected 2, got $marker_count: $sent_prompt"
-fi
-
-# ---------------------------------------------------------------------------
 # test: BOB_EXTRA_ARGS does not expand globs or command substitution
 # ---------------------------------------------------------------------------
 echo "test: BOB_EXTRA_ARGS literal passthrough (no glob expansion)"
@@ -1233,6 +1096,92 @@ if [[ -f "$TMPDIR_TEST/bob_args_lines" ]]; then
     fi
 else
     fail "BOB_EXTRA_ARGS command-substitution test did not record args"
+fi
+
+# ---------------------------------------------------------------------------
+# test: custom-mode installer creates, merges, and fails safely
+# ---------------------------------------------------------------------------
+echo "test: custom-mode installer"
+
+INSTALLER="$SCRIPT_DIR/install-modes.sh"
+installer_home="$TMPDIR_TEST/home with spaces"
+installer_target="$installer_home/.bob/custom_modes.yaml"
+rm -rf "$installer_home"
+
+# an absent target is created below a HOME path containing spaces.
+HOME="$installer_home" BOB_CUSTOM_MODES_FILE= bash "$INSTALLER" >/dev/null
+if [[ -f "$installer_target" ]]; then
+    pass "installer creates missing custom-mode document"
+else
+    fail "installer did not create missing custom-mode document"
+fi
+for slug in ralphex-task ralphex-review ralphex-plan; do
+    slug_count=$(grep -c -- "^  - slug: $slug$" "$installer_target" || true)
+    if [[ "$slug_count" -eq 1 ]]; then
+        pass "installer adds $slug once"
+    else
+        fail "installer did not add $slug exactly once" "count: $slug_count"
+    fi
+done
+
+# a user-owned mode and a user-owned ralphex slug are preserved during a merge.
+merge_home="$TMPDIR_TEST/merge-home"
+merge_target="$merge_home/.bob/custom_modes.yaml"
+mkdir -p "$(dirname "$merge_target")"
+cat > "$merge_target" << 'EOF'
+customModes:
+  - slug: user-mode
+    name: User Mode
+    groups:
+      - read
+  - slug: ralphex-task
+    name: User-Owned Task Mode
+    groups:
+      - read
+EOF
+HOME="$merge_home" BOB_CUSTOM_MODES_FILE= bash "$INSTALLER" >/dev/null
+if grep -q -- "name: User Mode" "$merge_target" && grep -q -- "name: User-Owned Task Mode" "$merge_target"; then
+    pass "installer preserves unrelated and existing ralphex modes"
+else
+    fail "installer overwrote user-owned modes" "document: $(cat "$merge_target")"
+fi
+for slug in ralphex-task ralphex-review ralphex-plan; do
+    slug_count=$(grep -c -- "^  - slug: $slug$" "$merge_target" || true)
+    if [[ "$slug_count" -eq 1 ]]; then
+        pass "merged document contains one $slug"
+    else
+        fail "merged document contains duplicate or missing $slug" "count: $slug_count"
+    fi
+done
+
+# a second run is a byte-for-byte no-op.
+cp "$merge_target" "$TMPDIR_TEST/merge-before-second-install"
+HOME="$merge_home" BOB_CUSTOM_MODES_FILE= bash "$INSTALLER" >/dev/null
+if cmp -s "$merge_target" "$TMPDIR_TEST/merge-before-second-install"; then
+    pass "repeated installer run is idempotent"
+else
+    fail "repeated installer run changed the document"
+fi
+
+# malformed input must fail before replacing the target.
+bad_home="$TMPDIR_TEST/bad-home"
+bad_target="$bad_home/.bob/custom_modes.yaml"
+mkdir -p "$(dirname "$bad_target")"
+printf '%s\n' 'this is not a safe customModes document' > "$bad_target"
+cp "$bad_target" "$TMPDIR_TEST/bad-before-install"
+set +e
+HOME="$bad_home" BOB_CUSTOM_MODES_FILE= bash "$INSTALLER" >/dev/null 2>"$TMPDIR_TEST/installer-error"
+installer_exit=$?
+set -e
+if [[ $installer_exit -ne 0 ]]; then
+    pass "installer rejects unsafe existing document"
+else
+    fail "installer accepted unsafe existing document"
+fi
+if cmp -s "$bad_target" "$TMPDIR_TEST/bad-before-install"; then
+    pass "unsafe installer merge leaves target unchanged"
+else
+    fail "unsafe installer merge changed target"
 fi
 
 # ---------------------------------------------------------------------------
