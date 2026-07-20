@@ -61,8 +61,11 @@ fi
 selected_chat_mode="$BOB_CHAT_MODE"
 if [[ -z "$selected_chat_mode" ]]; then
     selected_chat_mode=$(printf '%s\n' "$prompt" | awk '
-        function fence_run(line, char, i) {
-            sub(/^[[:space:]]*/, "", line)
+        function fence_run(line, char, i, leading) {
+            leading = 0
+            while (substr(line, leading + 1, 1) == " ") leading++
+            if (leading > 3 || substr(line, leading + 1, 1) == "\t") return 0
+            line = substr(line, leading + 1)
             char = substr(line, 1, 1)
             if (char != "`" && char != "~") return 0
             for (i = 1; substr(line, i, 1) == char; i++) { }
@@ -74,9 +77,12 @@ if [[ -z "$selected_chat_mode" ]]; then
             run = fence_run($0)
             if (run >= 3) {
                 if (!in_fence) {
-                    in_fence = 1
-                    fence_char = candidate_char
-                    fence_length = run
+                    if (candidate_char != "`" || candidate_rest !~ /`/) {
+                        in_fence = 1
+                        fence_char = candidate_char
+                        fence_length = run
+                        next
+                    }
                 } else if (candidate_char == fence_char &&
                            run >= fence_length &&
                            candidate_rest ~ /^[[:space:]]*$/) {
@@ -84,7 +90,7 @@ if [[ -z "$selected_chat_mode" ]]; then
                     fence_char = ""
                     fence_length = 0
                 }
-                next
+                if (in_fence || candidate_rest ~ /^[[:space:]]*$/) next
             }
         }
         !in_fence && /^[[:space:]]*## Step 2: Launch (ALL 5 )?Review Agents IN PARALLEL[[:space:]]*$/ { review = 1 }

@@ -68,7 +68,7 @@ type mode struct {
 	RoleDefinition     string   `yaml:"roleDefinition"`
 	WhenToUse          string   `yaml:"whenToUse"`
 	CustomInstructions string   `yaml:"customInstructions"`
-	Groups             []string `yaml:"groups"`
+	Groups             []interface{} `yaml:"groups"`
 }
 
 var ralphexGroups = map[string][]string{
@@ -150,11 +150,19 @@ func validate(path string, strict bool) {
 		if !known {
 			invalid("shipped document contains unknown mode %q", current.Slug)
 		}
-		if !reflect.DeepEqual(current.Groups, expectedGroups) {
+		actualGroups := make([]string, 0, len(current.Groups))
+		for _, group := range current.Groups {
+			name, ok := group.(string)
+			if !ok {
+				invalid("mode %s has a non-scalar group", current.Slug)
+			}
+			actualGroups = append(actualGroups, name)
+		}
+		if !reflect.DeepEqual(actualGroups, expectedGroups) {
 			invalid(
 				"mode %s has groups %v, expected %v",
 				current.Slug,
-				current.Groups,
+				actualGroups,
 				expectedGroups,
 			)
 		}
@@ -783,6 +791,11 @@ assert_selected_mode "ralphex-review" "Use the Task tool with model=sonnet to la
 assert_selected_mode "ralphex-review" $'<<<RALPHEX:QUESTION>>>\n## Step 2: Launch Review Agents IN PARALLEL\n<<<RALPHEX:PLAN_READY>>>'
 assert_selected_mode "ralphex-task" $'  ```text\nUse the Task tool to launch a general-purpose agent with this prompt:\n```'
 assert_selected_mode "ralphex-task" $'  ~~~\n<<<RALPHEX:QUESTION>>>\n<<<RALPHEX:PLAN_DRAFT>>>\n<<<RALPHEX:PLAN_READY>>>\n~~~'
+
+# fence-like Markdown that cannot open a fenced block must not suppress later
+# phase markers.
+assert_selected_mode "ralphex-review" $'```literal```\n## Step 2: Launch Review Agents IN PARALLEL'
+assert_selected_mode "ralphex-plan" $'    ```\n<<<RALPHEX:QUESTION>>>\n<<<RALPHEX:PLAN_DRAFT>>>\n<<<RALPHEX:PLAN_READY>>>'
 
 # detection resumes after either fence style closes.
 assert_selected_mode "ralphex-review" $'```text\n## Step 2: Launch Review Agents IN PARALLEL\n```\nUse the Task tool to launch a general-purpose agent with this prompt:'
@@ -1420,6 +1433,32 @@ for slug in ralphex-task ralphex-review ralphex-plan; do
     fi
 done
 
+# bob's documented restricted edit-group form and quoted scalars are preserved.
+restricted_target="$TMPDIR_TEST/restricted/custom_modes.yaml"
+mkdir -p "$(dirname "$restricted_target")"
+cat > "$restricted_target" << 'EOF'
+customModes:
+  - slug: restricted-user-mode
+    name: "Restricted User Mode"
+    description: 'A user-owned restricted mode.'
+    roleDefinition: "Edit only Markdown files."
+    groups:
+      - read
+      - - edit
+        - fileRegex: ".*\\.(md|mdx)$"
+          description: "Markdown files only"
+      - command  # bob documents inline comments on group entries
+EOF
+BOB_CUSTOM_MODES_FILE="$restricted_target" bash "$INSTALLER" >/dev/null
+assert_yaml_valid "documented restricted edit group remains valid after install" \
+    "$restricted_target"
+if grep -q -- 'fileRegex: ".*\\\\.(md|mdx)$"' "$restricted_target" &&
+    grep -q -- 'name: "Restricted User Mode"' "$restricted_target"; then
+    pass "installer preserves quoted scalars and restricted edit groups"
+else
+    fail "installer changed a documented restricted edit group"
+fi
+
 # a second run is a byte-for-byte no-op.
 cp "$merge_target" "$TMPDIR_TEST/merge-before-second-install"
 HOME="$merge_home" BOB_CUSTOM_MODES_FILE= bash "$INSTALLER" >/dev/null
@@ -1550,6 +1589,31 @@ else
     fail "installer changed or accepted an unterminated quoted scalar"
 fi
 
+# a comment-looking line inside a block scalar is content and establishes its
+# indentation; a later deindent that remains under the field is malformed yaml.
+block_comment_target="$TMPDIR_TEST/block-comment-malformed/custom_modes.yaml"
+mkdir -p "$(dirname "$block_comment_target")"
+cat > "$block_comment_target" << 'EOF'
+customModes:
+  - slug: block-comment-malformed
+    customInstructions: |
+        # literal scalar content
+      invalid deindent
+    groups:
+      - read
+EOF
+cp "$block_comment_target" "$TMPDIR_TEST/block-comment-before-install"
+set +e
+BOB_CUSTOM_MODES_FILE="$block_comment_target" bash "$INSTALLER" >/dev/null 2>&1
+block_comment_exit=$?
+set -e
+if [[ $block_comment_exit -ne 0 ]] &&
+    cmp -s "$block_comment_target" "$TMPDIR_TEST/block-comment-before-install"; then
+    pass "installer rejects malformed block indentation after literal hash content"
+else
+    fail "installer changed or accepted malformed block indentation after literal hash content"
+fi
+
 # malformed block-scalar indicators must fail before replacing the target.
 for invalid_indicator in '|foo' '>foo'; do
     indicator_name="${invalid_indicator:0:1}"
@@ -1620,6 +1684,14 @@ if ! grep -q -- 'customModes: \[\]' "$empty_target"; then
 else
     fail "empty customModes sequence was not converted"
 fi
+
+# bob also accepts an empty null-valued customModes key; appending the shipped
+# sequence turns it into the normal block form.
+empty_null_target="$TMPDIR_TEST/empty-null/custom_modes.yaml"
+mkdir -p "$(dirname "$empty_null_target")"
+printf '%s\n' 'customModes: # initially empty' > "$empty_null_target"
+BOB_CUSTOM_MODES_FILE="$empty_null_target" bash "$INSTALLER" >/dev/null
+assert_yaml_valid "empty customModes key installs valid modes" "$empty_null_target"
 
 # alternate valid indentation and a non-leading slug stay valid after append.
 indented_target="$TMPDIR_TEST/four-space/custom_modes.yaml"
