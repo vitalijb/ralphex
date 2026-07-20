@@ -75,17 +75,18 @@ pass_claude_md = true
 # (set to an empty value, "codex_model =", to inherit from ~/.codex/config.toml instead;
 # commenting the line out keeps the gpt-5.5 default)
 # codex_model = gpt-5.5
+codex_model = sol
 
-plan_model = sol:xhigh
-task_model = terra:xhigh
-review_model = sol:xhigh
+plan_model     = sol:xhigh
+task_model     = luna:max
+review_model   = sol:xhigh
 
 # codex_reasoning_effort: reasoning effort level for codex
 # available: low, medium, high, xhigh
 # default: xhigh
 # (set to an empty value, "codex_reasoning_effort =", to inherit from ~/.codex/config.toml
 # instead; commenting the line out keeps the xhigh default)
-# codex_reasoning_effort = xhigh
+codex_reasoning_effort = high
 
 # codex_timeout_ms: timeout for codex execution in milliseconds
 # default: 3600000 (1 hour)
