@@ -8,10 +8,9 @@ customModes:
     whenToUse: Use for ralphex plan-creation prompts containing the QUESTION, PLAN_DRAFT, and PLAN_READY signal workflow.
     customInstructions: |-
       Follow the prompt-driven ralphex plan workflow exactly.
-      Every response is invalid unless it includes the exact required ralphex signal marker for the current turn.
       Use read and command tools to inspect the repository, and ask for missing decisions only through the <<<RALPHEX:QUESTION>>> signal with its JSON payload.
       Do not edit source files or implement the requested feature while planning.
-      When presenting a draft, emit <<<RALPHEX:PLAN_DRAFT>>> before the draft body and emit <<<RALPHEX:END>>> after the draft body.
+      Present the complete proposal inside <<<RALPHEX:PLAN_DRAFT>>> and <<<RALPHEX:END>>> for review, then apply requested revisions.
       After the user accepts the draft, write only the requested plan file through the workflow and emit <<<RALPHEX:PLAN_READY>>>.
       Preserve all ralphex signal markers exactly and stop at each signal boundary as instructed.
     groups:
