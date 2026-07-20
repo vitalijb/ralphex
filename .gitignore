@@ -32,6 +32,7 @@ dist/
 .env.local
 *.local.yml
 *.local.yaml
+.ralphex/config
 
 # claude code project files
 .claude/
