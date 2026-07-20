@@ -419,9 +419,9 @@ The wrapper covers task and review phases only. Plan creation mode (`ralphex --p
 
 ## IBM Bob Shell CLI wrapper (included example)
 
-The repository includes a wrapper at `scripts/bob-as-claude/bob-as-claude.sh` that translates the IBM Bob Shell CLI's (`bob`) `--output-format stream-json` JSONL event stream to Claude stream-json format. It uses `jq` for JSON parsing.
+The repository includes a wrapper at `scripts/bob-as-claude/bob-as-claude.sh` that translates the IBM Bob Shell CLI's (`bob`) `--output-format=stream-json` JSONL event stream to Claude stream-json format. It uses `jq` for JSON parsing.
 
-The wrapper runs bob with `--chat-mode <mode> --output-format stream-json --hide-intermediary-output --yolo --trust` and passes the prompt on stdin (avoiding the per-arg command-line length cap). With `--hide-intermediary-output`, bob emits only lifecycle events plus a final `attempt_completion` tool event; the wrapper extracts the complete result text from `attempt_completion.parameters.result`, splits it into line-level `content_block_delta` events, and emits a terminal `result` event.
+The wrapper runs bob with an automatically selected `--chat-mode=<slug>`, `--output-format=stream-json`, `--hide-intermediary-output`, `--yolo`, and `--trust`, then passes the prompt on stdin (avoiding the per-arg command-line length cap). With `--hide-intermediary-output`, bob emits only lifecycle events plus a final `attempt_completion` tool event; the wrapper extracts the complete result text from `attempt_completion.parameters.result`, splits it into line-level `content_block_delta` events, and emits a terminal `result` event.
 
 ### Setup
 
@@ -436,29 +436,46 @@ For a one-off run without editing config:
 ralphex --claude-command=/path/to/scripts/bob-as-claude/bob-as-claude.sh docs/plans/feature.md
 ```
 
+### Custom-mode installation and selection
+
+Install the three shipped modes before automatic phase selection:
+
+```bash
+bash scripts/bob-as-claude/install-modes.sh
+```
+
+The installer creates `~/.bob/custom_modes.yaml` when absent, preserves unrelated modes, appends missing ralphex modes, skips an existing ralphex slug as a user-owned override, and is idempotent. It validates the document before an atomic replacement; malformed or unsafe input fails without changing the target. Set `BOB_CUSTOM_MODES_FILE=/path/to/custom_modes.yaml` to select another target. Automatic selection requires these modes to be installed; the wrapper does not silently fall back to Bob's built-in modes.
+
+The shipped mode tool groups are exact:
+
+| Mode | Tool groups | Role |
+|---|---|---|
+| `ralphex-task` | `read`, `edit`, `command`, `browser` | Complete one task section at a time; also handles finalize prompts. |
+| `ralphex-review` | `read`, `edit`, `command`, `browser` | Run review assignments sequentially, verify findings, apply fixes, test, commit, and emit ralphex signals. |
+| `ralphex-plan` | `read`, `command`, `browser` | Explore and create a plan without editing source files. |
+
 ### Environment variables
 
 | Variable | Default | Description |
 |---|---|---|
-| `BOB_CHAT_MODE` | `code` | bob chat mode: `ask`, `code`, `plan`, or `advanced`. Use `code` for task/review, `plan` for plan creation (untested). |
-| `BOB_MODEL` | (bob default) | Model passed as `-m` when ralphex does not append a `--model` flag. bob 1.0.6+ supports `-m`/`--model`. |
+| `BOB_CHAT_MODE` | automatic | Any non-empty built-in slug (`ask`, `code`, `plan`, or `advanced`) or custom-mode slug is passed through unchanged and overrides prompt detection. Empty selects a shipped ralphex mode. |
+| `BOB_MODEL` | (bob default) | Model passed as `-m` when ralphex does not append a `--model=<m>` flag. bob 1.0.6+ supports `-m`/`--model`. |
 | `BOB_VERBOSE` | `0` | Set to `1` to include `tool_result` output and `[tool]` markers in the stream (default: only `attempt_completion` result text is shown). |
-| `BOB_EXTRA_ARGS` | (none) | Extra flags appended verbatim to the bob invocation (word-split on whitespace, **no quote preservation**); e.g. `--max-coins 100` to cap spend. |
+| `BOB_EXTRA_ARGS` | (none) | Extra flags appended verbatim to the bob invocation (word-split on whitespace, **no quote preservation**); e.g. `--max-coins=100` to cap spend. |
 
 ### Model and effort mapping
 
-ralphex appends `--model <m>` / `--effort <e>` per phase. The wrapper forwards `--model` to bob's `-m`/`--model` (bob 1.0.6+ supports it). `--effort` is **accepted but ignored** — bob has no `--effort` flag, and passing it would make bob exit with an "Unknown argument" error, so the wrapper strips it. A one-line note is printed to stderr when a non-empty `--effort` value is received.
+ralphex appends `--model=<m>` / `--effort=<e>` per phase. The wrapper forwards `--model=<m>` to bob's `-m`/`--model` (bob 1.0.6+ supports it). `--effort=<e>` is **accepted but ignored** — bob has no `--effort` flag, and passing it would make bob exit with an "Unknown argument" error, so the wrapper strips it. A one-line note is printed to stderr when a non-empty `--effort` value is received.
 
-### Chat modes
+### Automatic phase mapping
 
-ralphex does not tell the wrapper which phase it is in, so a single `BOB_CHAT_MODE` applies to all phases driven by the wrapper.
+When `BOB_CHAT_MODE` is empty, the wrapper scans the prompt outside fenced ` ``` ` and `~~~` blocks. It selects modes in this order:
 
-| Mode | Recommended use |
-|---|---|
-| `ask` | Read-only explanations. Note: bob may still invoke tools, including write tools, in `ask` mode. |
-| `code` | Task execution and review that applies fixes (default). |
-| `plan` | Plan creation (`ralphex --plan`). Untested with bob. |
-| `advanced` | Complex multi-step operations. |
+1. `Use the Task tool to launch` or `Launch.*Review Agents IN PARALLEL` selects `ralphex-review`.
+2. The complete set of `<<<RALPHEX:QUESTION>>>`, `<<<RALPHEX:PLAN_DRAFT>>>`, and `<<<RALPHEX:PLAN_READY>>>` selects `ralphex-plan`.
+3. Every other prompt, including task and finalize prompts, selects `ralphex-task`.
+
+Review markers take precedence over plan markers. Individual plan markers do not select plan mode, and markers inside a fenced block are ignored. `<<<RALPHEX:REVIEW_DONE>>>` is emitted as an output signal and is not a selection marker. A non-empty `BOB_CHAT_MODE=<slug>` override always wins and supports both Bob's built-in modes and arbitrary installed custom-mode slugs.
 
 ### Event translation
 
@@ -493,9 +510,7 @@ The wrapper invokes bob with `--yolo --trust` so tool calls are auto-approved an
 {"type":"result","result":""}
 ```
 
-For review prompts, the wrapper prepends adapter instructions telling bob to execute review agent tasks sequentially using its `read`/`bash`/`edit`/`write` tools, since bob has no parallel sub-agent support (no `Task` tool, no `spawn_agent`/`wait_agent`). The adapter is injected when a review START marker appears in the prompt OUTSIDE fenced code blocks: `Use the Task tool to launch` (per-agent `{{agent:NAME}}` expansion under the claude executor), or a line matching `Launch.*Review Agents IN PARALLEL` (the `review_first.txt` / `review_second.txt` Step 2 headers). The completion signal `<<<RALPHEX:REVIEW_DONE>>>` is NOT a trigger — it is an end-of-review output signal, not a start marker.
-
-The wrapper covers task and review phases only. Plan creation mode (`ralphex --plan`) has no bob-specific adapter for `QUESTION`/`PLAN_DRAFT` handling and is untested with bob.
+Review instructions are stored in the `customInstructions` field of `ralphex-review`, not injected into the prompt. The wrapper passes review prompts unchanged. Plan instructions, including the `QUESTION`, `PLAN_DRAFT`, and `PLAN_READY` workflow, are stored in `ralphex-plan`; task and finalize instructions are stored in `ralphex-task`.
 
 ## Writing your own wrapper
 

@@ -49,6 +49,8 @@ scripts/gemini-as-claude/ # gemini wrapper for Claude-compatible output
 scripts/agy-as-claude/ # Antigravity (agy) CLI wrapper for Claude-compatible output
 scripts/pi-as-claude/ # pi wrapper for Claude-compatible output
 scripts/bob-as-claude/ # IBM Bob Shell CLI wrapper for Claude-compatible output
+scripts/bob-as-claude/modes/ # declarative Bob custom modes for ralphex phases
+scripts/bob-as-claude/install-modes.sh # installs and safely merges the shipped Bob modes
 scripts/hg2git/     # Mercurial-to-git translation script with tests
 scripts/opencode/   # opencode wrapper scripts with tests
 scripts/internal/   # internal dev/CI scripts (prep-toy-test, init-docker, etc.)
@@ -118,7 +120,7 @@ Env vars:
 - bob: `BOB_CHAT_MODE`, `BOB_MODEL`, `BOB_VERBOSE`, `BOB_EXTRA_ARGS`
 Copilot wrapper: native autopilot mode — `--autopilot --no-ask-user --allow-all` for task/review, `--autopilot --allow-all` for plan runs (so `QUESTION` signals surface).
 pi wrapper: line-buffers pi's token-level text deltas so `<<<RALPHEX:...>>>` signals land intact in one `content_block_delta`; suppressed events emit empty keepalive deltas so `idle_timeout` doesn't fire during silent tool runs; literal `<<<RALPHEX:` on re-emitted stderr is neutralized to `<<< RALPHEX:`; the prompt reaches pi via stdin (temp-file redirect), never argv; translation jq runs in the background with an interruptible `wait` so the TERM-forwarding trap fires while pi is alive. Task/review phases only — plan creation mode has no pi adapter.
-bob wrapper: runs bob with `--chat-mode <mode> --output-format stream-json --hide-intermediary-output --yolo --trust`, extracts the complete result from `attempt_completion.parameters.result`, and emits line-level `content_block_delta` events plus a `result`; suppressed events emit empty keepalive deltas; stderr is re-emitted with `<<<RALPHEX:` neutralized. `--model` is forwarded to bob's `-m` (bob 1.0.6+), `--effort` is stripped. Review adapter is prepended only when `<<<RALPHEX:REVIEW_DONE>>>` appears as a standalone line outside fenced code blocks. Task/review phases only — plan creation mode has no bob adapter.
+bob wrapper: runs bob with an automatically selected `--chat-mode=<slug>`, `--output-format=stream-json`, `--hide-intermediary-output`, `--yolo`, and `--trust`, extracts the complete result from `attempt_completion.parameters.result`, and emits line-level `content_block_delta` events plus a `result`; suppressed events emit empty keepalive deltas; stderr is re-emitted with `<<<RALPHEX:` neutralized. `--model=<m>` is forwarded to bob's `-m` (bob 1.0.6+), `--effort=<e>` is stripped. Install `scripts/bob-as-claude/modes/` with `bash scripts/bob-as-claude/install-modes.sh` before automatic selection. Review start markers select `ralphex-review`, the complete `QUESTION`/`PLAN_DRAFT`/`PLAN_READY` signal set selects `ralphex-plan`, and task/finalize prompts select `ralphex-task`; a non-empty `BOB_CHAT_MODE=<slug>` override always wins. Review instructions live in the review mode and the wrapper passes the original prompt unchanged.
 
 ### AWS Bedrock Provider (Docker Wrapper Only)
 

@@ -85,16 +85,16 @@ Enhance the IBM Bob wrapper with installable ralphex-specific task, review, and 
 - Modify: `CLAUDE.md`
 - Modify: `scripts/bob-as-claude/bob-as-claude_docs_test.sh`
 
-- [ ] document the three shipped modes, exact tool groups, installer command, safe merge behavior, existing-slug precedence, and the requirement to install modes before automatic selection
-- [ ] document the mapping from review and plan prompt markers to custom modes, with task and finalize using `ralphex-task`
-- [ ] document `BOB_CHAT_MODE` as an unrestricted explicit override that preserves built-in-mode compatibility
-- [ ] replace review-adapter and "plan creation untested" descriptions with the new mode-driven behavior
-- [ ] update top-level inventories and project conventions for the new `modes/` directory and `install-modes.sh`
-- [ ] correct the stale review-trigger description in `CLAUDE.md`
-- [ ] normalize Bob command examples to `--flag=value` form, including chat-mode and extra-argument examples
-- [ ] extend documentation tests to require the executable installer, all three mode files, installation instructions, phase mapping, override behavior, and updated repository inventories
-- [ ] run both Bob shell test scripts and resolve all failures
-- [ ] commit the documentation as `docs(bob-as-claude): document custom modes and phase mapping`
+- [x] document the three shipped modes, exact tool groups, installer command, safe merge behavior, existing-slug precedence, and the requirement to install modes before automatic selection
+- [x] document the mapping from review and plan prompt markers to custom modes, with task and finalize using `ralphex-task`
+- [x] document `BOB_CHAT_MODE` as an unrestricted explicit override that preserves built-in-mode compatibility
+- [x] replace review-adapter and "plan creation untested" descriptions with the new mode-driven behavior
+- [x] update top-level inventories and project conventions for the new `modes/` directory and `install-modes.sh`
+- [x] correct the stale review-trigger description in `CLAUDE.md`
+- [x] normalize Bob command examples to `--flag=value` form, including chat-mode and extra-argument examples
+- [x] extend documentation tests to require the executable installer, all three mode files, installation instructions, phase mapping, override behavior, and updated repository inventories
+- [x] run both Bob shell test scripts and resolve all failures
+- [x] commit the documentation as `docs(bob-as-claude): document custom modes and phase mapping`
 
 ### Task 3: Harden regression coverage and verify acceptance criteria
 
