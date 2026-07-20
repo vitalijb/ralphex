@@ -108,7 +108,16 @@ if [[ -z "$selected_chat_mode" ]]; then
 fi
 
 if [[ "$selected_chat_mode" == "ralphex-plan" ]]; then
-    plan_adapter=$'Ralphex plan adapter for Bob:\n- Follow the prompt workflow exactly.\n- Your response is invalid unless it contains a valid ralphex plan signal for the current turn.\n- When clarification is needed, emit <<<RALPHEX:QUESTION>>> with its JSON payload and stop at <<<RALPHEX:END>>>.\n- When presenting a draft for review, emit <<<RALPHEX:PLAN_DRAFT>>> before the draft body and emit <<<RALPHEX:END>>> after the draft body.\n- After the user accepts the draft and the requested plan file is written, emit <<<RALPHEX:PLAN_READY>>> and stop.\n- Do not replace, rename, or omit any <<<RALPHEX:...>>> marker.'
+    if [[ -z "$RALPHEX_EXPECT_SIGNAL" ]]; then
+        if [[ "$prompt" == *"<<<RALPHEX:PLAN_READY>>>"* ]]; then
+            RALPHEX_EXPECT_SIGNAL="PLAN_READY"
+        elif [[ "$prompt" == *"<<<RALPHEX:PLAN_DRAFT>>>"* ]]; then
+            RALPHEX_EXPECT_SIGNAL="PLAN_DRAFT"
+        elif [[ "$prompt" == *"<<<RALPHEX:QUESTION>>>"* ]]; then
+            RALPHEX_EXPECT_SIGNAL="QUESTION"
+        fi
+    fi
+    plan_adapter=$'Ralphex plan adapter for Bob:\n- Follow the prompt workflow exactly.\n- Your response is invalid unless it contains the exact required ralphex signal marker for this turn.\n- If planning work is requested, emit <<<RALPHEX:PLAN_DRAFT>>> before any plan body text and emit <<<RALPHEX:END>>> after the draft body.\n- If the user is answering an uncertainty, emit <<<RALPHEX:QUESTION>>> only when the workflow requires it.\n- If the plan file has already been accepted and written, emit <<<RALPHEX:PLAN_READY>>>.\n- Do not replace, rename, or omit any <<<RALPHEX:...>>> marker.'
     if [[ -n "$RALPHEX_EXPECT_SIGNAL" ]]; then
         plan_adapter+=$'\n- Required signal for this turn: <<<RALPHEX:'"$RALPHEX_EXPECT_SIGNAL"$'>>>.'
     fi
@@ -204,57 +213,42 @@ fi
 
 if [[ "$selected_chat_mode" == "ralphex-plan" ]]; then
     completion_text=$(tr '\0' '\n' < "$completion_file")
-    has_question=0
-    has_draft=0
-    has_ready=0
-
-    [[ "$completion_text" == *"<<<RALPHEX:QUESTION>>>"* ]] && has_question=1
-    [[ "$completion_text" == *"<<<RALPHEX:PLAN_DRAFT>>>"* ]] && has_draft=1
-    [[ "$completion_text" == *"<<<RALPHEX:PLAN_READY>>>"* ]] && has_ready=1
-
-    if [[ "$RALPHEX_EXPECT_SIGNAL" == "PLAN_DRAFT" && $has_draft -eq 0 && $has_question -eq 1 ]]; then
-        :
-    elif [[ "$RALPHEX_EXPECT_SIGNAL" == "PLAN_READY" && $has_ready -eq 0 && $has_draft -eq 1 ]]; then
-        :
-    else
-        case "$RALPHEX_EXPECT_SIGNAL" in
-            PLAN_DRAFT)
-                [[ $has_draft -eq 1 ]] || {
-                    echo "error: ralphex-plan response missing required signal <<<RALPHEX:PLAN_DRAFT>>>" >&2
-                    exit 1
-                }
-                ;;
-            PLAN_READY)
-                [[ $has_ready -eq 1 ]] || {
-                    echo "error: ralphex-plan response missing required signal <<<RALPHEX:PLAN_READY>>>" >&2
-                    exit 1
-                }
-                ;;
-            QUESTION)
-                [[ $has_question -eq 1 ]] || {
-                    echo "error: ralphex-plan response missing required signal <<<RALPHEX:QUESTION>>>" >&2
-                    exit 1
-                }
-                ;;
-            "")
-                if [[ $has_question -eq 0 && $has_draft -eq 0 && $has_ready -eq 0 ]]; then
-                    echo "error: ralphex-plan response missing required ralphex plan signal" >&2
-                    exit 1
-                fi
-                ;;
-            *)
-                echo "error: unsupported RALPHEX_EXPECT_SIGNAL value: $RALPHEX_EXPECT_SIGNAL" >&2
+    case "$RALPHEX_EXPECT_SIGNAL" in
+        PLAN_DRAFT)
+            [[ "$completion_text" == *"<<<RALPHEX:PLAN_DRAFT>>>"* ]] || {
+                echo "error: ralphex-plan response missing required signal <<<RALPHEX:PLAN_DRAFT>>>" >&2
                 exit 1
-                ;;
-        esac
-    fi
-
-    if [[ $has_question -eq 1 || $has_draft -eq 1 ]]; then
-        [[ "$completion_text" == *"<<<RALPHEX:END>>>"* ]] || {
-            echo "error: ralphex-plan response missing required signal <<<RALPHEX:END>>>" >&2
+            }
+            [[ "$completion_text" == *"<<<RALPHEX:END>>>"* ]] || {
+                echo "error: ralphex-plan response missing required signal <<<RALPHEX:END>>>" >&2
+                exit 1
+            }
+            ;;
+        PLAN_READY)
+            [[ "$completion_text" == *"<<<RALPHEX:PLAN_READY>>>"* ]] || {
+                echo "error: ralphex-plan response missing required signal <<<RALPHEX:PLAN_READY>>>" >&2
+                exit 1
+            }
+            ;;
+        QUESTION)
+            [[ "$completion_text" == *"<<<RALPHEX:QUESTION>>>"* ]] || {
+                echo "error: ralphex-plan response missing required signal <<<RALPHEX:QUESTION>>>" >&2
+                exit 1
+            }
+            ;;
+        "")
+            if [[ "$completion_text" != *"<<<RALPHEX:QUESTION>>>"* &&
+                  "$completion_text" != *"<<<RALPHEX:PLAN_DRAFT>>>"* &&
+                  "$completion_text" != *"<<<RALPHEX:PLAN_READY>>>"* ]]; then
+                echo "error: ralphex-plan response missing required ralphex plan signal" >&2
+                exit 1
+            fi
+            ;;
+        *)
+            echo "error: unsupported RALPHEX_EXPECT_SIGNAL value: $RALPHEX_EXPECT_SIGNAL" >&2
             exit 1
-        }
-    fi
+            ;;
+    esac
 fi
 
 echo '{"type":"result","result":""}'
