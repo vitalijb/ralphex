@@ -164,6 +164,14 @@ assert_contains \
     "wrapper README documents custom-mode installation"
 assert_contains \
     "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "BOB_REVIEW_GUARD" \
+    "wrapper README documents review guard env var"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "nested agent CLI" \
+    "wrapper README documents nested-agent guard purpose"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
     "ralphex-task" \
     "wrapper README documents task mode"
 assert_contains \

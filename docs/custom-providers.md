@@ -423,6 +423,8 @@ The repository includes a wrapper at `scripts/bob-as-claude/bob-as-claude.sh` th
 
 The wrapper runs bob with an automatically selected `--chat-mode=<slug>`, `--output-format=stream-json`, `--hide-intermediary-output`, `--yolo`, and `--trust`, then passes the prompt on stdin (avoiding the per-arg command-line length cap). With `--hide-intermediary-output`, bob emits only lifecycle events plus a final `attempt_completion` tool event; the wrapper extracts the complete result text from `attempt_completion.parameters.result`, splits it into line-level `content_block_delta` events, and emits a terminal `result` event.
 
+The wrapper merges bob's stdout and stderr into one stream, detects `result` and `tool_result` errors, and can force a non-zero exit on bob failure. In review mode it optionally blocks nested `bob`/`claude`/`codex` CLI invocations using PATH guard shims (`BOB_REVIEW_GUARD=path`, default) or a `bwrap` sandbox (`BOB_REVIEW_GUARD=bwrap`) to prevent the model from emulating parallel sub-agents. Disable with `BOB_REVIEW_GUARD=none`.
+
 ### Setup
 
 ```ini
@@ -464,6 +466,7 @@ The shipped mode tool groups are exact:
 | `BOB_MODEL` | (bob default) | Model passed as `-m` when ralphex does not supply `--model`. bob 1.0.6+ supports `-m`/`--model`. |
 | `BOB_VERBOSE` | `0` | Set to `1` to include `tool_result` output and `[tool]` markers in the stream (default: only `attempt_completion` result text is shown). |
 | `BOB_EXTRA_ARGS` | (none) | Extra flags appended verbatim to the bob invocation (word-split on whitespace, **no quote preservation**); e.g. `--max-coins=100` to cap spend. |
+| `BOB_REVIEW_GUARD` | `path` | How review mode blocks nested agent CLI invocations: `path` (default PATH shims), `bwrap` (sandbox if installed), or `none`. |
 
 ### Model and effort mapping
 
@@ -490,11 +493,11 @@ The wrapper translates bob JSONL events as follows:
 | `tool_result` + `status == "success"` | skipped by default; `[tool_result] <output>` when `BOB_VERBOSE=1` |
 | `tool_use` + other tool names | skipped by default; `[tool] <name>` when `BOB_VERBOSE=1` |
 | `init`, `message` (user echo), suppressed events | empty keepalive delta |
-| `result` | `{"type":"result","result":""}` (end of execution) |
+| `result` | `{"type":"result","result":""}` (end of execution); errors in `result` also emit a diagnostic delta and force a non-zero exit |
 
-bob sometimes emits a bare plaintext line between `tool_result` and `result` (the final answer echo). The wrapper's `jq` pipeline tolerates non-JSON lines, so this line is silently skipped — the same text is already captured from `attempt_completion.parameters.result`.
+bob sometimes emits a bare plaintext line between `tool_result` and `result` (the final answer echo). The wrapper's parser tolerates non-JSON lines, treating them as diagnostics; any literal `<<<RALPHEX:` token in such lines is neutralized first.
 
-A fallback `{"type":"result","result":""}` is always emitted, covering bob exiting without a `result` event. Stderr is captured and emitted as `content_block_delta` events after the main stream for error/limit pattern detection, and bob's exit code is preserved. Any literal `<<<RALPHEX:` token on stderr is neutralized first (rewritten to `<<< RALPHEX:` with an inserted space), so a stray signal token echoed in bob diagnostics cannot be mistaken for a real completion signal — rate-limit and `API Error:` phrases pass through verbatim.
+A fallback `{"type":"result","result":""}` is always emitted, covering bob exiting without a `result` event. Stderr is merged with stdout and emitted as `content_block_delta` events for error/limit pattern detection, and bob's exit code is preserved. Any literal `<<<RALPHEX:` token in diagnostics is neutralized first (rewritten to `<<< RALPHEX:` with an inserted space), so a stray signal token echoed in bob diagnostics cannot be mistaken for a real completion signal — rate-limit and `API Error:` phrases pass through verbatim.
 
 ### Permissions and sandbox
 

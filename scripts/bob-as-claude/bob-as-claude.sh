@@ -9,12 +9,17 @@
 #   BOB_MODEL      - model to use when --model is absent
 #   BOB_VERBOSE    - set to 1 to include tool_result output and tool markers (default: 0)
 #   BOB_EXTRA_ARGS - extra bob arguments, word-split on whitespace
+#   BOB_REVIEW_GUARD - how to block nested agent CLI invocations in review mode
+#                    values: "path" (default), "bwrap" (if available), "none"
 
 set -euo pipefail
 
 # verify required commands before doing any prompt work.
 command -v jq >/dev/null 2>&1 || { echo "error: jq is required but not found" >&2; exit 1; }
-command -v bob >/dev/null 2>&1 || { echo "error: bob is required but not found" >&2; exit 1; }
+if ! bob_executable=$(command -v bob); then
+    echo "error: bob is required but not found" >&2
+    exit 1
+fi
 
 # accept prompts through stdin, with -p retained for direct invocations.
 prompt=""
@@ -43,6 +48,7 @@ fi
 BOB_CHAT_MODE="${BOB_CHAT_MODE:-}"
 BOB_MODEL="${BOB_MODEL:-}"
 BOB_VERBOSE="${BOB_VERBOSE:-0}"
+BOB_REVIEW_GUARD="${BOB_REVIEW_GUARD:-path}"
 if [[ "$BOB_VERBOSE" != "0" && "$BOB_VERBOSE" != "1" ]]; then
     echo "warning: BOB_VERBOSE must be 0 or 1, got '$BOB_VERBOSE', defaulting to 0" >&2
     BOB_VERBOSE=0
@@ -123,13 +129,51 @@ cleanup() {
 }
 trap cleanup EXIT
 
-stderr_file="$tmp_dir/stderr"
-stdout_pipe="$tmp_dir/stdout.fifo"
-mkfifo "$stdout_pipe"
+# Review prompts ask Claude-compatible providers to launch multiple sub-agents.
+# Bob has no native sub-agent orchestration, and may try to emulate it by
+# spawning bob/claude/codex through its command tool. Those nested CLIs inherit
+# credentials and can outlive a timed-out tool call, exhaust provider limits,
+# or deadlock the parent session. Resolve the real top-level Bob executable
+# before placing any guard, so only nested launches are rejected.
+#
+# Two guard strategies:
+#   "path"  - prepend a directory with guard shims for bob/claude/codex to PATH.
+#             Cheap and effective for PATH lookups, but can be bypassed with absolute paths.
+#   "bwrap" - run bob inside a bwrap sandbox with PATH-shims only.
+#             Prevents PATH-based nested launches from reaching real binaries.
+#             Requires bwrap; if unavailable falls back to "path".
+#   "none"  - disable guard entirely (use only if you trust the model and provider).
+if [[ "$selected_chat_mode" == "ralphex-review" && "$BOB_REVIEW_GUARD" != "none" ]]; then
+    review_guard_dir="$tmp_dir/review-agent-guard"
+    mkdir -p "$review_guard_dir"
+    for guarded_cli in bob claude codex; do
+        guard_path="$review_guard_dir/$guarded_cli"
+        printf '%s\n' \
+            '#!/usr/bin/env bash' \
+            'tool_name=${0##*/}' \
+            'printf '\''error: nested %s invocation blocked by bob-as-claude review guard; perform review assignments sequentially in the current Bob session\n'\'' "$tool_name" >&2' \
+            'exit 64' > "$guard_path"
+        chmod +x "$guard_path"
+    done
+    if [[ "$BOB_REVIEW_GUARD" == "bwrap" ]] && command -v bwrap >/dev/null 2>&1; then
+        # bwrap will be applied around bob below.
+        use_bwrap_guard=1
+    else
+        if [[ "$BOB_REVIEW_GUARD" == "bwrap" ]]; then
+            echo "warning: bwrap not found, falling back to PATH guard" >&2
+        fi
+        export PATH="$review_guard_dir:$PATH"
+        use_bwrap_guard=0
+    fi
+fi
+
+# named pipe carrying bob's combined stdout+stderr so one reader preserves live ordering.
+stream_pipe="$tmp_dir/stream.fifo"
+mkfifo "$stream_pipe"
 prompt_file="$tmp_dir/prompt"
 printf '%s' "$prompt" > "$prompt_file"
 
-# forward termination to bob while jq drains the named pipe in the background.
+# forward termination to bob while the translated stream drains.
 bob_pid=""
 forward_signal() {
     if [[ -n "$bob_pid" ]]; then
@@ -139,34 +183,208 @@ forward_signal() {
 }
 trap forward_signal TERM
 
-bob "${bob_args[@]}" < "$prompt_file" 2>"$stderr_file" > "$stdout_pipe" &
+# emit helpers that write claude-compatible JSONL to stdout.
+emit_text_delta() {
+    jq -cn --arg text "$1" \
+        '{type: "content_block_delta", delta: {type: "text_delta", text: $text}}'
+}
+
+emit_keepalive() {
+    jq -cn '{type: "content_block_delta", delta: {type: "text_delta", text: ""}}'
+}
+
+emit_result() {
+    echo '{"type":"result","result":""}'
+}
+
+# strip <thinking> ... </thinking> blocks so internal reasoning does not leak into
+# plan boundary detection.
+strip_thinking_blocks() {
+    local text="$1"
+    while [[ "$text" == *"<thinking"*"<"* ]]; do
+        local before="${text%%<thinking*}"
+        local rest="${text#*<thinking}"
+        # find the matching closing tag; simple approach handles one level.
+        if [[ "$rest" == *"</thinking"*"<"* ]]; then
+            local after="${rest#*</thinking}"
+            text="$before${after#*>}"
+        else
+            break
+        fi
+    done
+    printf '%s' "$text"
+}
+
+# parse a single line of JSON into bash variables. returns 1 on malformed input.
+# extracted fields:
+#   event_type, event_role, event_content, event_tool, event_completion,
+#   event_status, event_output, event_error, event_has_error
+parse_bob_event() {
+    local line="$1"
+    event_type=""
+    event_role=""
+    event_content=""
+    event_tool=""
+    event_completion=""
+    event_status=""
+    event_output=""
+    event_error=""
+    event_has_error="false"
+
+    # fast path: skip jq if the line is obviously not a JSON object.
+    case "$line" in
+        {*}) ;;
+        *) return 1 ;;
+    esac
+
+    {
+        IFS= read -r -d '' event_type &&
+            IFS= read -r -d '' event_role &&
+            IFS= read -r -d '' event_content &&
+            IFS= read -r -d '' event_tool &&
+            IFS= read -r -d '' event_completion &&
+            IFS= read -r -d '' event_status &&
+            IFS= read -r -d '' event_output &&
+            IFS= read -r -d '' event_error &&
+            IFS= read -r -d '' event_has_error
+    } < <(
+        printf '%s\n' "$line" | jq -j '
+            (.type // ""), "\u0000",
+            (.role // ""), "\u0000",
+            ((.content // "") | tostring), "\u0000",
+            (.tool_name // ""), "\u0000",
+            ((.parameters.result // "") | tostring), "\u0000",
+            ((.status // "") | tostring), "\u0000",
+            ((.output // "") | tostring), "\u0000",
+            ((.error.message // .error // .message // "") | tostring), "\u0000",
+            ((.error != null) | tostring), "\u0000"
+        ' 2>/dev/null
+    )
+}
+
+# neutralize literal ralphex signal markers in diagnostic text so ralphex cannot
+# mistake stderr/stream noise for a real completion signal.
+neutralize_signal_text() {
+    printf '%s' "${1//<<<RALPHEX:/<<< RALPHEX:}"
+}
+
+# emit the result field of attempt_completion, splitting on newlines and
+# preserving them as separate content_block_delta events.
+emit_completion_lines() {
+    local completion="$1"
+    local completion_line=""
+
+    while IFS= read -r completion_line || [[ -n "$completion_line" ]]; do
+        emit_text_delta "$completion_line"$'\n'
+    done < <(printf '%s' "$completion")
+}
+
+# plan mode state
+intentional_stop=0
+plan_boundary_emitted=0
+plan_stream_buffer=""
+bob_failure_detail_emitted=0
+bob_result_failed=0
+
+bob_start_seconds=$SECONDS
+
+# plan helper: emit the buffered plan text and stop reading.
+emit_plan_and_stop() {
+    local plan_text="$1"
+    emit_completion_lines "$plan_text"
+    plan_boundary_emitted=1
+    intentional_stop=1
+}
+
+# Merge Bob's descriptors before translation so one reader preserves live ordering
+# without concurrent JSON writers. Non-JSON lines are treated as diagnostics.
+if [[ "${use_bwrap_guard:-0}" == "1" ]]; then
+    # Construct PATH that puts /guard first and excludes the system directories
+    # that contain real bob/claude/codex binaries. This prevents a nested command
+    # from reaching the real executables while preserving the rest of the PATH.
+    guarded_path="/guard:$(printf '%s\n' "$PATH" | tr ':' '\n' | grep -vxE '^/usr/bin$|^/bin$|^/usr/local/bin$' | paste -sd:)"
+    bwrap \
+        --ro-bind "$review_guard_dir" /guard \
+        --bind "$tmp_dir" /tmp-ralphex \
+        --ro-bind /usr /usr \
+        --ro-bind /bin /bin \
+        --ro-bind /lib /lib \
+        --ro-bind /lib64 /lib64 \
+        --ro-bind /etc /etc \
+        --proc /proc \
+        --dev /dev \
+        --unshare-pid \
+        --new-session \
+        --setenv PATH "$guarded_path" \
+        "$bob_executable" "${bob_args[@]}" < "$prompt_file" > "$stream_pipe" 2>&1 &
+else
+    "$bob_executable" "${bob_args[@]}" < "$prompt_file" > "$stream_pipe" 2>&1 &
+fi
 bob_pid=$!
 
-# translate bob events into claude-compatible text deltas and terminal results.
-jq -Rcn --unbuffered --argjson verbose "$BOB_VERBOSE" '
-    def emit($t): {type: "content_block_delta", delta: {type: "text_delta", text: $t}};
-    inputs | fromjson? | objects |
-        if .type == "tool_use" and (.tool_name // "") == "attempt_completion" then
-            ((.parameters.result // "") | tostring | split("\n")) as $parts
-            | if ($parts[-1] // "") == "" then
-                $parts[0:-1][] | emit(. + "\n")
-              else
-                $parts[] | emit(. + "\n")
-              end
-        elif .type == "result" then
-            {type: "result", result: ""}
-        elif $verbose == 1 and .type == "tool_result" and (.status // "") == "success" then
-            emit(("[tool_result] " + ((.output // "") | tostring) + "\n"))
-        elif .type == "tool_result" and (.status // "") == "error" then
-            emit(("[tool_error] " + ((.output // "") | tostring) + "\n"))
-        elif $verbose == 1 and .type == "tool_use" then
-            emit(("[tool] " + ((.tool_name // "") | tostring) + "\n"))
-        else
-            emit("")
-        end
-' < "$stdout_pipe" 2>/dev/null &
-jq_pid=$!
-wait "$jq_pid" || true
+while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" ]] && continue
+
+    if ! parse_bob_event "$line" || [[ -z "$event_type" ]]; then
+        sanitized_line=$(neutralize_signal_text "$line")
+        emit_text_delta "$sanitized_line"$'\n'
+        case "${line,,}" in
+            *error*|*failed*|*failure*|*limit*|*auth*|*required*|*timeout*|*exception*)
+                bob_failure_detail_emitted=1
+                ;;
+        esac
+        continue
+    fi
+
+    if [[ "$selected_chat_mode" == "ralphex-plan" ]]; then
+        if [[ "$event_type" == "message" && "$event_role" == "assistant" ]]; then
+            plan_stream_buffer+="$event_content"
+            visible_plan_text=$(strip_thinking_blocks "$plan_stream_buffer")
+            if [[ "$visible_plan_text" == *"<<<RALPHEX:"*"END>>>"* ]]; then
+                emit_plan_and_stop "$plan_stream_buffer"
+                break
+            fi
+        elif [[ "$event_type" == "tool_use" && "$event_tool" == "attempt_completion" ]]; then
+            # attempt_completion in plan mode can carry the full plan boundary.
+            # Use it directly (not the stream buffer) so we emit exactly what bob produced.
+            plan_completion_text="$event_completion"
+            visible_plan_text=$(strip_thinking_blocks "$plan_completion_text")
+            if [[ "$visible_plan_text" == *"<<<RALPHEX:"*"END>>>"* ]]; then
+                emit_plan_and_stop "$plan_completion_text"
+                break
+            fi
+            # A QUESTION-only completion is a legitimate intermediate step; emit it
+            # and keep reading so the next completion can carry the full boundary.
+            emit_completion_lines "$plan_completion_text"
+        fi
+        emit_keepalive
+        continue
+    fi
+
+    # Task/review translation stays terminal-only and line-oriented.
+    if [[ "$event_type" == "tool_use" && "$event_tool" == "attempt_completion" ]]; then
+        emit_completion_lines "$event_completion"
+    elif [[ "$event_type" == "result" ]]; then
+        if [[ "$event_has_error" == "true" || ( -n "$event_status" && "$event_status" != "success" ) ]]; then
+            result_detail="$event_error"
+            [[ -n "$result_detail" ]] || result_detail="status $event_status"
+            result_detail=$(neutralize_signal_text "$result_detail")
+            emit_text_delta "error: bob result failed: $result_detail"$'\n'
+            bob_failure_detail_emitted=1
+            bob_result_failed=1
+        fi
+        emit_result
+    elif [[ "$event_type" == "tool_result" && "$event_status" == "error" ]]; then
+        emit_text_delta "[tool_error] $event_output"$'\n'
+        bob_failure_detail_emitted=1
+    elif [[ "$BOB_VERBOSE" == "1" && "$event_type" == "tool_result" && "$event_status" == "success" ]]; then
+        emit_text_delta "[tool_result] $event_output"$'\n'
+    elif [[ "$BOB_VERBOSE" == "1" && "$event_type" == "tool_use" ]]; then
+        emit_text_delta "[tool] $event_tool"$'\n'
+    else
+        emit_keepalive
+    fi
+done < "$stream_pipe"
 
 # preserve bob's exit status after the translation process has drained.
 bob_exit=0
@@ -174,15 +392,22 @@ wait "$bob_pid" || bob_exit=$?
 trap - TERM
 bob_pid=""
 
-# forward stderr for executor error detection, but neutralize signal-looking text.
-if [[ -s "$stderr_file" ]]; then
-    while IFS= read -r err_line || [[ -n "$err_line" ]]; do
-        [[ -z "$err_line" ]] && continue
-        err_line="${err_line//<<<RALPHEX:/<<< RALPHEX:}"
-        printf '%s\n' "$err_line" \
-            | jq -Rc '{type: "content_block_delta", delta: {type: "text_delta", text: (. + "\n")}}'
-    done < "$stderr_file"
+if [[ "$intentional_stop" == "1" ]]; then
+    bob_exit=0
+elif [[ "$bob_result_failed" == "1" && "$bob_exit" -eq 0 ]]; then
+    bob_exit=1
 fi
 
-echo '{"type":"result","result":""}'
+if [[ "$selected_chat_mode" == "ralphex-plan" && "$plan_boundary_emitted" == "0" ]]; then
+    emit_text_delta "error: bob plan phase finished without emitting a complete ralphex plan boundary"$'\n'
+    bob_exit=1
+fi
+
+# Bob occasionally exits non-zero after going silent without emitting any diagnostic.
+if [[ "$bob_exit" -ne 0 && "$bob_failure_detail_emitted" == "0" ]]; then
+    bob_elapsed_seconds=$((SECONDS - bob_start_seconds))
+    emit_text_delta "error: bob exited with status $bob_exit after ${bob_elapsed_seconds}s without diagnostic output"$'\n'
+fi
+
+emit_result
 exit "$bob_exit"

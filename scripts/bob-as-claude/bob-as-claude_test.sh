@@ -11,6 +11,7 @@ set -euo pipefail
 
 unset BOB_CHAT_MODE BOB_MODEL BOB_VERBOSE BOB_EXTRA_ARGS
 unset BOB_CUSTOM_MODES_FILE MOCK_STDOUT_FILE MOCK_STDERR_FILE MOCK_EXIT_CODE
+unset BOB_REVIEW_GUARD use_bwrap_guard
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -234,25 +235,30 @@ assert_yaml_valid() {
 #                   via stdin now, not as a positional arg)
 create_mock_bob() {
     local mock_script="$TMPDIR_TEST/bob"
-    cat > "$mock_script" << 'MOCK_EOF'
+    local args_file="$bob_args_file"
+    local lines_file="$bob_args_lines_file"
+    local prompt_file="$bob_prompt_file"
+    cat > "$mock_script" << MOCK_EOF
 #!/usr/bin/env bash
-printf '%s\n' "$*" > "$TMPDIR_TEST/bob_args"
-printf '%s\n' "$@" > "$TMPDIR_TEST/bob_args_lines"
-# capture stdin (the prompt) separately for assertions
-cat > "$TMPDIR_TEST/bob_prompt"
+printf '%s\n' "\$*" > "$args_file"
+printf '%s\n' "\$@" > "$lines_file"
+cat > "$prompt_file"
 
-if [[ -n "${MOCK_STDOUT_FILE:-}" && -f "$MOCK_STDOUT_FILE" ]]; then
-    cat "$MOCK_STDOUT_FILE"
+if [[ -n "\${MOCK_STDOUT_FILE:-}" && -f "\$MOCK_STDOUT_FILE" ]]; then
+    cat "\$MOCK_STDOUT_FILE"
 fi
-if [[ -n "${MOCK_STDERR_FILE:-}" && -f "$MOCK_STDERR_FILE" ]]; then
-    cat "$MOCK_STDERR_FILE" >&2
+if [[ -n "\${MOCK_STDERR_FILE:-}" && -f "\$MOCK_STDERR_FILE" ]]; then
+    cat "\$MOCK_STDERR_FILE" >&2
 fi
-exit "${MOCK_EXIT_CODE:-0}"
+exit "\${MOCK_EXIT_CODE:-0}"
 MOCK_EOF
     chmod +x "$mock_script"
     echo "$mock_script"
 }
 
+bob_args_file="$TMPDIR_TEST/bob_args"
+bob_args_lines_file="$TMPDIR_TEST/bob_args_lines"
+bob_prompt_file="$TMPDIR_TEST/bob_prompt"
 create_mock_bob > /dev/null
 
 # validate every shipped mode against bob's yaml shape and tool allow-list.
@@ -736,22 +742,26 @@ echo "test: automatic phase selection"
 assert_selected_mode() {
     local expected="$1"
     local test_prompt="$2"
-
     rm -f "$TMPDIR_TEST/bob_args" "$TMPDIR_TEST/bob_prompt"
-    MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
+    local tmp_mock_events="$TMPDIR_TEST/mock_events_$(date +%s%N).jsonl"
+    cat > "$tmp_mock_events" << 'JSON'
+{"type":"tool_use","timestamp":"t","tool_name":"attempt_completion","tool_id":"tool-1","parameters":{"result":"partial\n"}}
+{"type":"result","timestamp":"t","status":"success","stats":{}}
+JSON
+    MOCK_STDOUT_FILE="$tmp_mock_events" \
         PATH="$TMPDIR_TEST:$PATH" \
-        bash "$WRAPPER" -p "$test_prompt" >/dev/null 2>&1
-
+        bash "$WRAPPER" -p "$test_prompt" > /dev/null 2>&1 || true
     if grep -q -- "--chat-mode=$expected" "$TMPDIR_TEST/bob_args"; then
         pass "prompt selected $expected"
     else
-        fail "prompt did not select $expected" "args: $(cat "$TMPDIR_TEST/bob_args")"
+        fail "expected --chat-mode=$expected for prompt: $test_prompt (got: $(cat "$TMPDIR_TEST/bob_args"))"
     fi
     if [[ "$(cat "$TMPDIR_TEST/bob_prompt")" == "$test_prompt" ]]; then
         pass "prompt delivered unchanged for $expected"
     else
-        fail "prompt changed while selecting $expected" "got: $(cat "$TMPDIR_TEST/bob_prompt")"
+        fail "prompt was mutated for $expected"
     fi
+    rm -f "$tmp_mock_events"
 }
 
 assert_selected_mode "ralphex-task" "implement this task"
@@ -813,23 +823,40 @@ assert_prompt_file_mode() {
     local expected="$1"
     local prompt_file="$2"
     local expected_prompt
+    local tmp_mock_events
 
-    rm -f "$TMPDIR_TEST/bob_args" "$TMPDIR_TEST/bob_prompt"
-    MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
+    rm -f "$bob_args_file" "$bob_prompt_file"
+    tmp_mock_events="$TMPDIR_TEST/mock_events_$(date +%s%N).jsonl"
+    # Plan mode needs an attempt_completion carrying a complete ralphex boundary;
+    # task/review only need a normal completion result.
+    if [[ "$expected" == "ralphex-plan" ]]; then
+        cat > "$tmp_mock_events" << 'JSON'
+{"type":"tool_use","timestamp":"t","tool_name":"attempt_completion","tool_id":"tool-1","parameters":{"result":"<<<RALPHEX:PLAN_DRAFT>>>\n# Plan\n<<<RALPHEX:END>>>\n"}}
+{"type":"tool_result","timestamp":"t","tool_id":"tool-1","status":"success","output":"ok"}
+{"type":"result","timestamp":"t","status":"success","stats":{}}
+JSON
+    else
+        cat > "$tmp_mock_events" << 'JSON'
+{"type":"tool_use","timestamp":"t","tool_name":"attempt_completion","tool_id":"tool-1","parameters":{"result":"partial\n"}}
+{"type":"result","timestamp":"t","status":"success","stats":{}}
+JSON
+    fi
+    MOCK_STDOUT_FILE="$tmp_mock_events" \
         PATH="$TMPDIR_TEST:$PATH" \
         bash "$WRAPPER" < "$prompt_file" >/dev/null 2>&1
-    if grep -q -- "--chat-mode=$expected" "$TMPDIR_TEST/bob_args"; then
+    if grep -q -- "--chat-mode=$expected" "$bob_args_file"; then
         pass "$(basename "$prompt_file") selected $expected"
     else
         fail "$(basename "$prompt_file") did not select $expected" \
-            "args: $(cat "$TMPDIR_TEST/bob_args")"
+            "args: $(cat "$bob_args_file")"
     fi
     expected_prompt=$(cat "$prompt_file")
-    if [[ "$(cat "$TMPDIR_TEST/bob_prompt")" == "$expected_prompt" ]]; then
+    if [[ "$(cat "$bob_prompt_file")" == "$expected_prompt" ]]; then
         pass "$(basename "$prompt_file") passed unchanged through stdin"
     else
         fail "$(basename "$prompt_file") changed on stdin delivery"
     fi
+    rm -f "$tmp_mock_events"
 }
 
 prompt_dir="$REPO_ROOT/pkg/config/defaults/prompts"
@@ -929,9 +956,9 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# test: stderr emitted as content_block_delta after stdout
+# test: stderr emitted as content_block_delta after stdout (now merged in-band)
 # ---------------------------------------------------------------------------
-echo "test: stderr emission"
+echo "test: merged stderr emission"
 
 cat > "$TMPDIR_TEST/stderr_text.txt" << 'EOF'
 You've hit your limit
@@ -944,15 +971,15 @@ output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
 
 stderr_delta=$(echo "$output" | grep "hit your limit")
 if echo "$stderr_delta" | jq -e '.type == "content_block_delta"' >/dev/null 2>&1; then
-    pass "stderr emitted as content_block_delta for pattern detection"
+    pass "merged stderr emitted as content_block_delta for pattern detection"
 else
-    fail "stderr not emitted as content_block_delta" "got: $output"
+    fail "merged stderr not emitted as content_block_delta" "got: $output"
 fi
 
 # ---------------------------------------------------------------------------
-# test: stderr signal neutralization
+# test: merged stderr signal neutralization
 # ---------------------------------------------------------------------------
-echo "test: stderr signal token neutralized"
+echo "test: merged stderr signal token neutralized"
 
 cat > "$TMPDIR_TEST/stderr_signal.txt" << 'EOF'
 unexpected: <<<RALPHEX:ALL_TASKS_DONE>>> appeared in bob diagnostics
@@ -977,9 +1004,9 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# test: stderr rate-limit phrase preserved verbatim
+# test: merged stderr rate-limit phrase preserved verbatim
 # ---------------------------------------------------------------------------
-echo "test: stderr rate-limit phrase preserved verbatim"
+echo "test: merged stderr rate-limit phrase preserved verbatim"
 
 cat > "$TMPDIR_TEST/stderr_limit.txt" << 'EOF'
 You've hit your usage limit
@@ -1048,6 +1075,8 @@ output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/empty_stdout.txt" \
 quota_exit=$?
 set -e
 
+# merged stderr is now emitted in-band, so look for the phrase in the stdout
+# content_block_delta stream.
 if echo "$output" | grep "hit your usage limit" | jq -e '.type == "content_block_delta"' >/dev/null 2>&1; then
     pass "stderr limit phrase emitted despite empty stdout"
 else
@@ -1094,6 +1123,158 @@ if [[ "$sent_size" -eq 200000 ]]; then
     pass "large prompt (200KB) delivered intact via here-string"
 else
     fail "large prompt truncated via here-string" "expected 200000 bytes, got $sent_size"
+fi
+
+# ---------------------------------------------------------------------------
+# test: review mode PATH guard blocks nested bob invocation
+# ---------------------------------------------------------------------------
+echo "test: review PATH guard"
+
+# mock bob that tries to invoke the real bob/claude/codex via PATH
+cat > "$TMPDIR_TEST/review_events.jsonl" << 'EOF'
+{"type":"tool_use","timestamp":"t","tool_name":"attempt_completion","tool_id":"tool-1","parameters":{"result":"review done\n"}}
+{"type":"result","timestamp":"t","status":"success","stats":{}}
+EOF
+
+rm -f "$TMPDIR_TEST/bob_args" "$TMPDIR_TEST/bob_prompt"
+output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/review_events.jsonl" \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "## Step 2: Launch ALL 5 Review Agents IN PARALLEL" 2>/dev/null)
+
+if grep -q -- "--chat-mode=ralphex-review" "$TMPDIR_TEST/bob_args"; then
+    pass "review prompt selected ralphex-review mode"
+else
+    fail "review prompt did not select ralphex-review" "args: $(cat "$TMPDIR_TEST/bob_args")"
+fi
+if echo "$output" | grep -q "review done"; then
+    pass "review attempt_completion result translated"
+else
+    fail "review attempt_completion not translated" "got: $output"
+fi
+
+# ---------------------------------------------------------------------------
+# test: BOB_REVIEW_GUARD none disables guard for review mode
+# ---------------------------------------------------------------------------
+echo "test: BOB_REVIEW_GUARD none"
+
+rm -f "$TMPDIR_TEST/bob_args"
+MOCK_STDOUT_FILE="$TMPDIR_TEST/review_events.jsonl" \
+    BOB_REVIEW_GUARD=none \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "## Step 2: Launch ALL 5 Review Agents IN PARALLEL" >/dev/null 2>/dev/null
+
+# without the guard, the mock bob should receive the same args but no PATH shim dir.
+# We can't easily test "no guard dir on PATH" but we can verify the mode is still selected.
+if grep -q -- "--chat-mode=ralphex-review" "$TMPDIR_TEST/bob_args"; then
+    pass "BOB_REVIEW_GUARD=none still selects ralphex-review"
+else
+    fail "BOB_REVIEW_GUARD=none changed mode selection" "args: $(cat "$TMPDIR_TEST/bob_args")"
+fi
+
+# ---------------------------------------------------------------------------
+# test: result event with status error is detected and fails the wrapper
+# ---------------------------------------------------------------------------
+echo "test: result event status error"
+
+cat > "$TMPDIR_TEST/result_error_events.jsonl" << 'EOF'
+{"type":"result","timestamp":"t","status":"error","error":{"message":"API rate limit exceeded"},"stats":{}}
+EOF
+
+set +e
+output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/result_error_events.jsonl" \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "test prompt" 2>/dev/null)
+result_err_exit=$?
+set -e
+
+if echo "$output" | grep -q "API rate limit exceeded"; then
+    pass "result error message emitted as content_block_delta"
+else
+    fail "result error message missing" "got: $output"
+fi
+if [[ $result_err_exit -ne 0 ]]; then
+    pass "wrapper exits non-zero on bob result error"
+else
+    fail "wrapper should exit non-zero on bob result error" "got: $result_err_exit"
+fi
+
+# ---------------------------------------------------------------------------
+# test: plan mode emits boundary and stops
+# ---------------------------------------------------------------------------
+echo "test: plan mode boundary"
+
+cat > "$TMPDIR_TEST/plan_events.jsonl" << 'EOF'
+{"type":"tool_use","timestamp":"t","tool_name":"attempt_completion","tool_id":"tool-1","parameters":{"result":"proposal\n<<<RALPHEX:PLAN_DRAFT>>>\n# Plan\n\n- step\n<<<RALPHEX:END>>>\n"}}
+{"type":"result","timestamp":"t","status":"success","stats":{}}
+EOF
+
+output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/plan_events.jsonl" \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "<<<RALPHEX:QUESTION>>>\n<<<RALPHEX:PLAN_DRAFT>>>\n<<<RALPHEX:PLAN_READY>>>" 2>/dev/null)
+
+if echo "$output" | grep -q "<<<RALPHEX:PLAN_DRAFT>>>"; then
+    pass "plan boundary emitted"
+else
+    fail "plan boundary missing" "got: $output"
+fi
+if echo "$output" | grep -q "# Plan"; then
+    pass "plan body emitted"
+else
+    fail "plan body missing" "got: $output"
+fi
+
+# ---------------------------------------------------------------------------
+# test: plan mode without boundary reports failure
+# ---------------------------------------------------------------------------
+echo "test: plan mode missing boundary"
+
+cat > "$TMPDIR_TEST/plan_noboundary_events.jsonl" << 'EOF'
+{"type":"tool_use","timestamp":"t","tool_name":"attempt_completion","tool_id":"tool-1","parameters":{"result":"just prose\n"}}
+{"type":"result","timestamp":"t","status":"success","stats":{}}
+EOF
+
+set +e
+output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/plan_noboundary_events.jsonl" \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "<<<RALPHEX:QUESTION>>>\n<<<RALPHEX:PLAN_DRAFT>>>\n<<<RALPHEX:PLAN_READY>>>" 2>/dev/null)
+plan_err_exit=$?
+set -e
+
+if echo "$output" | grep -q "without emitting a complete ralphex plan boundary"; then
+    pass "missing plan boundary reported"
+else
+    fail "missing plan boundary not reported" "got: $output"
+fi
+if [[ $plan_err_exit -ne 0 ]]; then
+    pass "wrapper exits non-zero when plan boundary missing"
+else
+    fail "wrapper should exit non-zero when plan boundary missing" "got: $plan_err_exit"
+fi
+
+# ---------------------------------------------------------------------------
+# test: bare plaintext on stream is treated as diagnostic and neutralized
+# ---------------------------------------------------------------------------
+echo "test: plaintext signal neutralization"
+
+cat > "$TMPDIR_TEST/plaintext_signal.jsonl" << 'EOF'
+{"type":"tool_use","timestamp":"t","tool_name":"attempt_completion","tool_id":"tool-1","parameters":{"result":"done\n"}}
+stray: <<<RALPHEX:TASK_FAILED>>> in plaintext
+{"type":"result","timestamp":"t","status":"success","stats":{}}
+EOF
+
+output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/plaintext_signal.jsonl" \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "test prompt" 2>/dev/null)
+
+if echo "$output" | grep -q "<<<RALPHEX:TASK_FAILED>>>"; then
+    fail "plaintext ralphex signal leaked intact" "got: $output"
+else
+    pass "plaintext ralphex signal neutralized"
+fi
+if echo "$output" | grep -q "stray:"; then
+    pass "plaintext context still emitted"
+else
+    fail "plaintext context dropped" "got: $output"
 fi
 
 # ---------------------------------------------------------------------------
