@@ -14,7 +14,10 @@ set -euo pipefail
 
 # verify required commands before doing any prompt work.
 command -v jq >/dev/null 2>&1 || { echo "error: jq is required but not found" >&2; exit 1; }
-command -v bob >/dev/null 2>&1 || { echo "error: bob is required but not found" >&2; exit 1; }
+if ! bob_executable=$(command -v bob); then
+    echo "error: bob is required but not found" >&2
+    exit 1
+fi
 
 # accept prompts through stdin, with -p retained for direct invocations.
 prompt=""
@@ -138,13 +141,35 @@ cleanup() {
 }
 trap cleanup EXIT
 
-stderr_file="$tmp_dir/stderr"
-stdout_pipe="$tmp_dir/stdout.fifo"
-mkfifo "$stdout_pipe"
+# Review prompts ask Claude-compatible providers to launch multiple sub-agents.
+# Bob has no native sub-agent orchestration, and may try to emulate it by
+# spawning bob/claude/codex through its command tool. Those nested CLIs inherit
+# credentials and can outlive a timed-out tool call, exhaust provider limits,
+# or deadlock the parent session. Resolve the real top-level Bob executable
+# before placing review-only guard shims on PATH, so only nested launches are
+# rejected. Absolute paths can bypass PATH, so the custom mode also forbids all
+# shell-based agent orchestration explicitly.
+if [[ "$selected_chat_mode" == "ralphex-review" ]]; then
+    review_guard_dir="$tmp_dir/review-agent-guard"
+    mkdir -p "$review_guard_dir"
+    for guarded_cli in bob claude codex; do
+        guard_path="$review_guard_dir/$guarded_cli"
+        printf '%s\n' \
+            '#!/usr/bin/env bash' \
+            'tool_name=${0##*/}' \
+            'printf '\''error: nested %s invocation blocked by bob-as-claude review guard; perform review assignments sequentially in the current Bob session\n'\'' "$tool_name" >&2' \
+            'exit 64' > "$guard_path"
+        chmod +x "$guard_path"
+    done
+    export PATH="$review_guard_dir:$PATH"
+fi
+
+stream_pipe="$tmp_dir/stream.fifo"
+mkfifo "$stream_pipe"
 prompt_file="$tmp_dir/prompt"
 printf '%s' "$prompt" > "$prompt_file"
 
-# forward termination to bob while jq drains the named pipe in the background.
+# forward termination to bob while the translated stream drains.
 bob_pid=""
 forward_signal() {
     if [[ -n "$bob_pid" ]]; then
@@ -153,9 +178,6 @@ forward_signal() {
     exit 143
 }
 trap forward_signal TERM
-
-bob "${bob_args[@]}" < "$prompt_file" 2>"$stderr_file" > "$stdout_pipe" &
-bob_pid=$!
 
 emit_text_delta() {
     jq -cn --arg text "$1" \
@@ -256,36 +278,76 @@ parse_bob_event() {
     event_content=""
     event_tool=""
     event_completion=""
+    event_status=""
+    event_output=""
+    event_error=""
+    event_has_error="false"
 
     {
         IFS= read -r -d '' event_type &&
             IFS= read -r -d '' event_role &&
             IFS= read -r -d '' event_content &&
             IFS= read -r -d '' event_tool &&
-            IFS= read -r -d '' event_completion
+            IFS= read -r -d '' event_completion &&
+            IFS= read -r -d '' event_status &&
+            IFS= read -r -d '' event_output &&
+            IFS= read -r -d '' event_error &&
+            IFS= read -r -d '' event_has_error
     } < <(
         printf '%s\n' "$line" | jq -j '
             (.type // ""), "\u0000",
             (.role // ""), "\u0000",
             ((.content // "") | tostring), "\u0000",
             (.tool_name // ""), "\u0000",
-            ((.parameters.result // "") | tostring), "\u0000"
+            ((.parameters.result // "") | tostring), "\u0000",
+            ((.status // "") | tostring), "\u0000",
+            ((.output // "") | tostring), "\u0000",
+            ((.error.message // .error // .message // "") | tostring), "\u0000",
+            ((.error != null) | tostring), "\u0000"
         ' 2>/dev/null
     )
 }
 
 intentional_stop=0
 plan_boundary_emitted=0
+bob_failure_detail_emitted=0
+bob_result_failed=0
 
-if [[ "$selected_chat_mode" == "ralphex-plan" ]]; then
-    plan_stream_buffer=""
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        [[ -z "$line" ]] && continue
-        if ! parse_bob_event "$line"; then
-            emit_keepalive
-            continue
-        fi
+neutralize_signal_text() {
+    printf '%s' "${1//<<<RALPHEX:/<<< RALPHEX:}"
+}
 
+emit_completion_lines() {
+    local completion="$1"
+    local completion_line=""
+
+    while IFS= read -r completion_line || [[ -n "$completion_line" ]]; do
+        emit_text_delta "$completion_line"$'\n'
+    done < <(printf '%s' "$completion")
+}
+
+bob_start_seconds=$SECONDS
+# Merge Bob's descriptors before translation so one reader preserves live ordering
+# without concurrent JSON writers. Non-JSON lines are treated as diagnostics.
+"$bob_executable" "${bob_args[@]}" < "$prompt_file" > "$stream_pipe" 2>&1 &
+bob_pid=$!
+
+plan_stream_buffer=""
+while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" ]] && continue
+
+    if ! parse_bob_event "$line" || [[ -z "$event_type" ]]; then
+        sanitized_line=$(neutralize_signal_text "$line")
+        emit_text_delta "$sanitized_line"$'\n'
+        case "${line,,}" in
+            *error*|*failed*|*failure*|*limit*|*auth*|*required*|*timeout*|*exception*)
+                bob_failure_detail_emitted=1
+                ;;
+        esac
+        continue
+    fi
+
+    if [[ "$selected_chat_mode" == "ralphex-plan" ]]; then
         if [[ "$event_type" == "message" && "$event_role" == "assistant" ]]; then
             plan_stream_buffer+="$event_content"
             visible_plan_text=$(strip_thinking_blocks "$plan_stream_buffer")
@@ -308,34 +370,33 @@ if [[ "$selected_chat_mode" == "ralphex-plan" ]]; then
                 plan_boundary_error="attempt_completion did not contain a complete valid ralphex plan boundary"
         fi
         emit_keepalive
-    done < "$stdout_pipe"
-else
+        continue
+    fi
+
     # Task/review translation stays terminal-only and line-oriented.
-    jq -Rcn --unbuffered --argjson verbose "$BOB_VERBOSE" '
-        def emit($t): {type: "content_block_delta", delta: {type: "text_delta", text: $t}};
-        inputs | fromjson? | objects |
-            if .type == "tool_use" and (.tool_name // "") == "attempt_completion" then
-                ((.parameters.result // "") | tostring | split("\n")) as $parts
-                | if ($parts[-1] // "") == "" then
-                    $parts[0:-1][] | emit(. + "\n")
-                  else
-                    $parts[] | emit(. + "\n")
-                  end
-            elif .type == "result" then
-                {type: "result", result: ""}
-            elif $verbose == 1 and .type == "tool_result" and (.status // "") == "success" then
-                emit(("[tool_result] " + ((.output // "") | tostring) + "\n"))
-            elif .type == "tool_result" and (.status // "") == "error" then
-                emit(("[tool_error] " + ((.output // "") | tostring) + "\n"))
-            elif $verbose == 1 and .type == "tool_use" then
-                emit(("[tool] " + ((.tool_name // "") | tostring) + "\n"))
-            else
-                emit("")
-            end
-    ' < "$stdout_pipe" 2>/dev/null &
-    jq_pid=$!
-    wait "$jq_pid" || true
-fi
+    if [[ "$event_type" == "tool_use" && "$event_tool" == "attempt_completion" ]]; then
+        emit_completion_lines "$event_completion"
+    elif [[ "$event_type" == "result" ]]; then
+        if [[ "$event_has_error" == "true" || ( -n "$event_status" && "$event_status" != "success" ) ]]; then
+            result_detail="$event_error"
+            [[ -n "$result_detail" ]] || result_detail="status $event_status"
+            result_detail=$(neutralize_signal_text "$result_detail")
+            emit_text_delta "error: bob result failed: $result_detail"$'\n'
+            bob_failure_detail_emitted=1
+            bob_result_failed=1
+        fi
+        printf '%s\n' '{"type":"result","result":""}'
+    elif [[ "$event_type" == "tool_result" && "$event_status" == "error" ]]; then
+        emit_text_delta "[tool_error] $event_output"$'\n'
+        bob_failure_detail_emitted=1
+    elif [[ "$BOB_VERBOSE" == "1" && "$event_type" == "tool_result" && "$event_status" == "success" ]]; then
+        emit_text_delta "[tool_result] $event_output"$'\n'
+    elif [[ "$BOB_VERBOSE" == "1" && "$event_type" == "tool_use" ]]; then
+        emit_text_delta "[tool] $event_tool"$'\n'
+    else
+        emit_keepalive
+    fi
+done < "$stream_pipe"
 
 # preserve bob's exit status after the translation process has drained.
 bob_exit=0
@@ -345,6 +406,8 @@ bob_pid=""
 
 if [[ "$intentional_stop" == "1" ]]; then
     bob_exit=0
+elif [[ "$bob_result_failed" == "1" && "$bob_exit" -eq 0 ]]; then
+    bob_exit=1
 fi
 
 if [[ "$selected_chat_mode" == "ralphex-plan" && "$plan_boundary_emitted" == "0" ]]; then
@@ -353,14 +416,11 @@ if [[ "$selected_chat_mode" == "ralphex-plan" && "$plan_boundary_emitted" == "0"
     bob_exit=1
 fi
 
-# forward stderr for executor error detection, but neutralize signal-looking text.
-if [[ -s "$stderr_file" && "$intentional_stop" == "0" ]]; then
-    while IFS= read -r err_line || [[ -n "$err_line" ]]; do
-        [[ -z "$err_line" ]] && continue
-        err_line="${err_line//<<<RALPHEX:/<<< RALPHEX:}"
-        printf '%s\n' "$err_line" \
-            | jq -Rc '{type: "content_block_delta", delta: {type: "text_delta", text: (. + "\n")}}'
-    done < "$stderr_file"
+# Bob occasionally exits non-zero after going silent without emitting any diagnostic.
+# Preserve the exit code and add enough context for ralphex progress logs to be useful.
+if [[ "$bob_exit" -ne 0 && "$bob_failure_detail_emitted" == "0" ]]; then
+    bob_elapsed_seconds=$((SECONDS - bob_start_seconds))
+    emit_text_delta "error: bob exited with status $bob_exit after ${bob_elapsed_seconds}s without diagnostic output"$'\n'
 fi
 
 echo '{"type":"result","result":""}'

@@ -9,6 +9,10 @@ customModes:
     customInstructions: |-
       Execute every review-agent assignment sequentially because Bob has no sub-agent orchestration tools.
       Read each assignment and perform its review work directly with the available tools before moving to the next assignment.
+      Never launch `bob`, `claude`, `codex`, or any other agent CLI through execute_command, including by absolute path.
+      Never use background commands, nohup, shell job control, or shell-based agent orchestration.
+      Perform all review assignments yourself in the current Bob session; do not delegate them to another process.
+      Keep temporary files inside the current workspace or Bob project temp directory, never in general-purpose `/tmp`.
       Merge and deduplicate findings, then verify every finding against the actual file and surrounding context.
       Classify findings as CONFIRMED or FALSE POSITIVE and discard false positives.
       Fix every confirmed issue, run the requested tests and linter, and commit fixes with: git commit -m "fix: address code review findings"

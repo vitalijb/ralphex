@@ -121,6 +121,14 @@ assert_contains \
     "customInstructions" \
     "review mode contains custom instructions"
 assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/modes/ralphex-review.yaml" \
+    'Never launch `bob`, `claude`, `codex`' \
+    "review mode forbids nested agent CLIs"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/modes/ralphex-review.yaml" \
+    "Never use background commands" \
+    "review mode forbids background agent orchestration"
+assert_contains \
     "$REPO_ROOT/scripts/bob-as-claude/modes/ralphex-plan.yaml" \
     "- read" \
     "plan mode allows read"
@@ -170,6 +178,10 @@ assert_contains \
     "$REPO_ROOT/scripts/bob-as-claude/README.md" \
     "ralphex-review" \
     "wrapper README documents review mode"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    'review-only `bob`, `claude`, and `codex` guard shims' \
+    "wrapper README documents nested-agent guards"
 assert_contains \
     "$REPO_ROOT/scripts/bob-as-claude/README.md" \
     "ralphex-plan" \

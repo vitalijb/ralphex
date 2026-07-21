@@ -44,7 +44,7 @@ The shipped modes have these exact tool groups:
 | Mode | Tool groups | Purpose |
 |---|---|---|
 | `ralphex-task` | `read`, `edit`, `command`, `browser` | One task section at a time, including task and finalize prompts. |
-| `ralphex-review` | `read`, `edit`, `command`, `browser` | Sequential review-agent work, verified fixes, tests, commits, and ralphex signals. |
+| `ralphex-review` | `read`, `edit`, `command`, `browser` | Sequential review-agent work in the current Bob session, verified fixes, tests, commits, and ralphex signals. |
 | `ralphex-plan` | `read`, `edit`, `command`, `browser` | Interactive plan creation without source edits; writes the accepted plan under `docs/plans`. |
 
 **Environment variables:**
@@ -64,7 +64,7 @@ With an empty `BOB_CHAT_MODE`, the wrapper scans prompt text outside fenced ` ``
 - the complete plan signal set `<<<RALPHEX:QUESTION>>>`, `<<<RALPHEX:PLAN_DRAFT>>>`, and `<<<RALPHEX:PLAN_READY>>>` selects `ralphex-plan`;
 - all other prompts, including task and finalize prompts, select `ralphex-task`.
 
-Review markers take precedence over the complete plan signal set. Review instructions live in `ralphex-review.customInstructions`; the wrapper passes review prompts unchanged. Plan prompts receive the strict Bob terminal-tool protocol described below. `<<<RALPHEX:REVIEW_DONE>>>` is an output signal and is not a phase-selection marker.
+Review markers take precedence over the complete plan signal set. Review instructions live in `ralphex-review.customInstructions`; the wrapper passes review prompts unchanged. Because Bob has no native sub-agent orchestration, review mode requires assignments to run sequentially in the current session. The wrapper resolves its top-level Bob executable first, then places review-only `bob`, `claude`, and `codex` guard shims on the child `PATH`; attempts to emulate sub-agents with nested or background CLI processes fail immediately instead of consuming provider capacity or outliving the parent tool call. Plan prompts receive the strict Bob terminal-tool protocol described below. `<<<RALPHEX:REVIEW_DONE>>>` is an output signal and is not a phase-selection marker.
 
 ### `--trust` and `--yolo`
 

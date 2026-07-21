@@ -11,6 +11,7 @@ set -euo pipefail
 
 unset BOB_CHAT_MODE BOB_MODEL BOB_VERBOSE BOB_EXTRA_ARGS
 unset BOB_CUSTOM_MODES_FILE MOCK_STDOUT_FILE MOCK_STDERR_FILE MOCK_EXIT_CODE
+unset MOCK_PROBE_NESTED_AGENT_GUARD MOCK_NESTED_AGENT_PROBE_ACTIVE
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -86,6 +87,10 @@ var requiredInstructions = map[string][]string{
 	},
 	"ralphex-review": {
 		"sequentially",
+		"Never launch `bob`, `claude`, `codex`",
+		"Never use background commands",
+		"current Bob session",
+		"temporary files",
 		"verify every finding",
 		"Fix every confirmed issue",
 		"run the requested tests",
@@ -244,10 +249,23 @@ printf '%s\n' "$@" > "$TMPDIR_TEST/bob_args_lines"
 # capture stdin (the prompt) separately for assertions
 cat > "$TMPDIR_TEST/bob_prompt"
 
+if [[ "${MOCK_PROBE_NESTED_AGENT_GUARD:-0}" == "1" &&
+    "${MOCK_NESTED_AGENT_PROBE_ACTIVE:-0}" != "1" ]]; then
+    export MOCK_NESTED_AGENT_PROBE_ACTIVE=1
+    for agent_cli in bob claude codex; do
+        "$agent_cli" --version > "$TMPDIR_TEST/nested_${agent_cli}_output" 2>&1
+        printf '%s\n' "$?" > "$TMPDIR_TEST/nested_${agent_cli}_status"
+    done
+fi
+
+if [[ "${MOCK_STDERR_FIRST:-0}" == "1" && -n "${MOCK_STDERR_FILE:-}" && -f "$MOCK_STDERR_FILE" ]]; then
+    cat "$MOCK_STDERR_FILE" >&2
+    sleep "${MOCK_DELAY_AFTER_STDERR:-0}"
+fi
 if [[ -n "${MOCK_STDOUT_FILE:-}" && -f "$MOCK_STDOUT_FILE" ]]; then
     cat "$MOCK_STDOUT_FILE"
 fi
-if [[ -n "${MOCK_STDERR_FILE:-}" && -f "$MOCK_STDERR_FILE" ]]; then
+if [[ "${MOCK_STDERR_FIRST:-0}" != "1" && -n "${MOCK_STDERR_FILE:-}" && -f "$MOCK_STDERR_FILE" ]]; then
     cat "$MOCK_STDERR_FILE" >&2
 fi
 exit "${MOCK_EXIT_CODE:-0}"
@@ -257,6 +275,17 @@ MOCK_EOF
 }
 
 create_mock_bob > /dev/null
+
+# Safe fallbacks for the review-guard regression: if a guard disappears, the
+# test records a normal exit instead of invoking a developer's real agent CLI.
+for mock_agent_cli in claude codex; do
+    printf '%s\n' \
+        '#!/usr/bin/env bash' \
+        'tool_name=${0##*/}' \
+        'printf '\''unguarded %s invocation\n'\'' "$tool_name"' \
+        'exit 0' > "$TMPDIR_TEST/$mock_agent_cli"
+    chmod +x "$TMPDIR_TEST/$mock_agent_cli"
+done
 
 # validate every shipped mode against bob's yaml shape and tool allow-list.
 for mode in ralphex-task ralphex-review ralphex-plan; do
@@ -322,6 +351,27 @@ if echo "$recorded" | grep -q -- "test prompt"; then
 else
     pass "prompt absent from argv"
 fi
+
+# Review mode must allow the wrapper's resolved top-level Bob executable while
+# preventing Bob from launching nested agent CLIs through its command-tool PATH.
+rm -f "$TMPDIR_TEST"/nested_{bob,claude,codex}_{output,status}
+MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
+    MOCK_PROBE_NESTED_AGENT_GUARD=1 \
+    BOB_CHAT_MODE=ralphex-review \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "review this change" >/dev/null 2>&1
+for agent_cli in bob claude codex; do
+    nested_status=$(cat "$TMPDIR_TEST/nested_${agent_cli}_status" 2>/dev/null || true)
+    nested_output=$(cat "$TMPDIR_TEST/nested_${agent_cli}_output" 2>/dev/null || true)
+    if [[ "$nested_status" == "64" ]] &&
+        [[ "$nested_output" == *"nested $agent_cli invocation blocked"* ]] &&
+        [[ "$nested_output" == *"sequentially in the current Bob session"* ]]; then
+        pass "review guard blocks nested $agent_cli invocation"
+    else
+        fail "review guard did not block nested $agent_cli" \
+            "status: $nested_status; output: $nested_output"
+    fi
+done
 
 # ---------------------------------------------------------------------------
 # test: --model flag forwarded to bob as -m
@@ -608,6 +658,33 @@ if [[ "$noterm_results" -eq 1 ]]; then
     pass "no result event yields exactly one (fallback) result"
 else
     fail "unexpected result count without result event" "expected 1, got $noterm_results: $output_noterm"
+fi
+
+# a failed Bob result must retain its diagnostic instead of being translated to
+# the same empty result as a successful run.
+cat > "$TMPDIR_TEST/failed_result_events.jsonl" << 'EOF'
+{"type":"result","timestamp":"t","status":"error","error":{"message":"backend continuation timed out"},"stats":{}}
+EOF
+set +e
+failed_result_output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/failed_result_events.jsonl" \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "test prompt" 2>/dev/null)
+failed_result_exit=$?
+set -e
+if echo "$failed_result_output" | grep -q "backend continuation timed out"; then
+    pass "failed Bob result diagnostic preserved"
+else
+    fail "failed Bob result diagnostic dropped" "got: $failed_result_output"
+fi
+if echo "$failed_result_output" | grep -q "without diagnostic output"; then
+    fail "synthetic diagnostic duplicated detailed Bob result error" "got: $failed_result_output"
+else
+    pass "detailed Bob result suppresses synthetic fallback diagnostic"
+fi
+if [[ $failed_result_exit -eq 1 ]]; then
+    pass "failed Bob result forces non-zero exit"
+else
+    fail "failed Bob result did not force non-zero exit" "got: $failed_result_exit"
 fi
 
 # ---------------------------------------------------------------------------
@@ -1111,6 +1188,25 @@ else
     fail "stderr not emitted as content_block_delta" "got: $output"
 fi
 
+# stderr must be translated as Bob emits it, not buffered until after stdout and
+# process exit. The mock pauses after stderr so output order is deterministic.
+cat > "$TMPDIR_TEST/stderr_early.txt" << 'EOF'
+early diagnostic
+EOF
+output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
+    MOCK_STDERR_FILE="$TMPDIR_TEST/stderr_early.txt" \
+    MOCK_STDERR_FIRST=1 \
+    MOCK_DELAY_AFTER_STDERR=0.2 \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "test prompt" 2>/dev/null)
+stderr_line_number=$(echo "$output" | grep -n "early diagnostic" | head -1 | cut -d: -f1)
+completion_line_number=$(echo "$output" | grep -n "hello world" | head -1 | cut -d: -f1)
+if [[ -n "$stderr_line_number" && -n "$completion_line_number" && "$stderr_line_number" -lt "$completion_line_number" ]]; then
+    pass "stderr streamed before later Bob stdout"
+else
+    fail "stderr remained buffered until Bob stdout completed" "got: $output"
+fi
+
 # ---------------------------------------------------------------------------
 # test: stderr signal neutralization
 # ---------------------------------------------------------------------------
@@ -1224,6 +1320,25 @@ if [[ $quota_exit -eq 1 ]]; then
     pass "non-zero exit preserved on failure path"
 else
     fail "exit code not preserved on failure path" "got: $quota_exit"
+fi
+
+# a silent non-zero exit still needs an actionable progress-log diagnostic.
+set +e
+silent_failure_output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/empty_stdout.txt" \
+    MOCK_EXIT_CODE=9 \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "test prompt" 2>/dev/null)
+silent_failure_exit=$?
+set -e
+if echo "$silent_failure_output" | grep -q "error: bob exited with status 9 after .* without diagnostic output"; then
+    pass "silent non-zero Bob exit gains synthetic diagnostic"
+else
+    fail "silent non-zero Bob exit lacks diagnostic" "got: $silent_failure_output"
+fi
+if [[ $silent_failure_exit -eq 9 ]]; then
+    pass "silent Bob failure preserves exit code"
+else
+    fail "silent Bob failure exit code changed" "got: $silent_failure_exit"
 fi
 
 # ---------------------------------------------------------------------------

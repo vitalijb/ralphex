@@ -453,7 +453,7 @@ The shipped mode tool groups are exact:
 | Mode | Tool groups | Role |
 |---|---|---|
 | `ralphex-task` | `read`, `edit`, `command`, `browser` | Complete one task section at a time; also handles finalize prompts. |
-| `ralphex-review` | `read`, `edit`, `command`, `browser` | Run review assignments sequentially, verify findings, apply fixes, test, commit, and emit ralphex signals. |
+| `ralphex-review` | `read`, `edit`, `command`, `browser` | Run review assignments sequentially in the current Bob session, verify findings, apply fixes, test, commit, and emit ralphex signals. |
 | `ralphex-plan` | `read`, `edit`, `command`, `browser` | Explore without source edits and write the accepted plan under `docs/plans`. |
 
 ### Environment variables
@@ -513,7 +513,7 @@ The wrapper invokes bob with `--yolo --trust` so tool calls are auto-approved an
 {"type":"result","result":""}
 ```
 
-Review instructions are stored in the `customInstructions` field of `ralphex-review`; the wrapper passes review prompts unchanged. Plan instructions are stored in `ralphex-plan` and reinforced by a wrapper-prepended protocol requiring the exact boundary in `attempt_completion.result` and forbidding writes to the ralphex progress log. The wrapper can recover a valid intermediary boundary if Bob ignores that instruction. Task and finalize instructions are stored in `ralphex-task`.
+Review instructions are stored in the `customInstructions` field of `ralphex-review`; the wrapper passes review prompts unchanged. Bob has no native sub-agent orchestration, so review assignments run sequentially in the current session. The wrapper resolves its top-level Bob executable before installing review-only `bob`, `claude`, and `codex` guard shims on the child `PATH`. This prevents command-tool attempts to emulate review sub-agents with nested or background agent CLIs, which can outlive tool timeouts and exhaust provider concurrency. Review temporary files must remain in the workspace or Bob's project temp directory rather than general-purpose `/tmp`. Plan instructions are stored in `ralphex-plan` and reinforced by a wrapper-prepended protocol requiring the exact boundary in `attempt_completion.result` and forbidding writes to the ralphex progress log. The wrapper can recover a valid intermediary boundary if Bob ignores that instruction. Task and finalize instructions are stored in `ralphex-task`.
 
 ## Writing your own wrapper
 
