@@ -5,11 +5,16 @@
 #   bash scripts/bob-as-claude/bob-as-claude_test.sh
 #
 # requires: jq, bash, awk
-# uses a mock bob — NO real API calls are made.
+# uses a mock bob — no real api calls are made.
 
 set -euo pipefail
 
+unset BOB_CHAT_MODE BOB_MODEL BOB_VERBOSE BOB_EXTRA_ARGS
+unset BOB_CUSTOM_MODES_FILE MOCK_STDOUT_FILE MOCK_STDERR_FILE MOCK_EXIT_CODE
+unset MOCK_PROBE_NESTED_AGENT_GUARD MOCK_NESTED_AGENT_PROBE_ACTIVE
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 WRAPPER="$SCRIPT_DIR/bob-as-claude.sh"
 TMPDIR_TEST=$(mktemp -d)
 # exported so the wrapper and the mock bob subprocess inherit it without a
@@ -36,25 +41,231 @@ fail() {
     fi
 }
 
+# build a temporary validator so shipped and installed yaml use the vendored parser.
+yaml_validator_source="$TMPDIR_TEST/yaml_validator.go"
+yaml_validator_bin="$TMPDIR_TEST/yaml-validator"
+cat > "$yaml_validator_source" << 'YAML_VALIDATOR_EOF'
+package main
+
+import (
+	"bytes"
+	"fmt"
+	"io"
+	"os"
+	"reflect"
+	"strings"
+
+	"gopkg.in/yaml.v3"
+)
+
+type modeDocument struct {
+	CustomModes []mode `yaml:"customModes"`
+}
+
+type mode struct {
+	Slug               string   `yaml:"slug"`
+	Name               string   `yaml:"name"`
+	Description        string   `yaml:"description"`
+	RoleDefinition     string   `yaml:"roleDefinition"`
+	WhenToUse          string   `yaml:"whenToUse"`
+	CustomInstructions string   `yaml:"customInstructions"`
+	Groups             []interface{} `yaml:"groups"`
+}
+
+var ralphexGroups = map[string][]string{
+	"ralphex-task":   {"read", "edit", "command", "browser"},
+	"ralphex-review": {"read", "edit", "command", "browser"},
+	"ralphex-plan":   {"read", "edit", "command", "browser"},
+}
+
+var requiredInstructions = map[string][]string{
+	"ralphex-task": {
+		"one task at a time",
+		"Commit completed work",
+		"<<<RALPHEX:ALL_TASKS_DONE>>>",
+		"<<<RALPHEX:TASK_FAILED>>>",
+	},
+	"ralphex-review": {
+		"sequentially",
+		"Never launch `bob`, `claude`, `codex`",
+		"Never use background commands",
+		"current Bob session",
+		"temporary files",
+		"verify every finding",
+		"Fix every confirmed issue",
+		"run the requested tests",
+		"git commit",
+		"<<<RALPHEX:REVIEW_DONE>>>",
+		"<<<RALPHEX:TASK_FAILED>>>",
+	},
+	"ralphex-plan": {
+		"Do not edit source files",
+		"use the edit tool to write only the requested plan file under docs/plans",
+		"attempt_completion",
+		"ralphex alone owns that log",
+		"<<<RALPHEX:QUESTION>>>",
+		"<<<RALPHEX:PLAN_DRAFT>>>",
+		"<<<RALPHEX:PLAN_READY>>>",
+	},
+}
+
+func invalid(format string, args ...interface{}) {
+	fmt.Fprintf(os.Stderr, format+"\n", args...)
+	os.Exit(1)
+}
+
+func validate(path string, strict bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		invalid("read %s: %v", path, err)
+	}
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	decoder.KnownFields(strict)
+	var document modeDocument
+	if err := decoder.Decode(&document); err != nil {
+		invalid("parse %s: %v", path, err)
+	}
+	var extra modeDocument
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			invalid("%s contains multiple YAML documents", path)
+		}
+		invalid("parse trailing content in %s: %v", path, err)
+	}
+	if len(document.CustomModes) == 0 {
+		invalid("%s has no customModes sequence", path)
+	}
+	seenSlugs := make(map[string]bool, len(document.CustomModes))
+	for _, current := range document.CustomModes {
+		if strings.TrimSpace(current.Slug) == "" {
+			invalid("%s contains a mode without a slug", path)
+		}
+		if seenSlugs[current.Slug] {
+			invalid("%s contains duplicate slug %q", path, current.Slug)
+		}
+		seenSlugs[current.Slug] = true
+		if !strict {
+			continue
+		}
+		if strings.TrimSpace(current.Name) == "" ||
+			strings.TrimSpace(current.Description) == "" ||
+			strings.TrimSpace(current.RoleDefinition) == "" ||
+			strings.TrimSpace(current.WhenToUse) == "" ||
+			strings.TrimSpace(current.CustomInstructions) == "" {
+			invalid("mode %s has an empty required field", current.Slug)
+		}
+		expectedGroups, known := ralphexGroups[current.Slug]
+		if !known {
+			invalid("shipped document contains unknown mode %q", current.Slug)
+		}
+		actualGroups := make([]string, 0, len(current.Groups))
+		for _, group := range current.Groups {
+			name, ok := group.(string)
+			if !ok {
+				invalid("mode %s has a non-scalar group", current.Slug)
+			}
+			actualGroups = append(actualGroups, name)
+		}
+		if !reflect.DeepEqual(actualGroups, expectedGroups) {
+			invalid(
+				"mode %s has groups %v, expected %v",
+				current.Slug,
+				actualGroups,
+				expectedGroups,
+			)
+		}
+		for _, requirement := range requiredInstructions[current.Slug] {
+			if !strings.Contains(current.CustomInstructions, requirement) {
+				invalid(
+					"mode %s is missing custom instruction %q",
+					current.Slug,
+					requirement,
+				)
+			}
+		}
+	}
+	if strict && len(document.CustomModes) != 1 {
+		invalid(
+			"%s strict mode document contains %d modes",
+			path,
+			len(document.CustomModes),
+		)
+	}
+}
+
+func main() {
+	strict := false
+	validated := 0
+	for _, path := range os.Args[1:] {
+		switch path {
+		case "--strict":
+			strict = true
+		default:
+			validate(path, strict)
+			validated++
+		}
+	}
+	if validated == 0 {
+		invalid("no YAML documents supplied")
+	}
+}
+YAML_VALIDATOR_EOF
+
+if GOFLAGS=-mod=vendor go build -o "$yaml_validator_bin" "$yaml_validator_source"; then
+    pass "vendored yaml.v3 validator compiled"
+else
+    fail "vendored yaml.v3 validator failed to compile"
+    exit 1
+fi
+
+validate_yaml() {
+    "$yaml_validator_bin" "$@"
+}
+
+assert_yaml_valid() {
+    local label="$1"
+    shift
+    if validate_yaml "$@"; then
+        pass "$label"
+    else
+        fail "$label"
+    fi
+}
+
 # create a mock bob script that records its arguments and emits predefined stdout.
 # MOCK_STDOUT_FILE: file containing text to emit on stdout
 # MOCK_STDERR_FILE: file containing text to emit on stderr
 # MOCK_EXIT_CODE:   exit code to return (default 0)
-# bob_args:         arguments written to $TMPDIR_TEST/bob_args
+# bob_args:         space-joined arguments written to $TMPDIR_TEST/bob_args
+# bob_args_lines:   one argument per line for exact token assertions
 # bob_prompt:       stdin captured to $TMPDIR_TEST/bob_prompt (the prompt arrives
 #                   via stdin now, not as a positional arg)
 create_mock_bob() {
     local mock_script="$TMPDIR_TEST/bob"
     cat > "$mock_script" << 'MOCK_EOF'
 #!/usr/bin/env bash
-echo "$@" > "$TMPDIR_TEST/bob_args"
+printf '%s\n' "$*" > "$TMPDIR_TEST/bob_args"
+printf '%s\n' "$@" > "$TMPDIR_TEST/bob_args_lines"
 # capture stdin (the prompt) separately for assertions
 cat > "$TMPDIR_TEST/bob_prompt"
 
+if [[ "${MOCK_PROBE_NESTED_AGENT_GUARD:-0}" == "1" &&
+    "${MOCK_NESTED_AGENT_PROBE_ACTIVE:-0}" != "1" ]]; then
+    export MOCK_NESTED_AGENT_PROBE_ACTIVE=1
+    for agent_cli in bob claude codex; do
+        "$agent_cli" --version > "$TMPDIR_TEST/nested_${agent_cli}_output" 2>&1
+        printf '%s\n' "$?" > "$TMPDIR_TEST/nested_${agent_cli}_status"
+    done
+fi
+
+if [[ "${MOCK_STDERR_FIRST:-0}" == "1" && -n "${MOCK_STDERR_FILE:-}" && -f "$MOCK_STDERR_FILE" ]]; then
+    cat "$MOCK_STDERR_FILE" >&2
+    sleep "${MOCK_DELAY_AFTER_STDERR:-0}"
+fi
 if [[ -n "${MOCK_STDOUT_FILE:-}" && -f "$MOCK_STDOUT_FILE" ]]; then
     cat "$MOCK_STDOUT_FILE"
 fi
-if [[ -n "${MOCK_STDERR_FILE:-}" && -f "$MOCK_STDERR_FILE" ]]; then
+if [[ "${MOCK_STDERR_FIRST:-0}" != "1" && -n "${MOCK_STDERR_FILE:-}" && -f "$MOCK_STDERR_FILE" ]]; then
     cat "$MOCK_STDERR_FILE" >&2
 fi
 exit "${MOCK_EXIT_CODE:-0}"
@@ -63,27 +274,25 @@ MOCK_EOF
     echo "$mock_script"
 }
 
-# A second mock that records each argv element on its own line (via printf) so
-# word-splitting can be asserted (echo "$@" would re-join with spaces). This
-# mock writes to bob_args_lines, not bob_args.
-# IMPORTANT: create_mock_bob writes via `cat > "$TMPDIR_TEST/bob"`, which FOLLOWS
-# the bob->bob_lines symlink and overwrites bob_lines itself. So after any call
-# to create_mock_bob, bob_lines is corrupted (replaced by the standard mock).
-# Any test needing the line-recording mock MUST call this helper to recreate
-# bob_lines before re-symlinking bob -> bob_lines.
-create_bob_lines_mock() {
-    cat > "$TMPDIR_TEST/bob_lines" << 'LINES_EOF'
-#!/usr/bin/env bash
-printf '%s\n' "$@" > "$TMPDIR_TEST/bob_args_lines"
-cat > /dev/null  # consume stdin
-cat "$MOCK_STDOUT_FILE"
-exit 0
-LINES_EOF
-    chmod +x "$TMPDIR_TEST/bob_lines"
-    ln -sf "$TMPDIR_TEST/bob_lines" "$TMPDIR_TEST/bob"
-}
-
 create_mock_bob > /dev/null
+
+# Safe fallbacks for the review-guard regression: if a guard disappears, the
+# test records a normal exit instead of invoking a developer's real agent CLI.
+for mock_agent_cli in claude codex; do
+    printf '%s\n' \
+        '#!/usr/bin/env bash' \
+        'tool_name=${0##*/}' \
+        'printf '\''unguarded %s invocation\n'\'' "$tool_name"' \
+        'exit 0' > "$TMPDIR_TEST/$mock_agent_cli"
+    chmod +x "$TMPDIR_TEST/$mock_agent_cli"
+done
+
+# validate every shipped mode against bob's yaml shape and tool allow-list.
+for mode in ralphex-task ralphex-review ralphex-plan; do
+    assert_yaml_valid \
+        "$mode mode parses with the vendored YAML validator" \
+        --strict "$SCRIPT_DIR/modes/$mode.yaml"
+done
 
 # minimal valid bob event stream: one attempt_completion produces output.
 cat > "$TMPDIR_TEST/minimal_events.txt" << 'EOF'
@@ -91,6 +300,14 @@ cat > "$TMPDIR_TEST/minimal_events.txt" << 'EOF'
 {"type":"message","timestamp":"t","role":"user","content":"test\n"}
 {"type":"tool_use","timestamp":"t","tool_name":"attempt_completion","tool_id":"tool-1","parameters":{"result":"hello world\n"}}
 {"type":"tool_result","timestamp":"t","tool_id":"tool-1","status":"success","output":"hello world\n"}
+{"type":"result","timestamp":"t","status":"success","stats":{}}
+EOF
+
+cat > "$TMPDIR_TEST/plan_ready_events.txt" << 'EOF'
+{"type":"init","timestamp":"t","session_id":"s","model":"premium"}
+{"type":"message","timestamp":"t","role":"user","content":"test\n"}
+{"type":"tool_use","timestamp":"t","tool_name":"attempt_completion","tool_id":"tool-1","parameters":{"result":"<<<RALPHEX:PLAN_READY>>>"}}
+{"type":"tool_result","timestamp":"t","tool_id":"tool-1","status":"success","output":"<<<RALPHEX:PLAN_READY>>>"}
 {"type":"result","timestamp":"t","status":"success","stats":{}}
 EOF
 
@@ -105,7 +322,7 @@ echo "running bob-as-claude.sh tests"
 echo ""
 
 # ---------------------------------------------------------------------------
-# test: bob launched with --chat-mode code, --output-format stream-json,
+# test: bob launched with automatic task mode, stream-json output,
 # --hide-intermediary-output, --yolo, --trust, and prompt delivered via stdin
 # ---------------------------------------------------------------------------
 echo "test: bob invocation flags"
@@ -114,7 +331,7 @@ rm -f "$TMPDIR_TEST/bob_args" "$TMPDIR_TEST/bob_prompt"
 run_wrapper -p "test prompt" >/dev/null 2>&1
 
 recorded=$(cat "$TMPDIR_TEST/bob_args")
-for flag in "--chat-mode code" "--output-format stream-json" "--hide-intermediary-output" "--yolo" "--trust"; do
+for flag in "--chat-mode=ralphex-task" "--output-format=stream-json" "--hide-intermediary-output" "--yolo" "--trust"; do
     if echo "$recorded" | grep -q -- "$flag"; then
         pass "bob invoked with $flag"
     else
@@ -135,6 +352,27 @@ else
     pass "prompt absent from argv"
 fi
 
+# Review mode must allow the wrapper's resolved top-level Bob executable while
+# preventing Bob from launching nested agent CLIs through its command-tool PATH.
+rm -f "$TMPDIR_TEST"/nested_{bob,claude,codex}_{output,status}
+MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
+    MOCK_PROBE_NESTED_AGENT_GUARD=1 \
+    BOB_CHAT_MODE=ralphex-review \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "review this change" >/dev/null 2>&1
+for agent_cli in bob claude codex; do
+    nested_status=$(cat "$TMPDIR_TEST/nested_${agent_cli}_status" 2>/dev/null || true)
+    nested_output=$(cat "$TMPDIR_TEST/nested_${agent_cli}_output" 2>/dev/null || true)
+    if [[ "$nested_status" == "64" ]] &&
+        [[ "$nested_output" == *"nested $agent_cli invocation blocked"* ]] &&
+        [[ "$nested_output" == *"sequentially in the current Bob session"* ]]; then
+        pass "review guard blocks nested $agent_cli invocation"
+    else
+        fail "review guard did not block nested $agent_cli" \
+            "status: $nested_status; output: $nested_output"
+    fi
+done
+
 # ---------------------------------------------------------------------------
 # test: --model flag forwarded to bob as -m
 # ---------------------------------------------------------------------------
@@ -148,6 +386,16 @@ if echo "$recorded" | grep -q -- "-m anthropic/claude-x"; then
     pass "--model forwarded to bob as -m"
 else
     fail "--model not forwarded as -m" "args: $recorded"
+fi
+
+# direct invocations may use the documented equals form.
+rm -f "$TMPDIR_TEST/bob_args"
+run_wrapper --model=anthropic/claude-equals -p "test prompt" >/dev/null 2>&1
+recorded=$(cat "$TMPDIR_TEST/bob_args")
+if echo "$recorded" | grep -q -- "-m anthropic/claude-equals"; then
+    pass "--model=<value> forwarded to bob as -m"
+else
+    fail "--model=<value> not forwarded as -m" "args: $recorded"
 fi
 
 # ---------------------------------------------------------------------------
@@ -213,6 +461,17 @@ else
     fail "stderr note missing for --effort" "stderr: $err_out"
 fi
 
+# the equals form is also accepted and stripped.
+rm -f "$TMPDIR_TEST/bob_args"
+err_out=$(run_wrapper --effort=medium -p "test prompt" 2>&1 >/dev/null)
+recorded=$(cat "$TMPDIR_TEST/bob_args")
+if ! echo "$recorded" | grep -q -- "--effort" &&
+    echo "$err_out" | grep -qi "bob has no --effort flag"; then
+    pass "--effort=<value> accepted, reported, and stripped"
+else
+    fail "--effort=<value> handling is incorrect" "args: $recorded; stderr: $err_out"
+fi
+
 # empty --effort must NOT emit a note (avoids noise on default empty)
 rm -f "$TMPDIR_TEST/bob_args"
 err_out=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
@@ -274,30 +533,13 @@ fi
 # BOB_EXTRA_ARGS word-splitting does NOT preserve quotes: a value like
 # '--flag "a b"' is split into ['--flag', '"a', 'b"'] (three tokens), not
 # ['--flag', 'a b'] (two tokens). This is a documented limitation.
-# To verify word-splitting, we record each arg on its own line by using
-# printf '%s\n' "$@" in a dedicated mock (echo "$@" would re-join with
-# spaces and hide the split).
+# the shared mock records each argument on its own line so the split remains
+# observable instead of being hidden by a space-joined argv string.
 rm -f "$TMPDIR_TEST/bob_args_lines"
-cat > "$TMPDIR_TEST/bob_lines" << 'LINES_EOF'
-#!/usr/bin/env bash
-printf '%s\n' "$@" > "$TMPDIR_TEST/bob_args_lines"
-cat > /dev/null  # consume stdin
-cat "$MOCK_STDOUT_FILE"
-exit 0
-LINES_EOF
-chmod +x "$TMPDIR_TEST/bob_lines"
-ln -sf "$TMPDIR_TEST/bob_lines" "$TMPDIR_TEST/bob"
 MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
     BOB_EXTRA_ARGS='--flag "a b"' \
     PATH="$TMPDIR_TEST:$PATH" \
     bash "$WRAPPER" -p "test prompt" >/dev/null 2>&1
-# restore the standard mock for subsequent tests.
-# NOTE: create_mock_bob writes via `cat > "$TMPDIR_TEST/bob"`, which FOLLOWS the
-# symlink and overwrites bob_lines itself. Any later test that re-symlinks bob
-# -> bob_lines would inherit the standard mock (writing bob_args, not
-# bob_args_lines). Tests below that need the line-recording mock must recreate
-# bob_lines before re-symlinking.
-create_mock_bob > /dev/null
 # The args should be split into 3 lines: --flag, "a, b"
 args_line_count=$(wc -l < "$TMPDIR_TEST/bob_args_lines" | tr -d ' ')
 if [[ "$args_line_count" -ge 3 ]]; then
@@ -315,46 +557,21 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# test: BOB_CHAT_MODE env forwarded as --chat-mode
+# test: BOB_CHAT_MODE accepts arbitrary custom slugs
 # ---------------------------------------------------------------------------
-echo "test: BOB_CHAT_MODE env"
+echo "test: arbitrary BOB_CHAT_MODE override"
 
 rm -f "$TMPDIR_TEST/bob_args"
 MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
-    BOB_CHAT_MODE="ask" \
+    BOB_CHAT_MODE="my-custom-mode" \
     PATH="$TMPDIR_TEST:$PATH" \
     bash "$WRAPPER" -p "test prompt" >/dev/null 2>&1
 
 recorded=$(cat "$TMPDIR_TEST/bob_args")
-if echo "$recorded" | grep -q -- "--chat-mode ask"; then
-    pass "BOB_CHAT_MODE=ask forwarded as --chat-mode ask"
+if echo "$recorded" | grep -q -- "--chat-mode=my-custom-mode"; then
+    pass "arbitrary BOB_CHAT_MODE slug forwarded unchanged"
 else
     fail "BOB_CHAT_MODE not forwarded" "args: $recorded"
-fi
-
-# ---------------------------------------------------------------------------
-# test: invalid BOB_CHAT_MODE exits with error
-# ---------------------------------------------------------------------------
-echo "test: invalid BOB_CHAT_MODE"
-
-set +e
-MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
-    BOB_CHAT_MODE="invalid" \
-    PATH="$TMPDIR_TEST:$PATH" \
-    bash "$WRAPPER" -p "test prompt" 2>"$TMPDIR_TEST/chatmode_err" >/dev/null
-chatmode_exit=$?
-set -e
-
-if [[ $chatmode_exit -ne 0 ]]; then
-    pass "invalid BOB_CHAT_MODE exits non-zero"
-else
-    fail "invalid BOB_CHAT_MODE should exit non-zero" "got exit 0"
-fi
-
-if grep -qi "BOB_CHAT_MODE must be one of" "$TMPDIR_TEST/chatmode_err"; then
-    pass "invalid BOB_CHAT_MODE error message is clear"
-else
-    fail "invalid BOB_CHAT_MODE error message missing" "stderr: $(cat "$TMPDIR_TEST/chatmode_err")"
 fi
 
 # ---------------------------------------------------------------------------
@@ -441,6 +658,33 @@ if [[ "$noterm_results" -eq 1 ]]; then
     pass "no result event yields exactly one (fallback) result"
 else
     fail "unexpected result count without result event" "expected 1, got $noterm_results: $output_noterm"
+fi
+
+# a failed Bob result must retain its diagnostic instead of being translated to
+# the same empty result as a successful run.
+cat > "$TMPDIR_TEST/failed_result_events.jsonl" << 'EOF'
+{"type":"result","timestamp":"t","status":"error","error":{"message":"backend continuation timed out"},"stats":{}}
+EOF
+set +e
+failed_result_output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/failed_result_events.jsonl" \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "test prompt" 2>/dev/null)
+failed_result_exit=$?
+set -e
+if echo "$failed_result_output" | grep -q "backend continuation timed out"; then
+    pass "failed Bob result diagnostic preserved"
+else
+    fail "failed Bob result diagnostic dropped" "got: $failed_result_output"
+fi
+if echo "$failed_result_output" | grep -q "without diagnostic output"; then
+    fail "synthetic diagnostic duplicated detailed Bob result error" "got: $failed_result_output"
+else
+    pass "detailed Bob result suppresses synthetic fallback diagnostic"
+fi
+if [[ $failed_result_exit -eq 1 ]]; then
+    pass "failed Bob result forces non-zero exit"
+else
+    fail "failed Bob result did not force non-zero exit" "got: $failed_result_exit"
 fi
 
 # ---------------------------------------------------------------------------
@@ -573,148 +817,308 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# test: review-prompt adapter injection (strict trigger on review START markers)
+# test: automatic phase selection and prompt delivery
 # ---------------------------------------------------------------------------
-echo "test: review-prompt adapter injection (strict trigger)"
+echo "test: automatic phase selection"
 
-# "Use the Task tool to launch" marker triggers the adapter (claude executor's
-# per-agent {{agent:NAME}} expansion form)
-rm -f "$TMPDIR_TEST/bob_prompt"
+assert_selected_mode() {
+    local expected="$1"
+    local test_prompt="$2"
+    local events_file="$TMPDIR_TEST/minimal_events.txt"
+
+    [[ "$expected" == "ralphex-plan" ]] && events_file="$TMPDIR_TEST/plan_ready_events.txt"
+
+    rm -f "$TMPDIR_TEST/bob_args" "$TMPDIR_TEST/bob_prompt"
+    MOCK_STDOUT_FILE="$events_file" \
+        PATH="$TMPDIR_TEST:$PATH" \
+        bash "$WRAPPER" -p "$test_prompt" >/dev/null 2>&1
+
+    if grep -q -- "--chat-mode=$expected" "$TMPDIR_TEST/bob_args"; then
+        pass "prompt selected $expected"
+    else
+        fail "prompt did not select $expected" "args: $(cat "$TMPDIR_TEST/bob_args")"
+    fi
+    if [[ "$expected" == "ralphex-plan" ]] &&
+        grep -qi 'call attempt_completion exactly once' "$TMPDIR_TEST/bob_prompt" &&
+        [[ "$(cat "$TMPDIR_TEST/bob_prompt")" == *"$test_prompt" ]]; then
+        pass "plan protocol adapter prepended while preserving original prompt"
+    elif [[ "$expected" != "ralphex-plan" && "$(cat "$TMPDIR_TEST/bob_prompt")" == "$test_prompt" ]]; then
+        pass "prompt delivered unchanged for $expected"
+    else
+        fail "prompt changed while selecting $expected" "got: $(cat "$TMPDIR_TEST/bob_prompt")"
+    fi
+}
+
+assert_selected_mode "ralphex-task" "implement this task"
+assert_selected_mode "ralphex-task" "finalize the completed work"
+assert_selected_mode "ralphex-review" "## Step 2: Launch ALL 5 Review Agents IN PARALLEL"
+assert_selected_mode "ralphex-review" "## Step 2: Launch Review Agents IN PARALLEL"
+assert_selected_mode "ralphex-plan" $'<<<RALPHEX:QUESTION>>>\n<<<RALPHEX:PLAN_DRAFT>>>\n<<<RALPHEX:PLAN_READY>>>'
+
+# review markers take precedence over a complete plan signal set.
+assert_selected_mode "ralphex-review" $'## Step 2: Launch Review Agents IN PARALLEL\n<<<RALPHEX:QUESTION>>>\n<<<RALPHEX:PLAN_DRAFT>>>\n<<<RALPHEX:PLAN_READY>>>'
+
+# markers inside either supported fence do not change the task fallback.
+assert_selected_mode "ralphex-task" $'```\n## Step 2: Launch Review Agents IN PARALLEL\n<<<RALPHEX:QUESTION>>>\n<<<RALPHEX:PLAN_DRAFT>>>\n<<<RALPHEX:PLAN_READY>>>\n```'
+assert_selected_mode "ralphex-task" $'~~~\nUse the Task tool to launch a general-purpose agent with this prompt:\n~~~'
+
+# only a compatible fence delimiter closes a block; nested shorter and mixed
+# delimiters stay inside the outer fence and cannot expose review markers.
+assert_selected_mode "ralphex-task" $'````markdown\n```text\n## Step 2: Launch Review Agents IN PARALLEL\n```\n````'
+assert_selected_mode "ralphex-task" $'```text\n~~~\nUse the Task tool to launch a general-purpose agent with this prompt:\n~~~\n```'
+
+# an output completion signal alone is not a review start marker.
+assert_selected_mode "ralphex-task" "please review <<<RALPHEX:REVIEW_DONE>>>"
+
+# each plan signal is insufficient on its own, and every incomplete pair stays
+# on the task fallback until the complete signal set is present.
+assert_selected_mode "ralphex-task" "<<<RALPHEX:QUESTION>>>"
+assert_selected_mode "ralphex-task" "<<<RALPHEX:PLAN_DRAFT>>>"
+assert_selected_mode "ralphex-task" "<<<RALPHEX:PLAN_READY>>>"
+assert_selected_mode "ralphex-task" $'<<<RALPHEX:QUESTION>>>\n<<<RALPHEX:PLAN_DRAFT>>>'
+assert_selected_mode "ralphex-task" $'<<<RALPHEX:QUESTION>>>\n<<<RALPHEX:PLAN_READY>>>'
+assert_selected_mode "ralphex-task" $'<<<RALPHEX:PLAN_DRAFT>>>\n<<<RALPHEX:PLAN_READY>>>'
+
+# review markers take precedence even when a plan marker set appears before or
+# after them, while fenced examples remain ordinary task prompt content.
+assert_selected_mode "ralphex-review" "Use the Task tool to launch a general-purpose agent with this prompt:"
+assert_selected_mode "ralphex-review" "Use the Task tool with model=sonnet to launch a general-purpose agent with this prompt:"
+assert_selected_mode "ralphex-review" $'<<<RALPHEX:QUESTION>>>\n## Step 2: Launch Review Agents IN PARALLEL\n<<<RALPHEX:PLAN_READY>>>'
+assert_selected_mode "ralphex-task" $'  ```text\nUse the Task tool to launch a general-purpose agent with this prompt:\n```'
+assert_selected_mode "ralphex-task" $'  ~~~\n<<<RALPHEX:QUESTION>>>\n<<<RALPHEX:PLAN_DRAFT>>>\n<<<RALPHEX:PLAN_READY>>>\n~~~'
+
+# fence-like Markdown that cannot open a fenced block must not suppress later
+# phase markers.
+assert_selected_mode "ralphex-review" $'```literal```\n## Step 2: Launch Review Agents IN PARALLEL'
+assert_selected_mode "ralphex-plan" $'    ```\n<<<RALPHEX:QUESTION>>>\n<<<RALPHEX:PLAN_DRAFT>>>\n<<<RALPHEX:PLAN_READY>>>'
+
+# detection resumes after either fence style closes.
+assert_selected_mode "ralphex-review" $'```text\n## Step 2: Launch Review Agents IN PARALLEL\n```\nUse the Task tool to launch a general-purpose agent with this prompt:'
+assert_selected_mode "ralphex-review" $'~~~\nUse the Task tool to launch a general-purpose agent with this prompt:\n~~~\n## Step 2: Launch Review Agents IN PARALLEL'
+
+# marker-like phrases in ordinary prose are content, not review structure.
+assert_selected_mode "ralphex-task" "Update the Launch Review Agents IN PARALLEL documentation"
+assert_selected_mode "ralphex-task" "Explain how to Use the Task tool to launch an agent"
+
+# a fenced plan marker cannot combine with two outside markers.
+assert_selected_mode "ralphex-task" $'```\n<<<RALPHEX:QUESTION>>>\n```\n<<<RALPHEX:PLAN_DRAFT>>>\n<<<RALPHEX:PLAN_READY>>>'
+
+# exercise the exact embedded prompts through the stdin path used by ralphex.
+assert_prompt_file_mode() {
+    local expected="$1"
+    local prompt_file="$2"
+    local expected_prompt
+    local events_file="$TMPDIR_TEST/minimal_events.txt"
+
+    [[ "$expected" == "ralphex-plan" ]] && events_file="$TMPDIR_TEST/plan_ready_events.txt"
+
+    rm -f "$TMPDIR_TEST/bob_args" "$TMPDIR_TEST/bob_prompt"
+    MOCK_STDOUT_FILE="$events_file" \
+        PATH="$TMPDIR_TEST:$PATH" \
+        bash "$WRAPPER" < "$prompt_file" >/dev/null 2>&1
+    if grep -q -- "--chat-mode=$expected" "$TMPDIR_TEST/bob_args"; then
+        pass "$(basename "$prompt_file") selected $expected"
+    else
+        fail "$(basename "$prompt_file") did not select $expected" \
+            "args: $(cat "$TMPDIR_TEST/bob_args")"
+    fi
+    expected_prompt=$(cat "$prompt_file")
+    if [[ "$expected" == "ralphex-plan" ]] &&
+        grep -qi 'call attempt_completion exactly once' "$TMPDIR_TEST/bob_prompt" &&
+        [[ "$(cat "$TMPDIR_TEST/bob_prompt")" == *"$expected_prompt" ]]; then
+        pass "$(basename "$prompt_file") received plan protocol adapter and original prompt"
+    elif [[ "$expected" != "ralphex-plan" && "$(cat "$TMPDIR_TEST/bob_prompt")" == "$expected_prompt" ]]; then
+        pass "$(basename "$prompt_file") passed unchanged through stdin"
+    else
+        fail "$(basename "$prompt_file") changed on stdin delivery"
+    fi
+}
+
+prompt_dir="$REPO_ROOT/pkg/config/defaults/prompts"
+assert_prompt_file_mode "ralphex-task" "$prompt_dir/task.txt"
+assert_prompt_file_mode "ralphex-task" "$prompt_dir/finalize.txt"
+assert_prompt_file_mode "ralphex-review" "$prompt_dir/review_first.txt"
+assert_prompt_file_mode "ralphex-review" "$prompt_dir/review_second.txt"
+assert_prompt_file_mode "ralphex-plan" "$prompt_dir/make_plan.txt"
+
+# a user-controlled plan description may mention review marker phrases without
+# overriding the complete plan signal set in the rendered prompt.
+rendered_plan_prompt=$(< "$prompt_dir/make_plan.txt")
+rendered_plan_prompt="${rendered_plan_prompt//\{\{PLAN_DESCRIPTION\}\}/Update the Launch Review Agents IN PARALLEL documentation}"
+assert_selected_mode "ralphex-plan" "$rendered_plan_prompt"
+
+# an explicit custom slug wins over every automatic marker.
+rm -f "$TMPDIR_TEST/bob_args" "$TMPDIR_TEST/bob_prompt"
+override_prompt=$'## Step 2: Launch ALL 5 Review Agents IN PARALLEL\n<<<RALPHEX:QUESTION>>>\n<<<RALPHEX:PLAN_DRAFT>>>\n<<<RALPHEX:PLAN_READY>>>'
 MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
+    BOB_CHAT_MODE="user-defined-mode" \
     PATH="$TMPDIR_TEST:$PATH" \
-    bash "$WRAPPER" -p $'Code review of: feature\n\n## Step 2: Launch ALL 5 Review Agents IN PARALLEL\n\nUse the Task tool to launch a general-purpose agent with this prompt:\n"review quality"\nReport findings only - no positive observations.' >/dev/null 2>&1
-
-sent_prompt=$(cat "$TMPDIR_TEST/bob_prompt")
-if echo "$sent_prompt" | grep -q "Ralphex review adapter for bob"; then
-    pass "review adapter text prepended for review prompts (Task tool marker)"
+    bash "$WRAPPER" -p "$override_prompt" >/dev/null 2>&1
+if grep -q -- "--chat-mode=user-defined-mode" "$TMPDIR_TEST/bob_args"; then
+    pass "explicit custom slug overrides automatic phase selection"
 else
-    fail "review adapter text not prepended" "got: $sent_prompt"
+    fail "explicit custom slug was not forwarded" "args: $(cat "$TMPDIR_TEST/bob_args")"
+fi
+if [[ "$(cat "$TMPDIR_TEST/bob_prompt")" == "$override_prompt" ]]; then
+    pass "explicit override preserves original prompt"
+else
+    fail "explicit override changed original prompt" "got: $(cat "$TMPDIR_TEST/bob_prompt")"
 fi
 
-# the original review prompt content is preserved after the adapter
-if echo "$sent_prompt" | grep -q "Use the Task tool to launch a general-purpose agent"; then
-    pass "original review prompt preserved in adapted prompt"
-else
-    fail "original review prompt lost" "got: $sent_prompt"
-fi
-
-# non-review prompts are NOT adapted
-rm -f "$TMPDIR_TEST/bob_prompt"
-run_wrapper -p "just a task prompt" >/dev/null 2>&1
-sent_prompt=$(cat "$TMPDIR_TEST/bob_prompt")
-if echo "$sent_prompt" | grep -q "Ralphex review adapter"; then
-    fail "adapter wrongly injected for non-review prompt" "got: $sent_prompt"
-else
-    pass "non-review prompt left unmodified"
-fi
-
-# ---------------------------------------------------------------------------
-# test: review-adapter trigger on "Launch ALL 5 Review Agents IN PARALLEL" alone
-# (review_first.txt Step 2 header — no per-agent Task tool block needed)
-# ---------------------------------------------------------------------------
-echo "test: review adapter triggers on Launch ALL 5 marker"
-
-rm -f "$TMPDIR_TEST/bob_prompt"
+# built-in bob slugs remain valid explicit overrides alongside arbitrary custom
+# slugs, and both preserve the prompt byte-for-byte.
+rm -f "$TMPDIR_TEST/bob_args" "$TMPDIR_TEST/bob_prompt"
+override_prompt=$'## Step 2: Launch Review Agents IN PARALLEL\n<<<RALPHEX:PLAN_DRAFT>>>'
 MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
+    BOB_CHAT_MODE="code" \
     PATH="$TMPDIR_TEST:$PATH" \
-    bash "$WRAPPER" -p $'Code review of: feature\n\n## Step 2: Launch ALL 5 Review Agents IN PARALLEL\n\nCRITICAL: All 5 agent invocations MUST be issued in a single message.' >/dev/null 2>&1
-sent_prompt=$(cat "$TMPDIR_TEST/bob_prompt")
-if echo "$sent_prompt" | grep -q "Ralphex review adapter for bob"; then
-    pass "adapter injected for Launch ALL 5 Review Agents IN PARALLEL marker"
+    bash "$WRAPPER" -p "$override_prompt" >/dev/null 2>&1
+if grep -q -- "--chat-mode=code" "$TMPDIR_TEST/bob_args"; then
+    pass "built-in BOB_CHAT_MODE override is forwarded"
 else
-    fail "adapter NOT injected for Launch ALL 5 marker" "got: $sent_prompt"
+    fail "built-in BOB_CHAT_MODE override was not forwarded" "args: $(cat "$TMPDIR_TEST/bob_args")"
+fi
+if [[ "$(cat "$TMPDIR_TEST/bob_prompt")" == "$override_prompt" ]]; then
+    pass "built-in override preserves original prompt"
+else
+    fail "built-in override changed original prompt" "got: $(cat "$TMPDIR_TEST/bob_prompt")"
 fi
 
 # ---------------------------------------------------------------------------
-# test: review-adapter trigger on "Launch Review Agents IN PARALLEL"
-# (review_second.txt Step 2 header — 2-agent second pass, no "ALL 5")
+# test: plan mode exposes intermediary deltas and injects Bob protocol
 # ---------------------------------------------------------------------------
-echo "test: review adapter triggers on Launch Review Agents marker (second pass)"
+echo "test: plan mode invocation and protocol adapter"
 
-rm -f "$TMPDIR_TEST/bob_prompt"
-MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
+plan_prompt=$'<<<RALPHEX:QUESTION>>>\n<<<RALPHEX:PLAN_DRAFT>>>\n<<<RALPHEX:PLAN_READY>>>'
+rm -f "$TMPDIR_TEST/bob_args" "$TMPDIR_TEST/bob_prompt"
+MOCK_STDOUT_FILE="$TMPDIR_TEST/plan_ready_events.txt" \
     PATH="$TMPDIR_TEST:$PATH" \
-    bash "$WRAPPER" -p $'Second code review pass of: feature\n\n## Step 2: Launch Review Agents IN PARALLEL\n\nCRITICAL: Both agent invocations MUST be issued in a single message.' >/dev/null 2>&1
-sent_prompt=$(cat "$TMPDIR_TEST/bob_prompt")
-if echo "$sent_prompt" | grep -q "Ralphex review adapter for bob"; then
-    pass "adapter injected for Launch Review Agents IN PARALLEL marker (second pass)"
+    bash "$WRAPPER" -p "$plan_prompt" >/dev/null 2>&1
+recorded=$(cat "$TMPDIR_TEST/bob_args")
+if echo "$recorded" | grep -q -- "--hide-intermediary-output"; then
+    fail "plan mode must expose intermediary assistant deltas" "args: $recorded"
 else
-    fail "adapter NOT injected for Launch Review Agents marker" "got: $sent_prompt"
+    pass "plan mode omits --hide-intermediary-output"
 fi
-
-# ---------------------------------------------------------------------------
-# test: REVIEW_DONE alone (completion signal, NOT a start marker) does NOT trigger
-# ---------------------------------------------------------------------------
-echo "test: REVIEW_DONE alone does NOT trigger adapter"
-
-rm -f "$TMPDIR_TEST/bob_prompt"
-MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
-    PATH="$TMPDIR_TEST:$PATH" \
-    bash "$WRAPPER" -p $'please review\n<<<RALPHEX:REVIEW_DONE>>>' >/dev/null 2>&1
-sent_prompt=$(cat "$TMPDIR_TEST/bob_prompt")
-if echo "$sent_prompt" | grep -q "Ralphex review adapter for bob"; then
-    fail "adapter injected for REVIEW_DONE-only prompt (should NOT fire on completion signal)" "got: $sent_prompt"
+if grep -qi 'attempt_completion exactly once' "$TMPDIR_TEST/bob_prompt" &&
+    grep -qi 'ralphex alone owns that log' "$TMPDIR_TEST/bob_prompt"; then
+    pass "plan prompt contains terminal-tool and progress ownership rules"
 else
-    pass "adapter NOT injected for REVIEW_DONE-only prompt (completion signal, not start)"
-fi
-
-# the REVIEW_DONE signal is still passed through to bob intact
-if echo "$sent_prompt" | grep -q "<<<RALPHEX:REVIEW_DONE>>>"; then
-    pass "REVIEW_DONE signal preserved in prompt even when adapter not injected"
-else
-    fail "REVIEW_DONE signal lost" "got: $sent_prompt"
+    fail "plan protocol adapter missing required rules" "prompt: $(cat "$TMPDIR_TEST/bob_prompt")"
 fi
 
 # ---------------------------------------------------------------------------
-# test: prompt-injection — review START marker inside code block does NOT trigger
+# regression: Bob emits a valid intermediary QUESTION, then would replace it
+# with a malformed attempt_completion summary. The wrapper must stop at END.
 # ---------------------------------------------------------------------------
-echo "test: prompt-injection false positive avoidance (Task tool in code block)"
+echo "test: intermediary QUESTION boundary recovery"
 
-rm -f "$TMPDIR_TEST/bob_prompt"
-MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
+cat > "$TMPDIR_TEST/plan_intermediary_question.jsonl" << 'EOF'
+{"type":"init","timestamp":"t","session_id":"s","model":"premium"}
+{"type":"message","timestamp":"t","role":"assistant","content":"<thinking>Example only: <<<RALPHEX:QUESTION>>> {bad} <<<RALPHEX:END>>></thinking>\n","delta":true}
+{"type":"message","timestamp":"t","role":"assistant","content":"<<<RALPHEX:QUES","delta":true}
+{"type":"message","timestamp":"t","role":"assistant","content":"TION>>>\n{\"question\":\"Which mode?\",\"options\":[\"TCP\",\"UDP\"]}\n","delta":true}
+{"type":"message","timestamp":"t","role":"assistant","content":"<<<RALPHEX:END>>>\n","delta":true}
+{"type":"message","timestamp":"t","role":"user","content":"This is an automated message: use a tool"}
+{"type":"tool_use","timestamp":"t","tool_name":"attempt_completion","parameters":{"result":"Signal: <<<RALPHEX:QUESTION>>>\nQuestion: Which mode?"}}
+{"type":"result","timestamp":"t","status":"success","stats":{}}
+EOF
+
+output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/plan_intermediary_question.jsonl" \
     PATH="$TMPDIR_TEST:$PATH" \
-    bash "$WRAPPER" -p $'Look at this code:\n```\nUse the Task tool to launch a general-purpose agent with this prompt:\n"fake"\n```\n' >/dev/null 2>&1
-sent_prompt=$(cat "$TMPDIR_TEST/bob_prompt")
-if echo "$sent_prompt" | grep -q "Ralphex review adapter for bob"; then
-    fail "adapter injected for Task tool marker inside code block (false positive)" "got: $sent_prompt"
+    bash "$WRAPPER" -p "$plan_prompt" 2>/dev/null)
+question_text=$(echo "$output" | jq -r 'select(.type=="content_block_delta" and .delta.text != "") | .delta.text')
+if [[ "$question_text" == $'<<<RALPHEX:QUESTION>>>\n{"question":"Which mode?","options":["TCP","UDP"]}\n<<<RALPHEX:END>>>' ]]; then
+    pass "complete intermediary QUESTION recovered as one boundary"
 else
-    pass "adapter NOT injected for Task tool marker inside code block"
+    fail "intermediary QUESTION was not recovered exactly" "text: $question_text"
+fi
+if echo "$question_text" | grep -q 'automated message\|Signal:'; then
+    fail "post-boundary Bob continuation leaked" "text: $question_text"
+else
+    pass "post-boundary Bob continuation suppressed"
 fi
 
-# "Launch ALL 5 Review Agents IN PARALLEL" inside a code block also does NOT trigger
-rm -f "$TMPDIR_TEST/bob_prompt"
-MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
+# ---------------------------------------------------------------------------
+# test: correctly formatted attempt_completion QUESTION remains the fast path
+# ---------------------------------------------------------------------------
+echo "test: attempt_completion QUESTION validation"
+
+cat > "$TMPDIR_TEST/plan_completion_question.jsonl" << 'EOF'
+{"type":"tool_use","timestamp":"t","tool_name":"attempt_completion","parameters":{"result":"<<<RALPHEX:QUESTION>>>\n{\"question\":\"Choose stack?\",\"options\":[\"JS\",\"TS\"]}\n<<<RALPHEX:END>>>"}}
+{"type":"result","timestamp":"t","status":"success","stats":{}}
+EOF
+output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/plan_completion_question.jsonl" \
     PATH="$TMPDIR_TEST:$PATH" \
-    bash "$WRAPPER" -p $'```bash\n## Step 2: Launch ALL 5 Review Agents IN PARALLEL\n```\n' >/dev/null 2>&1
-sent_prompt=$(cat "$TMPDIR_TEST/bob_prompt")
-if echo "$sent_prompt" | grep -q "Ralphex review adapter for bob"; then
-    fail "adapter injected for Launch marker inside code block (false positive)" "got: $sent_prompt"
+    bash "$WRAPPER" -p "$plan_prompt" 2>/dev/null)
+if echo "$output" | jq -e 'select(.type=="content_block_delta" and (.delta.text | contains("\"question\":\"Choose stack?\"")) and (.delta.text | contains("<<<RALPHEX:END>>>")))' >/dev/null 2>&1; then
+    pass "valid attempt_completion QUESTION forwarded"
 else
-    pass "adapter NOT injected for Launch marker inside code block"
+    fail "valid attempt_completion QUESTION rejected" "output: $output"
 fi
 
-# marker after a fenced block closes (valid standalone) DOES trigger
-rm -f "$TMPDIR_TEST/bob_prompt"
-MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
+# Bob may ignore the prompt's preferred 2-4 option count. Ralphex's parser only
+# requires a non-empty string array, so the adapter must not reject an otherwise
+# valid boundary before ralphex can display it.
+cat > "$TMPDIR_TEST/plan_completion_many_options.jsonl" << 'EOF'
+{"type":"tool_use","timestamp":"t","tool_name":"attempt_completion","parameters":{"result":"\n<<<RALPHEX:QUESTION>>>\n{\"question\": \"Which planet?\", \"options\": [\"Mercury\", \"Venus\", \"Earth\", \"Mars\", \"Outer planet\", \"Multiple planets\"]}\n<<<RALPHEX:END>>>\n"}}
+{"type":"result","timestamp":"t","status":"success","stats":{}}
+EOF
+output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/plan_completion_many_options.jsonl" \
     PATH="$TMPDIR_TEST:$PATH" \
-    bash "$WRAPPER" -p $'```\ncode here\n```\nUse the Task tool to launch a general-purpose agent with this prompt:\n"real review"\nReport findings only.' >/dev/null 2>&1
-sent_prompt=$(cat "$TMPDIR_TEST/bob_prompt")
-if echo "$sent_prompt" | grep -q "Ralphex review adapter for bob"; then
-    pass "adapter injected for Task tool marker after fence closes"
+    bash "$WRAPPER" -p "$plan_prompt" 2>/dev/null)
+if echo "$output" | jq -e 'select(.type=="content_block_delta" and (.delta.text | contains("Multiple planets")) and (.delta.text | contains("<<<RALPHEX:END>>>")))' >/dev/null 2>&1; then
+    pass "QUESTION with more than four options follows ralphex parser contract"
 else
-    fail "adapter NOT injected for Task tool marker after fence closes" "got: $sent_prompt"
+    fail "valid QUESTION with many options rejected" "output: $output"
 fi
 
-# ~~~ fence also excluded
-rm -f "$TMPDIR_TEST/bob_prompt"
-MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
+# ---------------------------------------------------------------------------
+# test: malformed terminal QUESTION fails closed instead of starting iteration 2
+# ---------------------------------------------------------------------------
+echo "test: malformed plan boundary fails closed"
+
+cat > "$TMPDIR_TEST/plan_malformed_question.jsonl" << 'EOF'
+{"type":"tool_use","timestamp":"t","tool_name":"attempt_completion","parameters":{"result":"Signal: <<<RALPHEX:QUESTION>>>\nQuestion: Choose stack?\nOptions: JS, TS"}}
+{"type":"result","timestamp":"t","status":"success","stats":{}}
+EOF
+set +e
+output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/plan_malformed_question.jsonl" \
     PATH="$TMPDIR_TEST:$PATH" \
-    bash "$WRAPPER" -p $'~~~\nUse the Task tool to launch a general-purpose agent\n~~~' >/dev/null 2>&1
-sent_prompt=$(cat "$TMPDIR_TEST/bob_prompt")
-if echo "$sent_prompt" | grep -q "Ralphex review adapter for bob"; then
-    fail "adapter injected for Task tool marker inside ~~~ fence" "got: $sent_prompt"
+    bash "$WRAPPER" -p "$plan_prompt" 2>/dev/null)
+malformed_exit=$?
+set -e
+if [[ $malformed_exit -ne 0 ]]; then
+    pass "malformed QUESTION exits non-zero"
 else
-    pass "adapter NOT injected for Task tool marker inside ~~~ fence"
+    fail "malformed QUESTION should fail closed" "output: $output"
+fi
+if echo "$output" | jq -e 'select(.type=="content_block_delta" and (.delta.text | contains("complete valid ralphex plan boundary")))' >/dev/null 2>&1; then
+    pass "malformed QUESTION reports a clear adapter error"
+else
+    fail "malformed QUESTION error missing" "output: $output"
+fi
+
+# ---------------------------------------------------------------------------
+# test: intermediary PLAN_DRAFT stops at END and discards trailing prose
+# ---------------------------------------------------------------------------
+echo "test: intermediary PLAN_DRAFT boundary"
+
+cat > "$TMPDIR_TEST/plan_intermediary_draft.jsonl" << 'EOF'
+{"type":"message","timestamp":"t","role":"assistant","content":"<thinking>planning</thinking>\n<<<RALPHEX:PLAN_DRAFT>>>\n# Draft\n\n## Overview\nBody.\n","delta":true}
+{"type":"message","timestamp":"t","role":"assistant","content":"<<<RALPHEX:END>>>\nThis must not leak","delta":true}
+{"type":"result","timestamp":"t","status":"success","stats":{}}
+EOF
+output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/plan_intermediary_draft.jsonl" \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "$plan_prompt" 2>/dev/null)
+draft_text=$(echo "$output" | jq -r 'select(.type=="content_block_delta" and .delta.text != "") | .delta.text')
+if echo "$draft_text" | grep -q '<<<RALPHEX:PLAN_DRAFT>>>' &&
+    echo "$draft_text" | grep -q '<<<RALPHEX:END>>>' &&
+    ! echo "$draft_text" | grep -q 'must not leak'; then
+    pass "PLAN_DRAFT boundary preserved and truncated"
+else
+    fail "PLAN_DRAFT boundary handling failed" "text: $draft_text"
 fi
 
 # ---------------------------------------------------------------------------
@@ -782,6 +1186,25 @@ if echo "$stderr_delta" | jq -e '.type == "content_block_delta"' >/dev/null 2>&1
     pass "stderr emitted as content_block_delta for pattern detection"
 else
     fail "stderr not emitted as content_block_delta" "got: $output"
+fi
+
+# stderr must be translated as Bob emits it, not buffered until after stdout and
+# process exit. The mock pauses after stderr so output order is deterministic.
+cat > "$TMPDIR_TEST/stderr_early.txt" << 'EOF'
+early diagnostic
+EOF
+output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
+    MOCK_STDERR_FILE="$TMPDIR_TEST/stderr_early.txt" \
+    MOCK_STDERR_FIRST=1 \
+    MOCK_DELAY_AFTER_STDERR=0.2 \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "test prompt" 2>/dev/null)
+stderr_line_number=$(echo "$output" | grep -n "early diagnostic" | head -1 | cut -d: -f1)
+completion_line_number=$(echo "$output" | grep -n "hello world" | head -1 | cut -d: -f1)
+if [[ -n "$stderr_line_number" && -n "$completion_line_number" && "$stderr_line_number" -lt "$completion_line_number" ]]; then
+    pass "stderr streamed before later Bob stdout"
+else
+    fail "stderr remained buffered until Bob stdout completed" "got: $output"
 fi
 
 # ---------------------------------------------------------------------------
@@ -899,6 +1322,25 @@ else
     fail "exit code not preserved on failure path" "got: $quota_exit"
 fi
 
+# a silent non-zero exit still needs an actionable progress-log diagnostic.
+set +e
+silent_failure_output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/empty_stdout.txt" \
+    MOCK_EXIT_CODE=9 \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "test prompt" 2>/dev/null)
+silent_failure_exit=$?
+set -e
+if echo "$silent_failure_output" | grep -q "error: bob exited with status 9 after .* without diagnostic output"; then
+    pass "silent non-zero Bob exit gains synthetic diagnostic"
+else
+    fail "silent non-zero Bob exit lacks diagnostic" "got: $silent_failure_output"
+fi
+if [[ $silent_failure_exit -eq 9 ]]; then
+    pass "silent Bob failure preserves exit code"
+else
+    fail "silent Bob failure exit code changed" "got: $silent_failure_exit"
+fi
+
 # ---------------------------------------------------------------------------
 # test: large prompt (>128KB) delivered via stdin does not break
 # ---------------------------------------------------------------------------
@@ -952,9 +1394,9 @@ for ralphex_flag in "--dangerously-skip-permissions" "--verbose" "--print"; do
         pass "ralphex flag $ralphex_flag not forwarded to bob"
     fi
 done
-# the wrapper's own --output-format stream-json should override any ralphex one
-if echo "$recorded" | grep -c -- "--output-format stream-json" | grep -q "^1$"; then
-    pass "exactly one --output-format stream-json in bob args"
+# the wrapper's own output-format setting should replace any ralphex one.
+if echo "$recorded" | grep -c -- "--output-format=stream-json" | grep -q "^1$"; then
+    pass "exactly one --output-format=stream-json in bob args"
 else
     fail "unexpected --output-format count" "args: $recorded"
 fi
@@ -1143,33 +1585,6 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# test: review-adapter trigger with language-specified fence
-# ---------------------------------------------------------------------------
-echo "test: review adapter with language fence"
-
-rm -f "$TMPDIR_TEST/bob_prompt"
-MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
-    PATH="$TMPDIR_TEST:$PATH" \
-    bash "$WRAPPER" -p $'```python\nUse the Task tool to launch a general-purpose agent with this prompt:\n"fake"\n```\nUse the Task tool to launch a general-purpose agent with this prompt:\n"real"\nReport findings only.' >/dev/null 2>&1
-sent_prompt=$(cat "$TMPDIR_TEST/bob_prompt")
-
-# Count occurrences: the Task tool marker appears twice, but only the standalone
-# one outside the ```python fence should trigger the adapter.
-if echo "$sent_prompt" | grep -q "Ralphex review adapter for bob"; then
-    pass "adapter injected for Task tool marker after language fence closes"
-else
-    fail "adapter not injected for Task tool marker after language fence" "got: $sent_prompt"
-fi
-
-# Verify both Task tool markers are preserved in the prompt
-marker_count=$(echo "$sent_prompt" | grep -c "Use the Task tool to launch a general-purpose agent")
-if [[ "$marker_count" -eq 2 ]]; then
-    pass "both Task tool markers preserved in adapted prompt"
-else
-    fail "Task tool markers missing in adapted prompt" "expected 2, got $marker_count: $sent_prompt"
-fi
-
-# ---------------------------------------------------------------------------
 # test: BOB_EXTRA_ARGS does not expand globs or command substitution
 # ---------------------------------------------------------------------------
 echo "test: BOB_EXTRA_ARGS literal passthrough (no glob expansion)"
@@ -1177,11 +1592,6 @@ echo "test: BOB_EXTRA_ARGS literal passthrough (no glob expansion)"
 # Create files that would match if the glob expanded.
 touch "$TMPDIR_TEST/should_not_expand.txt"
 rm -f "$TMPDIR_TEST/bob_args_lines"
-# recreate the line-recording mock: create_mock_bob (called after the word-split
-# test above) followed the bob->bob_lines symlink and overwrote bob_lines with
-# the standard mock, so a bare `ln -sf bob_lines bob` would inherit the wrong
-# mock. create_bob_lines_mock rewrites bob_lines AND re-symlinks bob to it.
-create_bob_lines_mock
 (
     cd "$TMPDIR_TEST"
     export MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt"
@@ -1189,8 +1599,6 @@ create_bob_lines_mock
         PATH="$TMPDIR_TEST:$PATH" \
         bash "$WRAPPER" -p "test prompt" >/dev/null 2>&1
 )
-# restore the standard mock for subsequent tests
-create_mock_bob > /dev/null
 
 if [[ -f "$TMPDIR_TEST/bob_args_lines" ]]; then
     # The wrapper uses quoted array expansion, so *.txt should remain literal.
@@ -1205,8 +1613,6 @@ fi
 
 # Command substitution inside BOB_EXTRA_ARGS should also stay literal.
 rm -f "$TMPDIR_TEST/bob_args_lines"
-# recreate the line-recording mock (create_mock_bob above corrupted bob_lines).
-create_bob_lines_mock
 (
     cd "$TMPDIR_TEST"
     export MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt"
@@ -1214,7 +1620,6 @@ create_bob_lines_mock
         PATH="$TMPDIR_TEST:$PATH" \
         bash "$WRAPPER" -p "test prompt" >/dev/null 2>&1
 )
-create_mock_bob > /dev/null
 
 if [[ -f "$TMPDIR_TEST/bob_args_lines" ]]; then
     # With quoted expansion, command substitution does NOT occur: the $, (, and
@@ -1233,6 +1638,396 @@ if [[ -f "$TMPDIR_TEST/bob_args_lines" ]]; then
     fi
 else
     fail "BOB_EXTRA_ARGS command-substitution test did not record args"
+fi
+
+# ---------------------------------------------------------------------------
+# test: custom-mode installer creates, merges, and fails safely
+# ---------------------------------------------------------------------------
+echo "test: custom-mode installer"
+
+INSTALLER="$SCRIPT_DIR/install-modes.sh"
+installer_home="$TMPDIR_TEST/home with spaces"
+installer_target="$installer_home/.bob/settings/custom_modes.yaml"
+rm -rf "$installer_home"
+
+# an absent target is created at bob's active global path.
+env -u BOB_CUSTOM_MODES_FILE HOME="$installer_home" bash "$INSTALLER" >/dev/null
+if [[ -f "$installer_target" ]]; then
+    pass "installer creates missing custom-mode document"
+else
+    fail "installer did not create missing custom-mode document"
+fi
+assert_yaml_valid \
+    "installer-created document parses with the vendored YAML validator" \
+    "$installer_target"
+for slug in ralphex-task ralphex-review ralphex-plan; do
+    slug_count=$(grep -c -- "^  - slug: $slug$" "$installer_target" || true)
+    if [[ "$slug_count" -eq 1 ]]; then
+        pass "installer adds $slug once"
+    else
+        fail "installer did not add $slug exactly once" "count: $slug_count"
+    fi
+done
+
+# a user-owned mode and a user-owned ralphex slug are preserved during a merge.
+merge_home="$TMPDIR_TEST/merge-home"
+merge_target="$merge_home/.bob/settings/custom_modes.yaml"
+mkdir -p "$(dirname "$merge_target")"
+cat > "$merge_target" << 'EOF'
+customModes:
+  - slug: user-mode
+    name: User Mode
+    description: A user-owned mode.
+    roleDefinition: You are a user-owned mode.
+    whenToUse: Use for user-owned work.
+    customInstructions: Follow the user's instructions.
+    groups:
+      - read
+  - slug: ralphex-task
+    name: User-Owned Task Mode
+    description: A user-owned task mode.
+    roleDefinition: You are a user-owned task mode.
+    whenToUse: Use for user-owned task work.
+    customInstructions: Follow the user's task instructions.
+    groups:
+      - read
+EOF
+HOME="$merge_home" BOB_CUSTOM_MODES_FILE= bash "$INSTALLER" >/dev/null
+if grep -q -- "name: User Mode" "$merge_target" && grep -q -- "name: User-Owned Task Mode" "$merge_target"; then
+    pass "installer preserves unrelated and existing ralphex modes"
+else
+    fail "installer overwrote user-owned modes" "document: $(cat "$merge_target")"
+fi
+assert_yaml_valid \
+    "merged installer document parses and preserves user-owned schemas" \
+    "$merge_target"
+for slug in ralphex-task ralphex-review ralphex-plan; do
+    slug_count=$(grep -c -- "^  - slug: $slug$" "$merge_target" || true)
+    if [[ "$slug_count" -eq 1 ]]; then
+        pass "merged document contains one $slug"
+    else
+        fail "merged document contains duplicate or missing $slug" "count: $slug_count"
+    fi
+done
+
+# bob's documented restricted edit-group form and quoted scalars are preserved.
+restricted_target="$TMPDIR_TEST/restricted/custom_modes.yaml"
+mkdir -p "$(dirname "$restricted_target")"
+cat > "$restricted_target" << 'EOF'
+customModes:
+  - slug: restricted-user-mode
+    name: "Restricted User Mode"
+    description: 'A user-owned restricted mode.'
+    roleDefinition: "Edit only Markdown files."
+    groups:
+      - read
+      - - edit
+        - fileRegex: ".*\\.(md|mdx)$"
+          description: "Markdown files only"
+      - command  # bob documents inline comments on group entries
+EOF
+BOB_CUSTOM_MODES_FILE="$restricted_target" bash "$INSTALLER" >/dev/null
+assert_yaml_valid "documented restricted edit group remains valid after install" \
+    "$restricted_target"
+if grep -q -- 'fileRegex: ".*\\\\.(md|mdx)$"' "$restricted_target" &&
+    grep -q -- 'name: "Restricted User Mode"' "$restricted_target"; then
+    pass "installer preserves quoted scalars and restricted edit groups"
+else
+    fail "installer changed a documented restricted edit group"
+fi
+
+# a second run is a byte-for-byte no-op.
+cp "$merge_target" "$TMPDIR_TEST/merge-before-second-install"
+HOME="$merge_home" BOB_CUSTOM_MODES_FILE= bash "$INSTALLER" >/dev/null
+if cmp -s "$merge_target" "$TMPDIR_TEST/merge-before-second-install"; then
+    pass "repeated installer run is idempotent"
+else
+    fail "repeated installer run changed the document"
+fi
+
+# a document with only some ralphex modes receives only the missing modes.
+partial_home="$TMPDIR_TEST/partial-home"
+partial_target="$partial_home/.bob/settings/custom_modes.yaml"
+mkdir -p "$(dirname "$partial_target")"
+cat > "$partial_target" << 'EOF'
+customModes:
+  - slug: ralphex-review
+    name: Existing Review Override
+    description: An existing review override.
+    roleDefinition: You are an existing review override.
+    whenToUse: Use for an existing review override.
+    customInstructions: Preserve this user-owned review mode.
+    groups:
+      - read
+EOF
+HOME="$partial_home" BOB_CUSTOM_MODES_FILE= bash "$INSTALLER" >/dev/null
+assert_yaml_valid \
+    "partially installed document parses after adding missing modes" \
+    "$partial_target"
+for slug in ralphex-task ralphex-review ralphex-plan; do
+    slug_count=$(grep -c -- "^  - slug: $slug$" "$partial_target" || true)
+    if [[ "$slug_count" -eq 1 ]]; then
+        pass "partial installation contains one $slug"
+    else
+        fail "partial installation contains duplicate or missing $slug" "count: $slug_count"
+    fi
+done
+if grep -q -- "name: Existing Review Override" "$partial_target"; then
+    pass "partial installation preserves existing ralphex slug"
+else
+    fail "partial installation replaced existing ralphex slug"
+fi
+
+# slug-shaped text inside a block scalar is not an installed mode field.
+block_text_target="$TMPDIR_TEST/block-text/custom_modes.yaml"
+mkdir -p "$(dirname "$block_text_target")"
+cat > "$block_text_target" << 'EOF'
+customModes:
+  - slug: user-mode
+    name: User Mode
+    customInstructions: |
+      Example configuration:
+      slug: ralphex-task
+    groups:
+      - read
+EOF
+BOB_CUSTOM_MODES_FILE="$block_text_target" bash "$INSTALLER" >/dev/null
+assert_yaml_valid "block-scalar slug example remains valid after install" \
+    "$block_text_target"
+if [[ "$(grep -c -- '^  - slug: ralphex-task$' "$block_text_target" || true)" -eq 1 ]]; then
+    pass "block-scalar slug text does not suppress mode installation"
+else
+    fail "block-scalar slug text was mistaken for an installed mode"
+fi
+
+# malformed input must fail before replacing the target.
+bad_home="$TMPDIR_TEST/bad-home"
+bad_target="$bad_home/.bob/settings/custom_modes.yaml"
+mkdir -p "$(dirname "$bad_target")"
+printf '%s\n' 'this is not a safe customModes document' > "$bad_target"
+cp "$bad_target" "$TMPDIR_TEST/bad-before-install"
+set +e
+HOME="$bad_home" BOB_CUSTOM_MODES_FILE= bash "$INSTALLER" >/dev/null 2>"$TMPDIR_TEST/installer-error"
+installer_exit=$?
+set -e
+if [[ $installer_exit -ne 0 ]]; then
+    pass "installer rejects unsafe existing document"
+else
+    fail "installer accepted unsafe existing document"
+fi
+if cmp -s "$bad_target" "$TMPDIR_TEST/bad-before-install"; then
+    pass "unsafe installer merge leaves target unchanged"
+else
+    fail "unsafe installer merge changed target"
+fi
+
+# a syntactically malformed nested value must also be rejected unchanged.
+malformed_target="$TMPDIR_TEST/malformed/custom_modes.yaml"
+mkdir -p "$(dirname "$malformed_target")"
+cat > "$malformed_target" << 'EOF'
+customModes:
+  - slug: malformed-mode
+    name: Malformed Mode
+    groups: [
+EOF
+cp "$malformed_target" "$TMPDIR_TEST/malformed-before-install"
+set +e
+BOB_CUSTOM_MODES_FILE="$malformed_target" bash "$INSTALLER" \
+    >/dev/null 2>"$TMPDIR_TEST/malformed-installer-error"
+malformed_exit=$?
+set -e
+if [[ $malformed_exit -ne 0 ]] &&
+    cmp -s "$malformed_target" "$TMPDIR_TEST/malformed-before-install"; then
+    pass "installer rejects malformed nested yaml without replacing it"
+else
+    fail "installer changed or accepted malformed nested yaml"
+fi
+
+# an unterminated quoted scalar is another shape the previous indentation-only
+# check accepted even though a yaml parser rejects it.
+quoted_target="$TMPDIR_TEST/quoted-malformed/custom_modes.yaml"
+mkdir -p "$(dirname "$quoted_target")"
+cat > "$quoted_target" << 'EOF'
+customModes:
+  - slug: quoted-malformed
+    name: "unterminated
+    groups:
+      - read
+EOF
+cp "$quoted_target" "$TMPDIR_TEST/quoted-before-install"
+set +e
+BOB_CUSTOM_MODES_FILE="$quoted_target" bash "$INSTALLER" >/dev/null 2>&1
+quoted_exit=$?
+set -e
+if [[ $quoted_exit -ne 0 ]] &&
+    cmp -s "$quoted_target" "$TMPDIR_TEST/quoted-before-install"; then
+    pass "installer rejects an unterminated quoted scalar unchanged"
+else
+    fail "installer changed or accepted an unterminated quoted scalar"
+fi
+
+# a comment-looking line inside a block scalar is content and establishes its
+# indentation; a later deindent that remains under the field is malformed yaml.
+block_comment_target="$TMPDIR_TEST/block-comment-malformed/custom_modes.yaml"
+mkdir -p "$(dirname "$block_comment_target")"
+cat > "$block_comment_target" << 'EOF'
+customModes:
+  - slug: block-comment-malformed
+    customInstructions: |
+        # literal scalar content
+      invalid deindent
+    groups:
+      - read
+EOF
+cp "$block_comment_target" "$TMPDIR_TEST/block-comment-before-install"
+set +e
+BOB_CUSTOM_MODES_FILE="$block_comment_target" bash "$INSTALLER" >/dev/null 2>&1
+block_comment_exit=$?
+set -e
+if [[ $block_comment_exit -ne 0 ]] &&
+    cmp -s "$block_comment_target" "$TMPDIR_TEST/block-comment-before-install"; then
+    pass "installer rejects malformed block indentation after literal hash content"
+else
+    fail "installer changed or accepted malformed block indentation after literal hash content"
+fi
+
+# malformed block-scalar indicators must fail before replacing the target.
+for invalid_indicator in '|foo' '>foo'; do
+    indicator_name="${invalid_indicator:0:1}"
+    indicator_target="$TMPDIR_TEST/block-indicator-$indicator_name/custom_modes.yaml"
+    mkdir -p "$(dirname "$indicator_target")"
+    cat > "$indicator_target" << EOF
+customModes:
+  - slug: malformed-block
+    name: Malformed Block
+    roleDefinition: $invalid_indicator
+    groups:
+      - read
+EOF
+    indicator_before="$indicator_target.before"
+    cp "$indicator_target" "$indicator_before"
+    set +e
+    BOB_CUSTOM_MODES_FILE="$indicator_target" bash "$INSTALLER" >/dev/null 2>&1
+    indicator_exit=$?
+    set -e
+    if [[ $indicator_exit -ne 0 ]] && cmp -s "$indicator_target" "$indicator_before"; then
+        pass "installer rejects malformed $invalid_indicator block indicator unchanged"
+    else
+        fail "installer changed or accepted malformed $invalid_indicator block indicator"
+    fi
+done
+
+# an explicit override path may contain spaces and bypasses the global target.
+override_target="$TMPDIR_TEST/override path/custom modes.yaml"
+BOB_CUSTOM_MODES_FILE="$override_target" bash "$INSTALLER" >/dev/null
+if [[ -f "$override_target" ]]; then
+    pass "BOB_CUSTOM_MODES_FILE selects a path containing spaces"
+else
+    fail "BOB_CUSTOM_MODES_FILE override was not created"
+fi
+assert_yaml_valid "override installation parses as yaml" "$override_target"
+
+# bob migrates a legacy global file on startup, so merge it when no canonical
+# settings file exists instead of hiding its user-owned modes.
+legacy_home="$TMPDIR_TEST/legacy-home"
+legacy_target="$legacy_home/.bob/custom_modes.yaml"
+mkdir -p "$(dirname "$legacy_target")"
+cat > "$legacy_target" << 'EOF'
+customModes:
+  - slug: legacy-user-mode
+    name: Legacy User Mode
+    roleDefinition: Preserve the legacy user mode.
+    groups:
+      - read
+EOF
+HOME="$legacy_home" BOB_CUSTOM_MODES_FILE= bash "$INSTALLER" >/dev/null
+if grep -q -- "slug: legacy-user-mode" "$legacy_target" &&
+    grep -q -- "slug: ralphex-plan" "$legacy_target" &&
+    [[ ! -e "$legacy_home/.bob/settings/custom_modes.yaml" ]]; then
+    pass "installer preserves bob's legacy migration source"
+else
+    fail "installer hid or replaced the legacy global mode document"
+fi
+assert_yaml_valid "legacy installation remains valid yaml" "$legacy_target"
+
+# an explicit empty sequence is converted before the shipped modes are added.
+empty_target="$TMPDIR_TEST/empty-sequence/custom_modes.yaml"
+mkdir -p "$(dirname "$empty_target")"
+printf '%s\n' 'customModes: []' > "$empty_target"
+BOB_CUSTOM_MODES_FILE="$empty_target" bash "$INSTALLER" >/dev/null
+assert_yaml_valid "customModes empty sequence installs valid modes" "$empty_target"
+if ! grep -q -- 'customModes: \[\]' "$empty_target"; then
+    pass "empty customModes sequence converted to block form"
+else
+    fail "empty customModes sequence was not converted"
+fi
+
+# bob also accepts an empty null-valued customModes key; appending the shipped
+# sequence turns it into the normal block form.
+empty_null_target="$TMPDIR_TEST/empty-null/custom_modes.yaml"
+mkdir -p "$(dirname "$empty_null_target")"
+printf '%s\n' 'customModes: # initially empty' > "$empty_null_target"
+BOB_CUSTOM_MODES_FILE="$empty_null_target" bash "$INSTALLER" >/dev/null
+assert_yaml_valid "empty customModes key installs valid modes" "$empty_null_target"
+
+# alternate valid indentation and a non-leading slug stay valid after append.
+indented_target="$TMPDIR_TEST/four-space/custom_modes.yaml"
+mkdir -p "$(dirname "$indented_target")"
+cat > "$indented_target" << 'EOF'
+customModes:
+    - name: Four Space Mode
+      slug: four-space-mode
+      roleDefinition: Preserve four-space sequence indentation.
+      groups:
+        - read
+EOF
+BOB_CUSTOM_MODES_FILE="$indented_target" bash "$INSTALLER" >/dev/null
+assert_yaml_valid "four-space-indented installation remains valid yaml" \
+    "$indented_target"
+if grep -q -- '^    - slug: ralphex-task$' "$indented_target"; then
+    pass "installer matches existing sequence indentation"
+else
+    fail "installer appended modes with the wrong indentation"
+fi
+
+# defensive target checks must fail before following or replacing special files.
+sentinel="$TMPDIR_TEST/symlink-sentinel"
+symlink_target="$TMPDIR_TEST/symlink-target"
+printf '%s\n' 'sentinel content' > "$sentinel"
+ln -s "$sentinel" "$symlink_target"
+set +e
+BOB_CUSTOM_MODES_FILE="$symlink_target" bash "$INSTALLER" >/dev/null 2>&1
+symlink_exit=$?
+set -e
+if [[ $symlink_exit -ne 0 ]] &&
+    [[ "$(cat "$sentinel")" == "sentinel content" ]]; then
+    pass "installer refuses a symlink without changing its target"
+else
+    fail "installer followed or accepted a symlink target"
+fi
+
+directory_target="$TMPDIR_TEST/non-regular-directory"
+mkdir -p "$directory_target"
+set +e
+BOB_CUSTOM_MODES_FILE="$directory_target" bash "$INSTALLER" >/dev/null 2>&1
+directory_exit=$?
+set -e
+if [[ $directory_exit -ne 0 && -d "$directory_target" ]]; then
+    pass "installer refuses a directory target"
+else
+    fail "installer accepted or replaced a directory target"
+fi
+
+fifo_target="$TMPDIR_TEST/non-regular-fifo"
+mkfifo "$fifo_target"
+set +e
+BOB_CUSTOM_MODES_FILE="$fifo_target" bash "$INSTALLER" >/dev/null 2>&1
+fifo_exit=$?
+set -e
+if [[ $fifo_exit -ne 0 && -p "$fifo_target" ]]; then
+    pass "installer refuses a fifo target"
+else
+    fail "installer accepted or replaced a fifo target"
 fi
 
 # ---------------------------------------------------------------------------

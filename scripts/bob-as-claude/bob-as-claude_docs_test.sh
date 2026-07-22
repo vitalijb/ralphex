@@ -37,6 +37,18 @@ assert_contains() {
     fi
 }
 
+assert_not_contains() {
+    local file="$1"
+    local needle="$2"
+    local label="$3"
+
+    if grep -Fq -- "$needle" "$file"; then
+        fail "$label" "unexpected '$needle' in $file"
+    else
+        pass "$label"
+    fi
+}
+
 assert_matches() {
     local file="$1"
     local regex="$2"
@@ -60,11 +72,78 @@ assert_executable() {
     fi
 }
 
+assert_file() {
+    local file="$1"
+    local label="$2"
+
+    if [[ -f "$file" ]]; then
+        pass "$label"
+    else
+        fail "$label" "$file does not exist"
+    fi
+}
+
 echo "running bob-as-claude docs tests"
 echo ""
 
 assert_executable "$REPO_ROOT/scripts/bob-as-claude/bob-as-claude.sh" "wrapper script is executable"
 assert_executable "$REPO_ROOT/scripts/bob-as-claude/bob-as-claude_test.sh" "wrapper shell test is executable"
+assert_executable "$REPO_ROOT/scripts/bob-as-claude/install-modes.sh" "custom-mode installer is executable"
+
+# shipped custom modes
+for mode in ralphex-task ralphex-review ralphex-plan; do
+    assert_file \
+        "$REPO_ROOT/scripts/bob-as-claude/modes/$mode.yaml" \
+        "$mode mode file exists"
+    assert_contains \
+        "$REPO_ROOT/scripts/bob-as-claude/modes/$mode.yaml" \
+        "slug: $mode" \
+        "$mode mode declares its slug"
+done
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/modes/ralphex-task.yaml" \
+    "- read" \
+    "task mode allows read"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/modes/ralphex-task.yaml" \
+    "- edit" \
+    "task mode allows edit"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/modes/ralphex-task.yaml" \
+    "- command" \
+    "task mode allows command"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/modes/ralphex-task.yaml" \
+    "- browser" \
+    "task mode allows browser"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/modes/ralphex-review.yaml" \
+    "customInstructions" \
+    "review mode contains custom instructions"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/modes/ralphex-review.yaml" \
+    'Never launch `bob`, `claude`, `codex`' \
+    "review mode forbids nested agent CLIs"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/modes/ralphex-review.yaml" \
+    "Never use background commands" \
+    "review mode forbids background agent orchestration"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/modes/ralphex-plan.yaml" \
+    "- read" \
+    "plan mode allows read"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/modes/ralphex-plan.yaml" \
+    "- command" \
+    "plan mode allows command"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/modes/ralphex-plan.yaml" \
+    "- browser" \
+    "plan mode allows browser"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/modes/ralphex-plan.yaml" \
+    "- edit" \
+    "plan mode allows accepted plan write"
 
 # wrapper README
 assert_contains \
@@ -87,6 +166,70 @@ assert_contains \
     "$REPO_ROOT/scripts/bob-as-claude/README.md" \
     "BOB_EXTRA_ARGS" \
     "wrapper README documents BOB_EXTRA_ARGS env var"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "bash scripts/bob-as-claude/install-modes.sh" \
+    "wrapper README documents custom-mode installation"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "ralphex-task" \
+    "wrapper README documents task mode"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "ralphex-review" \
+    "wrapper README documents review mode"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    'review-only `bob`, `claude`, and `codex` guard shims' \
+    "wrapper README documents nested-agent guards"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "ralphex-plan" \
+    "wrapper README documents plan mode"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "BOB_CUSTOM_MODES_FILE" \
+    "wrapper README documents custom-mode target override"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "~/.bob/settings/custom_modes.yaml" \
+    "wrapper README documents bob's active global mode path"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    ".bob/custom_modes.yaml" \
+    "wrapper README documents project mode precedence"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "does not silently fall back" \
+    "wrapper README documents installation requirement"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "complete plan signal set" \
+    "wrapper README documents plan marker mapping"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "exact review headers" \
+    "wrapper README documents strict review markers"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "matching delimiter character" \
+    "wrapper README documents compatible fence closing"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "task and finalize prompts" \
+    "wrapper README documents task and finalize mapping"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "Any non-empty built-in slug" \
+    "wrapper README documents unrestricted explicit override"
+assert_not_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "Plan creation is untested" \
+    "wrapper README removes stale plan limitation"
+assert_not_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "### Review adapter" \
+    "wrapper README removes stale review adapter section"
 assert_contains \
     "$REPO_ROOT/scripts/bob-as-claude/README.md" \
     "bash scripts/bob-as-claude/bob-as-claude_test.sh" \
@@ -115,8 +258,52 @@ assert_contains \
     "custom providers doc documents bob event translation"
 assert_contains \
     "$REPO_ROOT/docs/custom-providers.md" \
-    "### Chat modes" \
-    "custom providers doc documents bob chat-mode mapping"
+    "### Automatic phase mapping" \
+    "custom providers doc documents bob chat-mode section"
+assert_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "Exact review headers" \
+    "custom providers doc documents strict review markers"
+assert_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "matching delimiter character" \
+    "custom providers doc documents compatible fence closing"
+assert_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "bash scripts/bob-as-claude/install-modes.sh" \
+    "custom providers doc documents custom-mode installation"
+assert_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "ralphex-task" \
+    "custom providers doc documents task mode"
+assert_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "ralphex-review" \
+    "custom providers doc documents review mode"
+assert_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "ralphex-plan" \
+    "custom providers doc documents plan mode"
+assert_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "BOB_CHAT_MODE=<slug>" \
+    "custom providers doc documents explicit override"
+assert_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "<<<RALPHEX:ALL_TASKS_DONE>>>" \
+    "custom providers doc uses the task completion signal"
+assert_not_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "<<<RALPHEX:COMPLETED>>>" \
+    "custom providers doc removes the nonexistent completion signal"
+assert_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "passes review prompts unchanged" \
+    "custom providers doc removes prompt adapter mutation"
+assert_not_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    'Plan creation mode (`ralphex --plan`) has no bob-specific adapter' \
+    "custom providers doc removes stale plan limitation"
 
 # top-level README
 assert_contains \
@@ -134,8 +321,20 @@ assert_contains \
     "top-level README documents bob-specific environment variables"
 assert_contains \
     "$REPO_ROOT/README.md" \
+    "Bob wrapper also requires" \
+    "top-level README documents awk requirement for bob wrapper"
+assert_contains \
+    "$REPO_ROOT/README.md" \
     "scripts/bob-as-claude/" \
     "top-level README requirements list mentions bob wrapper dir"
+assert_contains \
+    "$REPO_ROOT/README.md" \
+    "scripts/bob-as-claude/modes/ralphex-task.yaml" \
+    "top-level README inventories shipped Bob modes"
+assert_contains \
+    "$REPO_ROOT/README.md" \
+    "scripts/bob-as-claude/install-modes.sh" \
+    "top-level README inventories Bob installer"
 
 # llms.txt
 assert_contains \
@@ -146,6 +345,18 @@ assert_contains \
     "$REPO_ROOT/llms.txt" \
     "scripts/bob-as-claude/" \
     "llms.txt requirements list mentions bob wrapper dir"
+assert_contains \
+    "$REPO_ROOT/llms.txt" \
+    "scripts/bob-as-claude/modes/ralphex-task.yaml" \
+    "llms.txt inventories shipped Bob modes"
+assert_contains \
+    "$REPO_ROOT/llms.txt" \
+    "scripts/bob-as-claude/install-modes.sh" \
+    "llms.txt inventories Bob installer"
+assert_contains \
+    "$REPO_ROOT/llms.txt" \
+    "~/.bob/settings/custom_modes.yaml" \
+    "llms.txt documents bob's active global mode path"
 
 # CLAUDE.md
 assert_contains \
@@ -156,6 +367,26 @@ assert_contains \
     "$REPO_ROOT/CLAUDE.md" \
     "scripts/bob-as-claude/bob-as-claude.sh" \
     "CLAUDE alternative provider docs mention bob wrapper path"
+assert_contains \
+    "$REPO_ROOT/CLAUDE.md" \
+    "scripts/bob-as-claude/modes/" \
+    "CLAUDE inventory includes Bob modes directory"
+assert_contains \
+    "$REPO_ROOT/CLAUDE.md" \
+    "scripts/bob-as-claude/install-modes.sh" \
+    "CLAUDE inventory includes Bob installer"
+assert_contains \
+    "$REPO_ROOT/CLAUDE.md" \
+    "~/.bob/settings/custom_modes.yaml" \
+    "CLAUDE documents bob's active global mode path"
+assert_contains \
+    "$REPO_ROOT/CLAUDE.md" \
+    'Review start markers select `ralphex-review`' \
+    "CLAUDE documents current Bob review trigger"
+assert_not_contains \
+    "$REPO_ROOT/CLAUDE.md" \
+    "Review adapter is prepended" \
+    "CLAUDE removes stale Bob review-adapter trigger"
 
 echo ""
 echo "summary: $passed passed, $failed failed, $total total"

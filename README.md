@@ -1107,7 +1107,7 @@ When running ralphex in Docker, your script must be accessible inside the contai
 
 ### Using Alternative Providers for Claude Phases
 
-The `claude_command` and `claude_args` config options let you replace Claude Code with any CLI that produces compatible `stream-json` output. This means codex, GitHub Copilot CLI, Gemini CLI, local LLMs, or any other tool can drive task execution and review phases — you just need a wrapper script that translates the tool's output format. Use `--claude-command` and `--claude-args` to choose a wrapper for a single run without changing config.
+The `claude_command` and `claude_args` config options let you replace Claude Code with any CLI that produces compatible `stream-json` output. Compatible wrappers can drive plan creation, task execution, internal reviews, and finalize; each wrapper's section documents which phases and signal workflows it supports. Use `--claude-command` and `--claude-args` to choose a wrapper for a single run without changing config.
 
 Working examples are included:
 
@@ -1117,7 +1117,9 @@ Working examples are included:
 - [`scripts/agy-as-claude/agy-as-claude.sh`](https://github.com/umputun/ralphex/blob/master/scripts/agy-as-claude/agy-as-claude.sh) wraps the Antigravity (`agy`) CLI — Google's successor to Gemini CLI — for the implementation slot
 - [`scripts/opencode/opencode-as-claude.sh`](https://github.com/umputun/ralphex/blob/master/scripts/opencode/opencode-as-claude.sh) wraps OpenCode CLI for the implementation slot, and `scripts/opencode/opencode-review.sh` is shipped alongside as a turn-key custom review script
 - [`scripts/pi-as-claude/pi-as-claude.sh`](https://github.com/umputun/ralphex/blob/master/scripts/pi-as-claude/pi-as-claude.sh) wraps the pi CLI, translating its `--mode json` JSONL events into Claude-compatible events
-- [`scripts/bob-as-claude/bob-as-claude.sh`](https://github.com/umputun/ralphex/blob/master/scripts/bob-as-claude/bob-as-claude.sh) wraps the IBM Bob Shell CLI, translating its `--output-format stream-json` events into Claude-compatible events
+- [`scripts/bob-as-claude/bob-as-claude.sh`](https://github.com/umputun/ralphex/blob/master/scripts/bob-as-claude/bob-as-claude.sh) wraps the IBM Bob Shell CLI, translating its `--output-format=stream-json` events into Claude-compatible events
+
+The Bob wrapper ships `scripts/bob-as-claude/modes/ralphex-task.yaml`, `ralphex-review.yaml`, and `ralphex-plan.yaml`. Install them with `bash scripts/bob-as-claude/install-modes.sh` before automatic phase selection. The installer safely merges into Bob's active global `~/.bob/settings/custom_modes.yaml`, preserves a legacy `~/.bob/custom_modes.yaml` for Bob's migration path, preserves unrelated modes, and leaves existing ralphex slugs as user-owned overrides. Project-level `.bob/custom_modes.yaml` entries take precedence; remove an existing ralphex entry before reinstalling when you want the latest shipped definition. Automatic selection maps review start markers to `ralphex-review`, the complete `QUESTION`/`PLAN_DRAFT`/`PLAN_READY` signal set to `ralphex-plan`, and task/finalize prompts to `ralphex-task`; `BOB_CHAT_MODE=<slug>` overrides this mapping with any built-in or custom slug. Review runs block nested `bob`, `claude`, and `codex` launches and execute review assignments sequentially in the current Bob session. Plan runs validate and stop at the first complete boundary, including recovery from intermediary Bob output when its final completion summary is malformed.
 
 To use the included Copilot wrapper:
 
@@ -1145,7 +1147,7 @@ ralphex --claude-command=/path/to/scripts/codex-as-claude/codex-as-claude.sh doc
 
 Wrapper scripts should ignore unknown flags gracefully — the included script does this via its `*) shift ;;` catch-all. If a wrapper cannot tolerate the default Claude flags (`--dangerously-skip-permissions`, `--output-format stream-json`, `--verbose`), use `--claude-args=` to explicitly clear configured/default args for that single run.
 
-The included Codex, Copilot, pi, and bob wrappers require `jq` on `PATH` for JSON translation.
+The included Codex, Copilot, pi, and bob wrappers require `jq` on `PATH` for JSON translation. The Bob wrapper also requires `awk` for fence-aware phase detection.
 
 Provider-specific environment variables:
 - `COPILOT_MODEL`, `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN` - Copilot model selection and headless authentication
@@ -1155,9 +1157,9 @@ Provider-specific environment variables:
 - `PI_PROVIDER`, `PI_MODEL`, `PI_THINKING` - pi provider, model, and thinking-level selection (used when ralphex does not append `--model`/`--effort`)
 - `PI_VERBOSE` - set to `1` to include tool execution events in the stream (default: `0`, only assistant text is shown)
 - `PI_EXTRA_ARGS` - extra flags appended verbatim to the pi invocation (word-split on whitespace); e.g. `--nolo-mode full` to auto-approve tools in non-interactive runs
-- `BOB_CHAT_MODE`, `BOB_MODEL` - bob chat mode (`ask`/`code`/`plan`/`advanced`, default `code`) and model selection (bob 1.0.6+)
-- `BOB_VERBOSE` - set to `1` to include `tool_result` output and `[tool]` markers in the stream (default: `0`, only `attempt_completion` result text is shown)
-- `BOB_EXTRA_ARGS` - extra flags appended verbatim to the bob invocation (word-split on whitespace, no quote preservation); e.g. `--max-coins 100` to cap spend
+- `BOB_CHAT_MODE`, `BOB_MODEL` - bob chat-mode slug override (built-in or custom; empty enables automatic phase selection) and model selection (bob 1.0.6+)
+- `BOB_VERBOSE` - set to `1` to include task/review `tool_result` output and `[tool]` markers (default: `0`; plan mode emits only a validated boundary)
+- `BOB_EXTRA_ARGS` - extra flags appended verbatim to the bob invocation (word-split on whitespace, no quote preservation); e.g. `--max-coins=100` to cap spend
 
 See [custom providers documentation](https://github.com/umputun/ralphex/blob/master/docs/custom-providers.md) for a detailed guide on writing wrappers for other providers.
 
@@ -1176,7 +1178,7 @@ The `claude_command` slot is documented above. The `custom_review_script` slot, 
 
 The repository ships a working custom review script at [`scripts/opencode/opencode-review.sh`](https://github.com/umputun/ralphex/blob/master/scripts/opencode/opencode-review.sh) that uses OpenCode CLI to produce review findings. Use it directly, or read it as a template when writing your own (for example, a `claude-as-review.sh` that calls Claude in the review slot).
 
-The wrappers under `scripts/codex-as-claude/`, `scripts/copilot-as-claude/`, `scripts/gemini-as-claude/`, `scripts/agy-as-claude/`, `scripts/opencode/`, `scripts/pi-as-claude/`, and `scripts/bob-as-claude/` ship in the source tree but are not bundled with the binary. Vendor the one you need into your project (`.ralphex/scripts/`) or reference it from a checkout.
+The wrappers under `scripts/codex-as-claude/`, `scripts/copilot-as-claude/`, `scripts/gemini-as-claude/`, `scripts/agy-as-claude/`, `scripts/opencode/`, `scripts/pi-as-claude/`, and `scripts/bob-as-claude/` ship in the source tree but are not bundled with the binary. The Bob directory also contains the declarative `modes/` files and `install-modes.sh`; vendor the provider directory you need into your project (`.ralphex/scripts/`) or reference it from a checkout.
 
 **Log labels reflect the slot, not the underlying tool.** Phase output keeps the internal slot names (`claude execution`, `codex execution`) regardless of what `claude_command` and the external review tool resolve to at runtime. With a wrapper in place, "claude execution" means whatever `claude_command` points at.
 
