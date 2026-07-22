@@ -4,7 +4,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/umputun/ralphex/pkg/status"
+	"github.com/vitalijb/ralphex/pkg/status"
 )
 
 // ParsedLineType indicates what kind of progress line was parsed.

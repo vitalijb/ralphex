@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/umputun/ralphex/pkg/status"
+	"github.com/vitalijb/ralphex/pkg/status"
 )
 
 // ReviewPhase runs internal review passes.

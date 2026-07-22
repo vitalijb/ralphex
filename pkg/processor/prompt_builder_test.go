@@ -6,7 +6,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
-	"github.com/umputun/ralphex/pkg/config"
+	"github.com/vitalijb/ralphex/pkg/config"
 )
 
 func TestPromptBuilder_FinalPrompts(t *testing.T) {

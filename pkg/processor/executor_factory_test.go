@@ -12,10 +12,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/umputun/ralphex/pkg/config"
-	"github.com/umputun/ralphex/pkg/executor"
-	"github.com/umputun/ralphex/pkg/processor/mocks"
-	"github.com/umputun/ralphex/pkg/status"
+	"github.com/vitalijb/ralphex/pkg/config"
+	"github.com/vitalijb/ralphex/pkg/executor"
+	"github.com/vitalijb/ralphex/pkg/processor/mocks"
+	"github.com/vitalijb/ralphex/pkg/status"
 )
 
 func TestRunner_TaskRetryCountUsesConfig(t *testing.T) {

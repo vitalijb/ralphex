@@ -9,7 +9,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/umputun/ralphex/pkg/plan"
+	"github.com/vitalijb/ralphex/pkg/plan"
 )
 
 func TestParsePlan(t *testing.T) {

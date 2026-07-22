@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/umputun/ralphex/pkg/status"
+	"github.com/vitalijb/ralphex/pkg/status"
 )
 
 //go:generate moq -out mocks/command_runner.go -pkg mocks -skip-ensure -fmt goimports . CommandRunner

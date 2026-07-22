@@ -7,10 +7,10 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/umputun/ralphex/pkg/config"
-	"github.com/umputun/ralphex/pkg/executor"
-	"github.com/umputun/ralphex/pkg/processor/phase"
-	"github.com/umputun/ralphex/pkg/status"
+	"github.com/vitalijb/ralphex/pkg/config"
+	"github.com/vitalijb/ralphex/pkg/executor"
+	"github.com/vitalijb/ralphex/pkg/processor/phase"
+	"github.com/vitalijb/ralphex/pkg/status"
 )
 
 // DefaultIterationDelay is the pause between iterations to allow system to settle.

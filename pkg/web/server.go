@@ -17,7 +17,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/umputun/ralphex/pkg/plan"
+	"github.com/vitalijb/ralphex/pkg/plan"
 )
 
 //go:embed templates static

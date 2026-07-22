@@ -7,8 +7,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/umputun/ralphex/pkg/config"
-	"github.com/umputun/ralphex/pkg/executor"
+	"github.com/vitalijb/ralphex/pkg/config"
+	"github.com/vitalijb/ralphex/pkg/executor"
 )
 
 type executorFactory struct{}

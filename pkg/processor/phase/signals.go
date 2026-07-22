@@ -7,7 +7,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/umputun/ralphex/pkg/status"
+	"github.com/vitalijb/ralphex/pkg/status"
 )
 
 // Signal aliases mirror pkg/status values used by phase prompt contracts and parser helpers.

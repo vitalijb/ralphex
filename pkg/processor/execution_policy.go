@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/umputun/ralphex/pkg/executor"
-	"github.com/umputun/ralphex/pkg/processor/phase"
+	"github.com/vitalijb/ralphex/pkg/executor"
+	"github.com/vitalijb/ralphex/pkg/processor/phase"
 )
 
 type retryPolicy struct {

@@ -1,6 +1,6 @@
 package processor
 
-import "github.com/umputun/ralphex/pkg/status"
+import "github.com/vitalijb/ralphex/pkg/status"
 
 // signal constants are aliases to the shared status package for convenience within processor.
 // all signal values are defined in pkg/status to avoid circular dependencies.

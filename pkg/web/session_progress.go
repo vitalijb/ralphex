@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/umputun/ralphex/pkg/status"
+	"github.com/vitalijb/ralphex/pkg/status"
 )
 
 // ParseProgressHeader reads the header section of a progress file and extracts metadata.

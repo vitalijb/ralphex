@@ -16,8 +16,8 @@ import (
 	"github.com/fatih/color"
 	"golang.org/x/term"
 
-	"github.com/umputun/ralphex/pkg/config"
-	"github.com/umputun/ralphex/pkg/status"
+	"github.com/vitalijb/ralphex/pkg/config"
+	"github.com/vitalijb/ralphex/pkg/status"
 )
 
 // multiDashRegex collapses multiple consecutive dashes into one.

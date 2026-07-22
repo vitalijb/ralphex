@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/umputun/ralphex/pkg/status"
+	"github.com/vitalijb/ralphex/pkg/status"
 )
 
 // FinalizePhase runs the optional finalize step.

@@ -6,7 +6,7 @@ import (
 	"io/fs"
 	"path/filepath"
 
-	"github.com/umputun/ralphex/pkg/plan"
+	"github.com/vitalijb/ralphex/pkg/plan"
 )
 
 // loadPlanWithFallback loads a plan from disk with completed/ directory fallback.

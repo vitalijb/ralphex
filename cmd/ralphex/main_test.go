@@ -17,14 +17,14 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/umputun/ralphex/pkg/config"
-	"github.com/umputun/ralphex/pkg/git"
-	gitmocks "github.com/umputun/ralphex/pkg/git/mocks"
-	"github.com/umputun/ralphex/pkg/notify"
-	"github.com/umputun/ralphex/pkg/plan"
-	"github.com/umputun/ralphex/pkg/processor"
-	"github.com/umputun/ralphex/pkg/progress"
-	"github.com/umputun/ralphex/pkg/status"
+	"github.com/vitalijb/ralphex/pkg/config"
+	"github.com/vitalijb/ralphex/pkg/git"
+	gitmocks "github.com/vitalijb/ralphex/pkg/git/mocks"
+	"github.com/vitalijb/ralphex/pkg/notify"
+	"github.com/vitalijb/ralphex/pkg/plan"
+	"github.com/vitalijb/ralphex/pkg/processor"
+	"github.com/vitalijb/ralphex/pkg/progress"
+	"github.com/vitalijb/ralphex/pkg/status"
 )
 
 // captureStdout runs fn while redirecting os.Stdout (and the fatih/color Output

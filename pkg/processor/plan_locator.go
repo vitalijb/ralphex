@@ -4,7 +4,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/umputun/ralphex/pkg/plan"
+	"github.com/vitalijb/ralphex/pkg/plan"
 )
 
 type planLocator struct {

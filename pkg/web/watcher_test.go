@@ -15,8 +15,8 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/tmaxmax/go-sse"
 
-	"github.com/umputun/ralphex/pkg/progress"
-	"github.com/umputun/ralphex/pkg/status"
+	"github.com/vitalijb/ralphex/pkg/progress"
+	"github.com/vitalijb/ralphex/pkg/status"
 )
 
 // resolveSymlinks resolves symlinks in the given path for test comparison.

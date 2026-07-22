@@ -10,8 +10,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/umputun/ralphex/pkg/executor"
-	"github.com/umputun/ralphex/pkg/status"
+	"github.com/vitalijb/ralphex/pkg/executor"
+	"github.com/vitalijb/ralphex/pkg/status"
 )
 
 type externalReviewPhaseTestOpts struct {

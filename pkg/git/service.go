@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/umputun/ralphex/pkg/plan"
+	"github.com/vitalijb/ralphex/pkg/plan"
 )
 
 //go:generate moq -out mocks/logger.go -pkg mocks -skip-ensure -fmt goimports . Logger

@@ -5,8 +5,8 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/umputun/ralphex/pkg/config"
-	"github.com/umputun/ralphex/pkg/executor"
+	"github.com/vitalijb/ralphex/pkg/config"
+	"github.com/vitalijb/ralphex/pkg/executor"
 )
 
 // agentRefPattern matches {{agent:name}} template syntax
