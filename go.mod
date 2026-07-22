@@ -1,4 +1,4 @@
-module github.com/umputun/ralphex
+module github.com/vitalijb/ralphex
 
 go 1.26
 
