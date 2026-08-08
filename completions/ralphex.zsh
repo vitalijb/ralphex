@@ -24,5 +24,3 @@ _ralphex() {
         _files
     fi
 }
-
-_ralphex "$@"
