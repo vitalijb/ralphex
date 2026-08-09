@@ -460,6 +460,12 @@ assert_contains \
     "$REPO_ROOT/docs/custom-providers.md" \
     "unspecified bob error" \
     "custom providers doc documents the empty-message error placeholder"
+# the forced non-zero exit alone cannot fail a run whose stream already carried a
+# signal, so the doc must record the TASK_FAILED retraction the wrapper emits.
+assert_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    'the wrapper also emits `<<<RALPHEX:TASK_FAILED>>>` after the diagnostic' \
+    "custom providers doc documents the post-signal failure retraction"
 assert_not_contains \
     "$REPO_ROOT/docs/custom-providers.md" \
     'severity == "error"' \
@@ -723,6 +729,10 @@ assert_contains \
     "$REPO_ROOT/CLAUDE.md" \
     "\`severity\` is not inspected" \
     "CLAUDE states error severity is not inspected"
+assert_contains \
+    "$REPO_ROOT/CLAUDE.md" \
+    "bob_signal_emitted" \
+    "CLAUDE documents the post-signal failure retraction"
 assert_not_contains \
     "$REPO_ROOT/CLAUDE.md" \
     "\`BOB_VERBOSE\`, \`BOB_EXTRA_ARGS\`, \`BOB_SETTINGS_FILE\`" \

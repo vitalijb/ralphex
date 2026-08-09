@@ -1084,6 +1084,90 @@ else
         "exit: $error_severity_exit output: $error_severity_output"
 fi
 
+# an error event that lands AFTER a terminal signal must retract it. ClaudeExecutor
+# ignores the wrapper's non-zero exit once any signal was detected, so without the
+# trailing TASK_FAILED a max-turns/max-cost abort would be logged and the failed run
+# still treated as a completed one.
+assert_signal_retracted() {
+    local label="$1"
+    local signal="$2"
+    local retract_output=""
+    local retract_exit=0
+
+    cat > "$TMPDIR_TEST/retract_events.jsonl" << EOF
+{"type":"message","timestamp":"t","role":"assistant","content":"work done $signal\n","isReasoning":false}
+{"type":"error","timestamp":"t","severity":"error","message":"Maximum turns limit reached"}
+{"type":"result","timestamp":"t","status":"success","stats":{}}
+EOF
+    set +e
+    retract_output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/retract_events.jsonl" \
+        PATH="$TMPDIR_TEST:$PATH" \
+        bash "$WRAPPER" -p "test prompt" 2>/dev/null)
+    retract_exit=$?
+    set -e
+
+    # the failure signal must be the LAST one in the stream: ralphex keeps the last
+    # match, so an earlier TASK_FAILED would be overridden by the success signal.
+    local last_signal=""
+    last_signal=$(echo "$retract_output" | grep -o '<<<RALPHEX:[A-Z_]*>>>' | tail -1)
+    if [[ "$last_signal" == "<<<RALPHEX:TASK_FAILED>>>" ]] && [[ $retract_exit -ne 0 ]] &&
+        echo "$retract_output" | grep -q "error: bob: Maximum turns limit reached"; then
+        pass "$label"
+    else
+        fail "$label" "exit: $retract_exit last signal: $last_signal output: $retract_output"
+    fi
+}
+
+assert_signal_retracted "error after ALL_TASKS_DONE retracts the completion signal" \
+    '<<<RALPHEX:ALL_TASKS_DONE>>>'
+assert_signal_retracted "error after REVIEW_DONE retracts the review signal" \
+    '<<<RALPHEX:REVIEW_DONE>>>'
+assert_signal_retracted "error after CODEX_REVIEW_DONE retracts the external review signal" \
+    '<<<RALPHEX:CODEX_REVIEW_DONE>>>'
+assert_signal_retracted "error after PLAN_READY retracts the plan signal" \
+    '<<<RALPHEX:PLAN_READY>>>'
+
+# the reverse ordering must NOT be retracted: an error followed by a genuine signal
+# means bob carried on and finished, and the stream's last word decides. Synthesizing
+# TASK_FAILED for a signal-less error would also suppress claude_retry_patterns, which
+# ralphex skips whenever a signal is present.
+cat > "$TMPDIR_TEST/error_then_signal_events.jsonl" << 'EOF'
+{"type":"error","timestamp":"t","severity":"warning","message":"subagent step failed"}
+{"type":"message","timestamp":"t","role":"assistant","content":"recovered <<<RALPHEX:ALL_TASKS_DONE>>>\n","isReasoning":false}
+{"type":"result","timestamp":"t","status":"success","stats":{}}
+EOF
+set +e
+error_then_signal_output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/error_then_signal_events.jsonl" \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "test prompt" 2>/dev/null)
+set -e
+if echo "$error_then_signal_output" | grep -q "<<<RALPHEX:TASK_FAILED>>>"; then
+    fail "error preceding a genuine signal synthesized a failure signal" \
+        "got: $error_then_signal_output"
+else
+    pass "error before a genuine signal emits no failure signal"
+fi
+
+# a signal-less error must not gain a synthesized signal either — the non-zero exit
+# is the whole failure channel there.
+cat > "$TMPDIR_TEST/error_no_signal_events.jsonl" << 'EOF'
+{"type":"message","timestamp":"t","role":"assistant","content":"working\n","isReasoning":false}
+{"type":"error","timestamp":"t","severity":"error","message":"Max cost exceeded"}
+EOF
+set +e
+error_no_signal_output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/error_no_signal_events.jsonl" \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "test prompt" 2>/dev/null)
+error_no_signal_exit=$?
+set -e
+if echo "$error_no_signal_output" | grep -q "<<<RALPHEX:"; then
+    fail "signal-less error synthesized a ralphex signal" "got: $error_no_signal_output"
+elif [[ $error_no_signal_exit -ne 0 ]]; then
+    pass "signal-less error stays signal-less and fails by exit code"
+else
+    fail "signal-less error did not fail the run" "exit: $error_no_signal_exit"
+fi
+
 # result.status is always "success" in v2, but a hypothetical error status must not
 # be mistaken for a failure channel — the contract is {type:"error"} only.
 cat > "$TMPDIR_TEST/result_status_error_events.jsonl" << 'EOF'

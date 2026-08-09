@@ -389,6 +389,12 @@ intentional_stop=0
 plan_boundary_emitted=0
 bob_failure_detail_emitted=0
 bob_result_failed=0
+# Set once the model's own answer text has carried a terminal ralphex signal
+# downstream. ClaudeExecutor ignores a non-zero provider exit as soon as any
+# signal was detected (pkg/executor/executor.go), so the forced non-zero exit
+# below cannot fail a run whose stream already contained one — see the error
+# branch, which retracts the signal instead.
+bob_signal_emitted=0
 
 # Text that did not come from the model's own answer is neutralized before it is
 # forwarded, so a tool error or diagnostic that quotes a ralphex signal token cannot
@@ -414,9 +420,18 @@ task_reasoning_buffer=""
 emit_task_chunk() {
     if [[ "$1" == "reasoning" ]]; then
         emit_text_delta "${2//<<<RALPHEX:/<<< RALPHEX:}"
-    else
-        emit_text_delta "$2"
+        return
     fi
+    emit_text_delta "$2"
+    # Remember that a terminal signal reached ralphex. Reasoning and diagnostics
+    # are neutralized above, so only answer text can carry a live one, and only
+    # the signals detectSignal recognizes matter. TASK_FAILED is not tracked: it
+    # already fails the run, so there is nothing left to retract.
+    case "$2" in
+        *'<<<RALPHEX:ALL_TASKS_DONE>>>'*|*'<<<RALPHEX:REVIEW_DONE>>>'*|*'<<<RALPHEX:CODEX_REVIEW_DONE>>>'*|*'<<<RALPHEX:PLAN_READY>>>'*)
+            bob_signal_emitted=1
+            ;;
+    esac
 }
 # True when the buffered answer text may still be receiving a signal token: an
 # opened `<<<RALPHEX:` with no closing `>>>` yet, or a tail that is a proper
@@ -531,6 +546,22 @@ while IFS= read -r line || [[ -n "$line" ]]; do
         emit_text_delta "error: bob: $error_detail"$'\n'
         bob_failure_detail_emitted=1
         bob_result_failed=1
+        # bob emits max-turns/max-cost aborts AFTER assistant text, so the stream
+        # can hold a terminal signal followed by this failure. ClaudeExecutor then
+        # ignores the non-zero exit ("if there IS a signal, work was done") and the
+        # diagnostic only lands in the log unless it happens to match a configured
+        # error pattern — a failed run reported as a success. detectSignal keeps the
+        # LAST signal it sees, so a TASK_FAILED emitted here supersedes the earlier
+        # one and restores the fail-closed contract.
+        # Only when a signal actually went out: with an empty signal the non-zero
+        # exit already fails the run, and synthesizing TASK_FAILED there would
+        # suppress claude_retry_patterns (retry detection is skipped once a signal
+        # is present), turning a transient bob error into a hard failure.
+        if [[ "$bob_signal_emitted" == "1" ]]; then
+            emit_text_delta '<<<RALPHEX:TASK_FAILED>>>'$'\n'
+            # a later genuine signal may still supersede this one, so re-arm.
+            bob_signal_emitted=0
+        fi
         continue
     fi
 
