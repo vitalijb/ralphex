@@ -1,7 +1,9 @@
 plan_model = claude-opus-5:xhigh
-task_model = claude-opus-5:high
-review_model = claude-opus-5:high
+task_model = claude-sonnet-5[1m]:high
+review_model = claude-sonnet-5[1m]:high
 codex_model = gpt-5.5-gus
 codex_reasoning_effort = xhigh
 external_review_tool = codex
 default_branch = master
+session_timeout = 40m
+idle_timeout    = 8m
