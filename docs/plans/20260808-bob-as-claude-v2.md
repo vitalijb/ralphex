@@ -158,9 +158,9 @@ Scope note: reuse the v2 mock helper from Task 4; do not reshape it again.
 **Files:**
 - Modify: `scripts/bob-as-claude/bob-as-claude_test.sh`
 
-- [ ] Add a test that a `<<<RALPHEX:...>>>` signal split across several streaming `message` deltas is re-assembled and emitted intact in a single `content_block_delta`
-- [ ] Update plan-mode tests: boundaries are recognized from assistant deltas only, the `attempt_completion` protocol-adapter assertions are removed, malformed and missing boundaries still fail closed, and QUESTION payload validation is unchanged
-- [ ] Run `bash scripts/bob-as-claude/bob-as-claude_test.sh` and confirm the signal-reassembly and plan-mode tests pass
+- [x] Add a test that a `<<<RALPHEX:...>>>` signal split across several streaming `message` deltas is re-assembled and emitted intact in a single `content_block_delta`
+- [x] Update plan-mode tests: boundaries are recognized from assistant deltas only, the `attempt_completion` protocol-adapter assertions are removed, malformed and missing boundaries still fail closed, and QUESTION payload validation is unchanged
+- [x] Run `bash scripts/bob-as-claude/bob-as-claude_test.sh` and confirm the signal-reassembly and plan-mode tests pass (remaining 7 failures are owned by Tasks 7-8: 4 model note, 3 YAML group validation)
 
 ### Task 7: Add tests for the model note, approval preflight, and guard-shim removal
 

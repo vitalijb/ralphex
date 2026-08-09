@@ -1023,11 +1023,9 @@ assert_selected_mode() {
     else
         fail "prompt did not select $expected" "args: $(cat "$TMPDIR_TEST/bob_args")"
     fi
-    if [[ "$expected" == "ralphex-plan" ]] &&
-        grep -qi 'call attempt_completion exactly once' "$TMPDIR_TEST/bob_prompt" &&
-        [[ "$(cat "$TMPDIR_TEST/bob_prompt")" == *"$test_prompt" ]]; then
-        pass "plan protocol adapter prepended while preserving original prompt"
-    elif [[ "$expected" != "ralphex-plan" && "$(cat "$TMPDIR_TEST/bob_prompt")" == "$test_prompt" ]]; then
+    # v2 has no attempt_completion tool, so plan mode no longer prepends a
+    # terminal-tool protocol adapter: every mode delivers the prompt byte-for-byte.
+    if [[ "$(cat "$TMPDIR_TEST/bob_prompt")" == "$test_prompt" ]]; then
         pass "prompt delivered unchanged for $expected"
     else
         fail "prompt changed while selecting $expected" "got: $(cat "$TMPDIR_TEST/bob_prompt")"
@@ -1108,11 +1106,7 @@ assert_prompt_file_mode() {
             "args: $(cat "$TMPDIR_TEST/bob_args")"
     fi
     expected_prompt=$(cat "$prompt_file")
-    if [[ "$expected" == "ralphex-plan" ]] &&
-        grep -qi 'call attempt_completion exactly once' "$TMPDIR_TEST/bob_prompt" &&
-        [[ "$(cat "$TMPDIR_TEST/bob_prompt")" == *"$expected_prompt" ]]; then
-        pass "$(basename "$prompt_file") received plan protocol adapter and original prompt"
-    elif [[ "$expected" != "ralphex-plan" && "$(cat "$TMPDIR_TEST/bob_prompt")" == "$expected_prompt" ]]; then
+    if [[ "$(cat "$TMPDIR_TEST/bob_prompt")" == "$expected_prompt" ]]; then
         pass "$(basename "$prompt_file") passed unchanged through stdin"
     else
         fail "$(basename "$prompt_file") changed on stdin delivery"
@@ -1170,12 +1164,14 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# test: plan mode exposes intermediary deltas and injects Bob protocol
+# test: plan mode invocation — v2 removed attempt_completion, so the wrapper no
+# longer prepends a terminal-tool protocol adapter and the prompt reaches bob
+# byte-for-byte. Plan boundaries are read from assistant deltas alone.
 # ---------------------------------------------------------------------------
-echo "test: plan mode invocation and protocol adapter"
+echo "test: plan mode invocation"
 
 plan_prompt=$'<<<RALPHEX:QUESTION>>>\n<<<RALPHEX:PLAN_DRAFT>>>\n<<<RALPHEX:PLAN_READY>>>'
-rm -f "$TMPDIR_TEST/bob_args" "$TMPDIR_TEST/bob_prompt"
+rm -f "$TMPDIR_TEST/bob_args" "$TMPDIR_TEST/bob_args_lines" "$TMPDIR_TEST/bob_prompt"
 MOCK_STDOUT_FILE="$TMPDIR_TEST/plan_ready_events.txt" \
     PATH="$TMPDIR_TEST:$PATH" \
     bash "$WRAPPER" -p "$plan_prompt" >/dev/null 2>&1
@@ -1185,44 +1181,49 @@ if echo "$recorded" | grep -q -- "--hide-intermediary-output"; then
 else
     pass "plan mode omits --hide-intermediary-output"
 fi
-if grep -qi 'attempt_completion exactly once' "$TMPDIR_TEST/bob_prompt" &&
-    grep -qi 'ralphex alone owns that log' "$TMPDIR_TEST/bob_prompt"; then
-    pass "plan prompt contains terminal-tool and progress ownership rules"
+if [[ "$(cat "$TMPDIR_TEST/bob_prompt")" == "$plan_prompt" ]]; then
+    pass "plan prompt delivered without a protocol adapter"
 else
-    fail "plan protocol adapter missing required rules" "prompt: $(cat "$TMPDIR_TEST/bob_prompt")"
+    fail "plan prompt was modified" "prompt: $(cat "$TMPDIR_TEST/bob_prompt")"
+fi
+if grep -qi 'attempt_completion' "$TMPDIR_TEST/bob_prompt"; then
+    fail "plan prompt still mentions the removed attempt_completion tool" \
+        "prompt: $(cat "$TMPDIR_TEST/bob_prompt")"
+else
+    pass "plan prompt carries no attempt_completion instructions"
 fi
 
 # ---------------------------------------------------------------------------
-# regression: Bob emits a valid intermediary QUESTION, then would replace it
-# with a malformed attempt_completion summary. The wrapper must stop at END.
+# regression: Bob streams a valid QUESTION across several assistant deltas after
+# mentioning a malformed example in a reasoning message, then keeps talking. The
+# wrapper must ignore the reasoning example, stop at END, and drop the rest.
 # ---------------------------------------------------------------------------
-echo "test: intermediary QUESTION boundary recovery"
+echo "test: streamed QUESTION boundary recovery"
 
 cat > "$TMPDIR_TEST/plan_intermediary_question.jsonl" << 'EOF'
 {"type":"init","timestamp":"t","session_id":"s","model":"premium"}
-{"type":"message","timestamp":"t","role":"assistant","content":"<thinking>Example only: <<<RALPHEX:QUESTION>>> {bad} <<<RALPHEX:END>>></thinking>\n","delta":true}
-{"type":"message","timestamp":"t","role":"assistant","content":"<<<RALPHEX:QUES","delta":true}
-{"type":"message","timestamp":"t","role":"assistant","content":"TION>>>\n{\"question\":\"Which mode?\",\"options\":[\"TCP\",\"UDP\"]}\n","delta":true}
-{"type":"message","timestamp":"t","role":"assistant","content":"<<<RALPHEX:END>>>\n","delta":true}
+{"type":"message","timestamp":"t","role":"assistant","content":"Example only: <<<RALPHEX:QUESTION>>> {bad} <<<RALPHEX:END>>>\n","isReasoning":true}
+{"type":"message","timestamp":"t","role":"assistant","content":"<<<RALPHEX:QUES","isReasoning":false}
+{"type":"message","timestamp":"t","role":"assistant","content":"TION>>>\n{\"question\":\"Which mode?\",\"options\":[\"TCP\",\"UDP\"]}\n","isReasoning":false}
+{"type":"message","timestamp":"t","role":"assistant","content":"<<<RALPHEX:END>>>\n","isReasoning":false}
 {"type":"message","timestamp":"t","role":"user","content":"This is an automated message: use a tool"}
-{"type":"tool_use","timestamp":"t","tool_name":"attempt_completion","parameters":{"result":"Signal: <<<RALPHEX:QUESTION>>>\nQuestion: Which mode?"}}
+{"type":"message","timestamp":"t","role":"assistant","content":"Signal: <<<RALPHEX:QUESTION>>>\nQuestion: Which mode?","isReasoning":false}
 {"type":"result","timestamp":"t","status":"success","stats":{}}
 EOF
 
-# these three plan-mode fixtures still use the removed v1 attempt_completion tool, so
-# the v2 wrapper fails closed on them until the plan-mode fixtures are converted. The
-# substitutions are guarded so a non-zero exit reports as a failure instead of aborting
-# the suite under set -e.
-set +e
 output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/plan_intermediary_question.jsonl" \
     PATH="$TMPDIR_TEST:$PATH" \
     bash "$WRAPPER" -p "$plan_prompt" 2>/dev/null)
-set -e
 question_text=$(echo "$output" | jq -r 'select(.type=="content_block_delta" and .delta.text != "") | .delta.text')
 if [[ "$question_text" == $'<<<RALPHEX:QUESTION>>>\n{"question":"Which mode?","options":["TCP","UDP"]}\n<<<RALPHEX:END>>>' ]]; then
-    pass "complete intermediary QUESTION recovered as one boundary"
+    pass "QUESTION streamed across deltas recovered as one boundary"
 else
-    fail "intermediary QUESTION was not recovered exactly" "text: $question_text"
+    fail "streamed QUESTION was not recovered exactly" "text: $question_text"
+fi
+if echo "$question_text" | grep -q '{bad}'; then
+    fail "malformed example from a reasoning message leaked" "text: $question_text"
+else
+    pass "reasoning-message boundary example ignored"
 fi
 if echo "$question_text" | grep -q 'automated message\|Signal:'; then
     fail "post-boundary Bob continuation leaked" "text: $question_text"
@@ -1231,41 +1232,57 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# test: correctly formatted attempt_completion QUESTION remains the fast path
+# test: a single-delta QUESTION with a valid payload is forwarded as-is
 # ---------------------------------------------------------------------------
-echo "test: attempt_completion QUESTION validation"
+echo "test: assistant message QUESTION validation"
 
 cat > "$TMPDIR_TEST/plan_completion_question.jsonl" << 'EOF'
-{"type":"tool_use","timestamp":"t","tool_name":"attempt_completion","parameters":{"result":"<<<RALPHEX:QUESTION>>>\n{\"question\":\"Choose stack?\",\"options\":[\"JS\",\"TS\"]}\n<<<RALPHEX:END>>>"}}
+{"type":"message","timestamp":"t","role":"assistant","content":"<<<RALPHEX:QUESTION>>>\n{\"question\":\"Choose stack?\",\"options\":[\"JS\",\"TS\"]}\n<<<RALPHEX:END>>>","isReasoning":false}
 {"type":"result","timestamp":"t","status":"success","stats":{}}
 EOF
-set +e
 output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/plan_completion_question.jsonl" \
     PATH="$TMPDIR_TEST:$PATH" \
     bash "$WRAPPER" -p "$plan_prompt" 2>/dev/null)
-set -e
 if echo "$output" | jq -e 'select(.type=="content_block_delta" and (.delta.text | contains("\"question\":\"Choose stack?\"")) and (.delta.text | contains("<<<RALPHEX:END>>>")))' >/dev/null 2>&1; then
-    pass "valid attempt_completion QUESTION forwarded"
+    pass "valid QUESTION in an assistant message forwarded"
 else
-    fail "valid attempt_completion QUESTION rejected" "output: $output"
+    fail "valid QUESTION in an assistant message rejected" "output: $output"
 fi
 
 # Bob may ignore the prompt's preferred 2-4 option count. Ralphex's parser only
 # requires a non-empty string array, so the adapter must not reject an otherwise
 # valid boundary before ralphex can display it.
 cat > "$TMPDIR_TEST/plan_completion_many_options.jsonl" << 'EOF'
-{"type":"tool_use","timestamp":"t","tool_name":"attempt_completion","parameters":{"result":"\n<<<RALPHEX:QUESTION>>>\n{\"question\": \"Which planet?\", \"options\": [\"Mercury\", \"Venus\", \"Earth\", \"Mars\", \"Outer planet\", \"Multiple planets\"]}\n<<<RALPHEX:END>>>\n"}}
+{"type":"message","timestamp":"t","role":"assistant","content":"\n<<<RALPHEX:QUESTION>>>\n{\"question\": \"Which planet?\", \"options\": [\"Mercury\", \"Venus\", \"Earth\", \"Mars\", \"Outer planet\", \"Multiple planets\"]}\n<<<RALPHEX:END>>>\n","isReasoning":false}
 {"type":"result","timestamp":"t","status":"success","stats":{}}
 EOF
-set +e
 output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/plan_completion_many_options.jsonl" \
     PATH="$TMPDIR_TEST:$PATH" \
     bash "$WRAPPER" -p "$plan_prompt" 2>/dev/null)
-set -e
 if echo "$output" | jq -e 'select(.type=="content_block_delta" and (.delta.text | contains("Multiple planets")) and (.delta.text | contains("<<<RALPHEX:END>>>")))' >/dev/null 2>&1; then
     pass "QUESTION with more than four options follows ralphex parser contract"
 else
     fail "valid QUESTION with many options rejected" "output: $output"
+fi
+
+# an invalid QUESTION payload must be rejected rather than forwarded to ralphex,
+# even though its markers are well formed.
+cat > "$TMPDIR_TEST/plan_invalid_question_payload.jsonl" << 'EOF'
+{"type":"message","timestamp":"t","role":"assistant","content":"<<<RALPHEX:QUESTION>>>\n{\"question\":\"Choose stack?\",\"options\":[]}\n<<<RALPHEX:END>>>","isReasoning":false}
+{"type":"result","timestamp":"t","status":"success","stats":{}}
+EOF
+set +e
+output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/plan_invalid_question_payload.jsonl" \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "$plan_prompt" 2>/dev/null)
+invalid_payload_exit=$?
+set -e
+if [[ $invalid_payload_exit -ne 0 ]] &&
+    echo "$output" | jq -e 'select(.type=="content_block_delta" and (.delta.text | contains("invalid QUESTION payload from Bob")))' >/dev/null 2>&1; then
+    pass "QUESTION with an empty options array fails closed"
+else
+    fail "invalid QUESTION payload was not rejected" \
+        "exit: $invalid_payload_exit output: $output"
 fi
 
 # ---------------------------------------------------------------------------
@@ -1274,7 +1291,7 @@ fi
 echo "test: malformed plan boundary fails closed"
 
 cat > "$TMPDIR_TEST/plan_malformed_question.jsonl" << 'EOF'
-{"type":"tool_use","timestamp":"t","tool_name":"attempt_completion","parameters":{"result":"Signal: <<<RALPHEX:QUESTION>>>\nQuestion: Choose stack?\nOptions: JS, TS"}}
+{"type":"message","timestamp":"t","role":"assistant","content":"Signal: <<<RALPHEX:QUESTION>>>\nQuestion: Choose stack?\nOptions: JS, TS","isReasoning":false}
 {"type":"result","timestamp":"t","status":"success","stats":{}}
 EOF
 set +e
@@ -1288,20 +1305,66 @@ if [[ $malformed_exit -ne 0 ]]; then
 else
     fail "malformed QUESTION should fail closed" "output: $output"
 fi
-if echo "$output" | jq -e 'select(.type=="content_block_delta" and (.delta.text | contains("complete valid ralphex plan boundary")))' >/dev/null 2>&1; then
-    pass "malformed QUESTION reports a clear adapter error"
+if echo "$output" | jq -e 'select(.type=="content_block_delta" and (.delta.text | contains("without a complete ralphex plan boundary")))' >/dev/null 2>&1; then
+    pass "malformed QUESTION reports a clear boundary error"
 else
     fail "malformed QUESTION error missing" "output: $output"
 fi
 
+# a plan run that never emits any boundary marker must fail the same way rather
+# than reporting a clean success on ordinary prose.
+cat > "$TMPDIR_TEST/plan_no_boundary.jsonl" << 'EOF'
+{"type":"message","timestamp":"t","role":"assistant","content":"I explored the repository and have some thoughts.\n","isReasoning":false}
+{"type":"result","timestamp":"t","status":"success","stats":{}}
+EOF
+set +e
+output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/plan_no_boundary.jsonl" \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "$plan_prompt" 2>/dev/null)
+no_boundary_exit=$?
+set -e
+if [[ $no_boundary_exit -ne 0 ]] &&
+    echo "$output" | jq -e 'select(.type=="content_block_delta" and (.delta.text | contains("without a complete ralphex plan boundary")))' >/dev/null 2>&1; then
+    pass "missing plan boundary fails closed"
+else
+    fail "missing plan boundary was not reported" \
+        "exit: $no_boundary_exit output: $output"
+fi
+if echo "$output" | jq -e 'select(.type=="content_block_delta" and (.delta.text | contains("some thoughts")))' >/dev/null 2>&1; then
+    fail "plan-mode prose leaked into the translated stream" "output: $output"
+else
+    pass "plan-mode prose outside a boundary is not forwarded"
+fi
+
+# an empty PLAN_DRAFT body is rejected: ralphex would otherwise present an empty
+# draft for review.
+cat > "$TMPDIR_TEST/plan_empty_draft.jsonl" << 'EOF'
+{"type":"message","timestamp":"t","role":"assistant","content":"<<<RALPHEX:PLAN_DRAFT>>>\n   \n<<<RALPHEX:END>>>\n","isReasoning":false}
+{"type":"result","timestamp":"t","status":"success","stats":{}}
+EOF
+set +e
+output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/plan_empty_draft.jsonl" \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "$plan_prompt" 2>/dev/null)
+empty_draft_exit=$?
+set -e
+if [[ $empty_draft_exit -ne 0 ]] &&
+    echo "$output" | jq -e 'select(.type=="content_block_delta" and (.delta.text | contains("empty PLAN_DRAFT payload from Bob")))' >/dev/null 2>&1; then
+    pass "empty PLAN_DRAFT payload fails closed"
+else
+    fail "empty PLAN_DRAFT payload was not rejected" \
+        "exit: $empty_draft_exit output: $output"
+fi
+
 # ---------------------------------------------------------------------------
-# test: intermediary PLAN_DRAFT stops at END and discards trailing prose
+# test: streamed PLAN_DRAFT stops at END and discards trailing prose
 # ---------------------------------------------------------------------------
-echo "test: intermediary PLAN_DRAFT boundary"
+echo "test: streamed PLAN_DRAFT boundary"
 
 cat > "$TMPDIR_TEST/plan_intermediary_draft.jsonl" << 'EOF'
-{"type":"message","timestamp":"t","role":"assistant","content":"<thinking>planning</thinking>\n<<<RALPHEX:PLAN_DRAFT>>>\n# Draft\n\n## Overview\nBody.\n","delta":true}
-{"type":"message","timestamp":"t","role":"assistant","content":"<<<RALPHEX:END>>>\nThis must not leak","delta":true}
+{"type":"message","timestamp":"t","role":"assistant","content":"planning","isReasoning":true}
+{"type":"message","timestamp":"t","role":"assistant","content":"<<<RALPHEX:PLAN_DRAFT>>>\n# Draft\n\n## Overview\nBody.\n","isReasoning":false}
+{"type":"message","timestamp":"t","role":"assistant","content":"<<<RALPHEX:END>>>\nThis must not leak","isReasoning":false}
 {"type":"result","timestamp":"t","status":"success","stats":{}}
 EOF
 output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/plan_intermediary_draft.jsonl" \
@@ -1310,11 +1373,50 @@ output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/plan_intermediary_draft.jsonl" \
 draft_text=$(echo "$output" | jq -r 'select(.type=="content_block_delta" and .delta.text != "") | .delta.text')
 if echo "$draft_text" | grep -q '<<<RALPHEX:PLAN_DRAFT>>>' &&
     echo "$draft_text" | grep -q '<<<RALPHEX:END>>>' &&
-    ! echo "$draft_text" | grep -q 'must not leak'; then
+    ! echo "$draft_text" | grep -q 'must not leak' &&
+    ! echo "$draft_text" | grep -q 'planning'; then
     pass "PLAN_DRAFT boundary preserved and truncated"
 else
     fail "PLAN_DRAFT boundary handling failed" "text: $draft_text"
 fi
+
+# ---------------------------------------------------------------------------
+# test: bare PLAN_READY and TASK_FAILED boundaries need no END marker, and the
+# earliest valid boundary in the buffer wins.
+# ---------------------------------------------------------------------------
+echo "test: bare plan boundary markers"
+
+assert_bare_plan_boundary() {
+    local label="$1"
+    local content="$2"
+    local expected="$3"
+    local boundary_text=""
+
+    printf '%s\n' \
+        "{\"type\":\"message\",\"timestamp\":\"t\",\"role\":\"assistant\",\"content\":$(jq -Rn --arg c "$content" '$c'),\"isReasoning\":false}" \
+        '{"type":"result","timestamp":"t","status":"success","stats":{}}' \
+        > "$TMPDIR_TEST/plan_bare_boundary.jsonl"
+
+    boundary_text=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/plan_bare_boundary.jsonl" \
+        PATH="$TMPDIR_TEST:$PATH" \
+        bash "$WRAPPER" -p "$plan_prompt" 2>/dev/null |
+        jq -r 'select(.type=="content_block_delta" and .delta.text != "") | .delta.text')
+
+    if [[ "$boundary_text" == "$expected" ]]; then
+        pass "$label"
+    else
+        fail "$label" "text: $boundary_text"
+    fi
+}
+
+assert_bare_plan_boundary "bare PLAN_READY forwarded alone" \
+    $'Wrote the plan file.\n<<<RALPHEX:PLAN_READY>>>\n' '<<<RALPHEX:PLAN_READY>>>'
+assert_bare_plan_boundary "bare TASK_FAILED forwarded alone" \
+    $'Cannot continue.\n<<<RALPHEX:TASK_FAILED>>>\n' '<<<RALPHEX:TASK_FAILED>>>'
+# PLAN_READY appears first in the buffer, so it wins over the later PLAN_DRAFT.
+assert_bare_plan_boundary "earliest boundary wins over a later PLAN_DRAFT" \
+    $'<<<RALPHEX:PLAN_READY>>>\n<<<RALPHEX:PLAN_DRAFT>>>\nlate draft\n<<<RALPHEX:END>>>\n' \
+    '<<<RALPHEX:PLAN_READY>>>'
 
 # ---------------------------------------------------------------------------
 # test: signal passthrough in assistant message text
@@ -1334,6 +1436,80 @@ if echo "$output" | grep -q "<<<RALPHEX:ALL_TASKS_DONE>>>"; then
     pass "ralphex signal preserved in translated output"
 else
     fail "ralphex signal lost in translation" "got: $output"
+fi
+
+# ---------------------------------------------------------------------------
+# test: a signal token split across several streaming message deltas is
+# re-assembled by the line buffer and emitted intact in one content_block_delta.
+# ralphex's parser scans individual text blocks, so a signal delivered in pieces
+# would otherwise never match.
+# ---------------------------------------------------------------------------
+echo "test: split signal re-assembly"
+
+assert_split_signal() {
+    local label="$1"
+    local expected="$2"
+    shift 2
+    local fixture="$TMPDIR_TEST/split_signal.jsonl"
+    local chunk=""
+    local matches=""
+    local text=""
+
+    : > "$fixture"
+    for chunk in "$@"; do
+        jq -cn --arg c "$chunk" \
+            '{type:"message",timestamp:"t",role:"assistant",content:$c,isReasoning:false}' \
+            >> "$fixture"
+    done
+    printf '%s\n' '{"type":"result","timestamp":"t","status":"success","stats":{}}' >> "$fixture"
+
+    text=$(MOCK_STDOUT_FILE="$fixture" PATH="$TMPDIR_TEST:$PATH" \
+        bash "$WRAPPER" -p "test prompt" 2>/dev/null |
+        jq -r 'select(.type=="content_block_delta" and .delta.text != "") | .delta.text')
+    matches=$(printf '%s\n' "$text" | grep -c "$expected" || true)
+
+    if [[ "$matches" == "1" ]]; then
+        pass "$label"
+    else
+        fail "$label" "matches: $matches text: $text"
+    fi
+}
+
+# the token is split mid-marker across three deltas.
+assert_split_signal "signal split across three deltas arrives in one block" \
+    '<<<RALPHEX:ALL_TASKS_DONE>>>' '<<<RALPH' 'EX:ALL_TASKS_' 'DONE>>>'$'\n'
+# a per-character trickle is the worst case for the buffer.
+assert_split_signal "signal split one character per delta arrives in one block" \
+    '<<<RALPHEX:REVIEW_DONE>>>' '<' '<' '<' 'R' 'A' 'L' 'P' 'H' 'E' 'X' ':' 'R' 'E' \
+    'V' 'I' 'E' 'W' '_' 'D' 'O' 'N' 'E' '>' '>' '>' $'\n'
+# leading prose on the same line must not split the signal off from its line.
+assert_split_signal "signal split after prose on the same line arrives in one block" \
+    '<<<RALPHEX:TASK_FAILED>>>' 'giving up: ' '<<<RALPHEX:TASK' '_FAILED>>>'$'\n'
+# a signal with no trailing newline is flushed once at stream end.
+assert_split_signal "split signal without a trailing newline is flushed once" \
+    '<<<RALPHEX:ALL_TASKS_DONE>>>' '<<<RALPHEX:ALL' '_TASKS_DONE>>>'
+
+# the re-assembled block must be exactly one delta carrying the whole line, not a
+# concatenation spread over the deltas bob produced.
+cat > "$TMPDIR_TEST/split_signal_exact.jsonl" << 'EOF'
+{"type":"message","timestamp":"t","role":"assistant","content":"<<<RALPHEX:ALL","isReasoning":false}
+{"type":"message","timestamp":"t","role":"assistant","content":"_TASKS_DONE>>>\n","isReasoning":false}
+{"type":"result","timestamp":"t","status":"success","stats":{}}
+EOF
+output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/split_signal_exact.jsonl" \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "test prompt" 2>/dev/null)
+# count blocks, not lines: the delta text itself ends in a newline.
+signal_blocks=$(echo "$output" | jq -s \
+    '[.[] | select(.type=="content_block_delta" and .delta.text != "")] | length')
+if [[ "$signal_blocks" == "1" ]] &&
+    echo "$output" | jq -e \
+        'select(.type=="content_block_delta" and .delta.text == "<<<RALPHEX:ALL_TASKS_DONE>>>\n")' \
+        >/dev/null 2>&1; then
+    pass "partial deltas emit no block until the line completes"
+else
+    fail "split signal produced more than one text block" \
+        "blocks: $signal_blocks output: $output"
 fi
 
 # ---------------------------------------------------------------------------
