@@ -116,14 +116,14 @@ Per bob's own bundled mode-schema documentation, the only valid group names are 
 **Files:**
 - Modify: `scripts/bob-as-claude/install-modes.sh`
 
-- [ ] Add approval merging targeting `~/.bob/settings/settings.json`, overridable through an env var for tests, alongside the existing `custom_modes.yaml` merge
-- [ ] Make the approval step opt-in via an explicit flag so the default installer run keeps its current modes-only behavior
-- [ ] Union `approval.allowed_permissions` with `read`, `edit`, `execute`, `subagent`, and `todo` without removing existing entries, and set `approval.autoApprovalEnabled` to true only when the key is absent
-- [ ] Union `approvedCommands` for the `execute_command` entry of `approval.allowedExecutors` with a minimal documented prefix list (`git`, `go`, `make`, `npm`, `npx`, `gofmt`, `golangci-lint`, `python3`), creating the executor entry when missing and never touching `deniedCommands`
-- [ ] Detect and warn when `approval.forbiddenApprovalGroups` contains any permission being granted, since that silently overrides the grant
-- [ ] Reuse the existing safety pattern: back up the original file, validate JSON before and after, write atomically, preserve all unrelated keys and sections, and stay idempotent across repeated runs
-- [ ] Print a summary of exactly what was changed, including an explicit warning that broadening `approvedCommands` affects all bob usage on the machine, not just ralphex
-- [ ] Verify with `bash -n scripts/bob-as-claude/install-modes.sh` and by running the installer twice against a temporary settings file, confirming the second run is a no-op
+- [x] Add approval merging targeting `~/.bob/settings/settings.json`, overridable through an env var for tests, alongside the existing `custom_modes.yaml` merge
+- [x] Make the approval step opt-in via an explicit flag so the default installer run keeps its current modes-only behavior
+- [x] Union `approval.allowed_permissions` with `read`, `edit`, `execute`, `subagent`, and `todo` without removing existing entries, and set `approval.autoApprovalEnabled` to true only when the key is absent
+- [x] Union `approvedCommands` for the `execute_command` entry of `approval.allowedExecutors` with a minimal documented prefix list (`git`, `go`, `make`, `npm`, `npx`, `gofmt`, `golangci-lint`, `python3`), creating the executor entry when missing and never touching `deniedCommands`
+- [x] Detect and warn when `approval.forbiddenApprovalGroups` contains any permission being granted, since that silently overrides the grant
+- [x] Reuse the existing safety pattern: back up the original file, validate JSON before and after, write atomically, preserve all unrelated keys and sections, and stay idempotent across repeated runs
+- [x] Print a summary of exactly what was changed, including an explicit warning that broadening `approvedCommands` affects all bob usage on the machine, not just ralphex
+- [x] Verify with `bash -n scripts/bob-as-claude/install-modes.sh` and by running the installer twice against a temporary settings file, confirming the second run is a no-op
 
 ### Task 4: Rewrite the wrapper test suite against the v2 mock schema
 

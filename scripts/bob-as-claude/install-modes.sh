@@ -1,7 +1,27 @@
 #!/usr/bin/env bash
-# install the shipped ralphex modes into Bob's global custom-mode document.
+# install the shipped ralphex modes into Bob's global custom-mode document,
+# and optionally grant the approval settings headless bob v2 requires.
+#
+# usage:
+#   install-modes.sh                    # install modes only (default)
+#   install-modes.sh --grant-approvals  # also merge ~/.bob/settings/settings.json
+#
+# --grant-approvals broadens approval.allowed_permissions and
+# approval.allowedExecutors.execute_command.approvedCommands for ALL bob usage
+# on this machine, not just ralphex-invoked runs. It is opt-in on purpose.
 
 set -euo pipefail
+
+grant_approvals=0
+for arg in "$@"; do
+    case "$arg" in
+        --grant-approvals) grant_approvals=1 ;;
+        *)
+            echo "error: unknown argument: $arg" >&2
+            exit 1
+            ;;
+    esac
+done
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 mode_dir="$script_dir/modes"
@@ -22,6 +42,110 @@ modes=(ralphex-task ralphex-review ralphex-plan)
 error() {
     echo "error: $*" >&2
     exit 1
+}
+
+# merge the approval settings headless bob v2 needs into settings.json.
+# union-only: never removes existing entries, never touches deniedCommands,
+# and is a no-op on a second run against the same input.
+grant_approval_settings() {
+    command -v jq >/dev/null 2>&1 ||
+        error "jq is required for --grant-approvals"
+
+    local approval_target
+    if [[ -n "${BOB_SETTINGS_FILE:-}" ]]; then
+        approval_target="$BOB_SETTINGS_FILE"
+    else
+        approval_target="${HOME:?HOME is required}/.bob/settings/settings.json"
+    fi
+    local approval_dir
+    approval_dir="$(dirname "$approval_target")"
+
+    if [[ -L "$approval_target" ]]; then
+        error "refusing to replace symlink: $approval_target"
+    fi
+    if [[ -e "$approval_target" && ! -f "$approval_target" ]]; then
+        error "approval-settings target is not a regular file: $approval_target"
+    fi
+
+    local existing_json
+    if [[ -e "$approval_target" && -s "$approval_target" ]]; then
+        jq empty "$approval_target" 2>/dev/null ||
+            error "cannot safely merge existing approval-settings document: $approval_target"
+        existing_json="$(cat "$approval_target")"
+    else
+        existing_json='{}'
+    fi
+
+    local wanted_permissions=(read edit execute subagent todo)
+    local wanted_commands=(git go make npm npx gofmt golangci-lint python3)
+    local wanted_permissions_json wanted_commands_json
+    wanted_permissions_json=$(printf '%s\n' "${wanted_permissions[@]}" | jq -R . | jq -sc .)
+    wanted_commands_json=$(printf '%s\n' "${wanted_commands[@]}" | jq -R . | jq -sc .)
+
+    local added_permissions added_commands auto_approval_was_absent forbidden_conflicts
+    added_permissions=$(jq -r --argjson wanted "$wanted_permissions_json" \
+        '(.approval.allowed_permissions // []) as $existing
+         | [$wanted[] | select(. as $p | ($existing | index($p)) == null)]
+         | join(", ")' <<<"$existing_json")
+    added_commands=$(jq -r --argjson wanted "$wanted_commands_json" \
+        '(.approval.allowedExecutors.execute_command.approvedCommands // []) as $existing
+         | [$wanted[] | select(. as $c | ($existing | index($c)) == null)]
+         | join(", ")' <<<"$existing_json")
+    auto_approval_was_absent=$(jq -r '(.approval.autoApprovalEnabled? | not) and ((.approval | has("autoApprovalEnabled")) | not)' <<<"$existing_json")
+    forbidden_conflicts=$(jq -r --argjson wanted "$wanted_permissions_json" \
+        '(.approval.forbiddenApprovalGroups // []) as $forbidden
+         | [$forbidden[] | select(. as $f | ($wanted | index($f)) != null)]
+         | join(", ")' <<<"$existing_json")
+
+    local updated_json
+    updated_json=$(jq --argjson wanted_permissions "$wanted_permissions_json" \
+                       --argjson wanted_commands "$wanted_commands_json" '
+        .approval = (.approval // {})
+        | .approval.allowed_permissions =
+            (((.approval.allowed_permissions // []) + $wanted_permissions) | unique)
+        | .approval.autoApprovalEnabled =
+            (if (.approval | has("autoApprovalEnabled"))
+             then .approval.autoApprovalEnabled
+             else true end)
+        | .approval.allowedExecutors = (.approval.allowedExecutors // {})
+        | .approval.allowedExecutors.execute_command =
+            (.approval.allowedExecutors.execute_command // {})
+        | .approval.allowedExecutors.execute_command.approvedCommands =
+            (((.approval.allowedExecutors.execute_command.approvedCommands // []) + $wanted_commands) | unique)
+    ' <<<"$existing_json")
+
+    jq empty <<<"$updated_json" ||
+        error "generated approval-settings document failed validation"
+
+    if [[ -n "$forbidden_conflicts" ]]; then
+        echo "warning: approval.forbiddenApprovalGroups already contains: $forbidden_conflicts" \
+             "— those groups override the corresponding grant even after this change" >&2
+    fi
+
+    if diff <(jq -S . <<<"$existing_json") <(jq -S . <<<"$updated_json") >/dev/null; then
+        echo "approval settings already granted in $approval_target"
+        return
+    fi
+
+    mkdir -p "$approval_dir"
+    if [[ -e "$approval_target" ]]; then
+        cp -p "$approval_target" "$approval_target.bak"
+    fi
+
+    local approval_tmp
+    approval_tmp=$(mktemp "$approval_dir/.settings.json.tmp.XXXXXX")
+    jq . <<<"$updated_json" > "$approval_tmp"
+    jq empty "$approval_tmp" 2>/dev/null || {
+        rm -f "$approval_tmp"
+        error "generated approval-settings document failed validation: $approval_target"
+    }
+    mv -f "$approval_tmp" "$approval_target"
+
+    echo "granted approval settings in $approval_target:"
+    [[ -n "$added_permissions" ]] && echo "  added permissions: $added_permissions"
+    [[ "$auto_approval_was_absent" == "true" ]] && echo "  set autoApprovalEnabled: true (was unset)"
+    [[ -n "$added_commands" ]] && echo "  added command prefixes: $added_commands"
+    echo "  warning: broadening approvedCommands affects all bob usage on this machine, not just ralphex"
 }
 
 # accept a conservative yaml subset with one top-level customModes sequence.
@@ -344,6 +468,9 @@ fi
 
 if [[ ${#missing[@]} -eq 0 ]]; then
     echo "ralphex modes already installed in $target"
+    if [[ "$grant_approvals" -eq 1 ]]; then
+        grant_approval_settings
+    fi
     exit 0
 fi
 
@@ -384,3 +511,7 @@ document_is_safe "$tmp_file" ||
 mv -f "$tmp_file" "$target"
 tmp_file=""
 echo "installed ralphex modes in $target"
+
+if [[ "$grant_approvals" -eq 1 ]]; then
+    grant_approval_settings
+fi
