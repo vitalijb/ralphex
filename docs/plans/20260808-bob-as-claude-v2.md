@@ -167,10 +167,10 @@ Scope note: reuse the v2 mock helper from Task 4; do not reshape it again.
 **Files:**
 - Modify: `scripts/bob-as-claude/bob-as-claude_test.sh`
 
-- [ ] Add a test asserting no guard-shim directory is prepended to `PATH` for `ralphex-review`
-- [ ] Add a test for the model note: both `--model` and `BOB_MODEL` are ignored, with a one-time stderr note and no model argument forwarded to bob
-- [ ] Add tests for the approval preflight warning: it fires on a minimal settings file and stays silent on a compliant one, using a temporary HOME so no real `~/.bob/` is read or written
-- [ ] Run `bash scripts/bob-as-claude/bob-as-claude_test.sh` and confirm these tests pass
+- [x] Add a test asserting no guard-shim directory is prepended to `PATH` for `ralphex-review`
+- [x] Add a test for the model note: both `--model` and `BOB_MODEL` are ignored, with a one-time stderr note and no model argument forwarded to bob
+- [x] Add tests for the approval preflight warning: it fires on a minimal settings file and stays silent on a compliant one, using a temporary HOME so no real `~/.bob/` is read or written
+- [x] Run `bash scripts/bob-as-claude/bob-as-claude_test.sh` and confirm these tests pass (remaining 3 failures are the YAML group validation tests owned by Task 8)
 
 ### Task 8: Extend YAML group validation and add installer approval-merge tests
 

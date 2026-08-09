@@ -379,71 +379,133 @@ fi
 # guard-shim removal tests.
 
 # ---------------------------------------------------------------------------
-# test: --model flag forwarded to bob as -m
+# test: no guard-shim directory is prepended to PATH for ralphex-review
+#
+# v1 wrote a directory of `bob`/`claude`/`codex` stubs that exited 64 and
+# prepended it to PATH. bob v2 blocks nested bob itself through BOB_SESSION,
+# so the shim is gone and bob must inherit the caller's PATH verbatim.
 # ---------------------------------------------------------------------------
-echo "test: --model forwarding"
+echo "test: guard-shim removal"
 
-rm -f "$TMPDIR_TEST/bob_args"
-run_wrapper --model "anthropic/claude-x" -p "test prompt" >/dev/null 2>&1
+review_prompt="## Step 2: Launch ALL 5 Review Agents IN PARALLEL"
+expected_path="$TMPDIR_TEST:$PATH"
+
+rm -f "$TMPDIR_TEST/bob_args" "$TMPDIR_TEST/bob_path"
+run_wrapper -p "$review_prompt" >/dev/null 2>&1
 
 recorded=$(cat "$TMPDIR_TEST/bob_args")
-if echo "$recorded" | grep -q -- "-m anthropic/claude-x"; then
-    pass "--model forwarded to bob as -m"
+if [[ "$recorded" == *"--mode=ralphex-review"* ]]; then
+    pass "review prompt selects ralphex-review for the guard-shim assertion"
 else
-    fail "--model not forwarded as -m" "args: $recorded"
+    fail "review prompt did not select ralphex-review" "args: $recorded"
 fi
+
+recorded_path=$(cat "$TMPDIR_TEST/bob_path")
+if [[ "$recorded_path" == "$expected_path" ]]; then
+    pass "no guard-shim directory prepended to PATH for ralphex-review"
+else
+    fail "PATH altered for ralphex-review" "got: $recorded_path"
+fi
+
+# the first PATH entry is the mock directory itself, so nothing was inserted
+# ahead of it, and no shim stub directory exists under the wrapper's tmp dir.
+if [[ "${recorded_path%%:*}" == "$TMPDIR_TEST" ]]; then
+    pass "mock directory remains the first PATH entry for ralphex-review"
+else
+    fail "unexpected first PATH entry for ralphex-review" "got: ${recorded_path%%:*}"
+fi
+
+if grep -qE 'exit 64|guard|shim' "$WRAPPER"; then
+    fail "wrapper still references a guard shim"
+else
+    pass "wrapper source contains no guard-shim stubs"
+fi
+
+# ---------------------------------------------------------------------------
+# test: model selection is accepted, reported once, and never forwarded
+#
+# bob v2 stable removed model selection (gated behind BOB_USE_MODEL_ENV plus a
+# dev gateway key), so --model / --model= / BOB_MODEL are swallowed with a note.
+# ---------------------------------------------------------------------------
+echo "test: model note"
+
+assert_model_ignored() {
+    local label="$1"
+    local value="$2"
+    local err_out="$3"
+    local args="$4"
+
+    if echo "$args" | grep -qE '(^| )-m( |$)'; then
+        fail "$label: -m forwarded to bob v2" "args: $args"
+    elif echo "$args" | grep -qF -- "$value"; then
+        fail "$label: model value leaked to bob argv" "args: $args"
+    else
+        pass "$label: no model argument forwarded to bob"
+    fi
+
+    local notes
+    notes=$(echo "$err_out" | grep -ci "bob v2 stable has no model selection" || true)
+    if [[ "$notes" == "1" ]]; then
+        pass "$label: one stderr note emitted"
+    else
+        fail "$label: expected exactly one stderr note, got $notes" "stderr: $err_out"
+    fi
+
+    if echo "$err_out" | grep -qF -- "$value"; then
+        pass "$label: stderr note names the ignored value"
+    else
+        fail "$label: stderr note omits the ignored value" "stderr: $err_out"
+    fi
+}
+
+rm -f "$TMPDIR_TEST/bob_args"
+err_out=$(run_wrapper --model "anthropic/claude-x" -p "test prompt" 2>&1 >/dev/null)
+assert_model_ignored "--model flag" "anthropic/claude-x" \
+    "$err_out" "$(cat "$TMPDIR_TEST/bob_args")"
 
 # direct invocations may use the documented equals form.
 rm -f "$TMPDIR_TEST/bob_args"
-run_wrapper --model=anthropic/claude-equals -p "test prompt" >/dev/null 2>&1
-recorded=$(cat "$TMPDIR_TEST/bob_args")
-if echo "$recorded" | grep -q -- "-m anthropic/claude-equals"; then
-    pass "--model=<value> forwarded to bob as -m"
-else
-    fail "--model=<value> not forwarded as -m" "args: $recorded"
-fi
-
-# ---------------------------------------------------------------------------
-# test: BOB_MODEL env used as -m when --model flag absent
-# ---------------------------------------------------------------------------
-echo "test: BOB_MODEL env"
+err_out=$(run_wrapper --model=anthropic/claude-equals -p "test prompt" 2>&1 >/dev/null)
+assert_model_ignored "--model=<value>" "anthropic/claude-equals" \
+    "$err_out" "$(cat "$TMPDIR_TEST/bob_args")"
 
 rm -f "$TMPDIR_TEST/bob_args"
-MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
+err_out=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
     BOB_MODEL="google/gemini-x" \
     PATH="$TMPDIR_TEST:$PATH" \
-    bash "$WRAPPER" -p "test prompt" >/dev/null 2>&1
+    bash "$WRAPPER" -p "test prompt" 2>&1 >/dev/null)
+assert_model_ignored "BOB_MODEL env" "google/gemini-x" \
+    "$err_out" "$(cat "$TMPDIR_TEST/bob_args")"
 
-recorded=$(cat "$TMPDIR_TEST/bob_args")
-if echo "$recorded" | grep -q -- "-m google/gemini-x"; then
-    pass "BOB_MODEL used as -m when flag absent"
-else
-    fail "BOB_MODEL not used" "args: $recorded"
-fi
-
-# --model flag wins over BOB_MODEL
+# the flag still wins over the env var, and only its value is reported.
 rm -f "$TMPDIR_TEST/bob_args"
-MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
+err_out=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
     BOB_MODEL="google/gemini-x" \
     PATH="$TMPDIR_TEST:$PATH" \
-    bash "$WRAPPER" --model "anthropic/claude-x" -p "test prompt" >/dev/null 2>&1
-
+    bash "$WRAPPER" --model "anthropic/claude-x" -p "test prompt" 2>&1 >/dev/null)
 recorded=$(cat "$TMPDIR_TEST/bob_args")
-if echo "$recorded" | grep -q -- "-m anthropic/claude-x" && ! echo "$recorded" | grep -q -- "google/gemini-x"; then
-    pass "--model flag overrides BOB_MODEL"
+assert_model_ignored "--model over BOB_MODEL" "anthropic/claude-x" \
+    "$err_out" "$recorded"
+if echo "$err_out$recorded" | grep -qF -- "google/gemini-x"; then
+    fail "BOB_MODEL reported or forwarded when --model is set" "stderr: $err_out; args: $recorded"
 else
-    fail "--model did not override BOB_MODEL" "args: $recorded"
+    pass "--model over BOB_MODEL: env value neither reported nor forwarded"
 fi
 
-# no -m when neither flag nor env set
+# no note and no -m when neither flag nor env set
 rm -f "$TMPDIR_TEST/bob_args"
-run_wrapper -p "test prompt" >/dev/null 2>&1
+err_out=$(run_wrapper -p "test prompt" 2>&1 >/dev/null)
 recorded=$(cat "$TMPDIR_TEST/bob_args")
-# use word-boundary grep so "-m" does not match "--mode" or "--max-coins"
+# use word-boundary grep so "-m" does not match "--mode" or "--max-turns"
 if echo "$recorded" | grep -qE '(^| )-m( |$)'; then
     fail "-m present when no model configured" "args: $recorded"
 else
     pass "-m omitted when no model configured"
+fi
+if echo "$err_out" | grep -qi "no model selection"; then
+    fail "stderr note emitted with no model configured" "stderr: $err_out"
+else
+    pass "no stderr note when no model configured"
 fi
 
 # ---------------------------------------------------------------------------
@@ -2013,6 +2075,111 @@ if [[ -f "$TMPDIR_TEST/bob_args_lines" ]]; then
     fi
 else
     fail "BOB_EXTRA_ARGS command-substitution test did not record args"
+fi
+
+# ---------------------------------------------------------------------------
+# test: approval preflight warns when bob v2 cannot auto-approve edit/execute
+#
+# headless `bob run` registers no interactive approval handler, so its only
+# input is bob's global settings.json. The wrapper warns and continues; it must
+# never abort. Every case below uses a temporary HOME and clears the exported
+# BOB_SETTINGS_FILE override, so the default path is exercised without reading
+# or writing a real ~/.bob/.
+# ---------------------------------------------------------------------------
+echo "test: approval preflight"
+
+preflight_home="$TMPDIR_TEST/preflight-home"
+preflight_settings="$preflight_home/.bob/settings/settings.json"
+mkdir -p "$preflight_home/.bob/settings"
+
+# runs the wrapper against $preflight_settings; sets preflight_err/preflight_rc.
+run_preflight() {
+    local settings="$1"
+    if [[ "$settings" == "MISSING" ]]; then
+        rm -f "$preflight_settings"
+    else
+        printf '%s\n' "$settings" > "$preflight_settings"
+    fi
+
+    rm -f "$TMPDIR_TEST/bob_args"
+    preflight_rc=0
+    preflight_err=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
+        HOME="$preflight_home" \
+        PATH="$TMPDIR_TEST:$PATH" \
+        env -u BOB_SETTINGS_FILE bash "$WRAPPER" -p "test prompt" 2>&1 >/dev/null) ||
+        preflight_rc=$?
+}
+
+# asserts a warning naming the installer, and that the run still proceeded.
+assert_preflight_warns() {
+    local label="$1"
+    local settings="$2"
+
+    run_preflight "$settings"
+    if echo "$preflight_err" | grep -qi "warning:.*approval"; then
+        pass "$label: approval warning emitted"
+    else
+        fail "$label: approval warning missing" "stderr: $preflight_err"
+    fi
+    if echo "$preflight_err" | grep -qF "install-modes.sh"; then
+        pass "$label: warning names install-modes.sh"
+    else
+        fail "$label: warning does not name install-modes.sh" "stderr: $preflight_err"
+    fi
+    if [[ "$preflight_rc" -eq 0 && -f "$TMPDIR_TEST/bob_args" ]]; then
+        pass "$label: warning does not abort the run"
+    else
+        fail "$label: run aborted after warning" "rc: $preflight_rc"
+    fi
+}
+
+assert_preflight_silent() {
+    local label="$1"
+    local settings="$2"
+
+    run_preflight "$settings"
+    if echo "$preflight_err" | grep -qi "warning:.*approval"; then
+        fail "$label: unexpected approval warning" "stderr: $preflight_err"
+    else
+        pass "$label: no approval warning emitted"
+    fi
+}
+
+assert_preflight_warns "missing settings file" "MISSING"
+
+assert_preflight_warns "default read-only permissions" \
+    '{"approval":{"allowed_permissions":["read"],"autoApprovalEnabled":true}}'
+
+assert_preflight_warns "edit granted without execute" \
+    '{"approval":{"allowed_permissions":["read","edit"],"autoApprovalEnabled":true}}'
+
+assert_preflight_warns "auto approval disabled" \
+    '{"approval":{"allowed_permissions":["read","edit","execute"],"autoApprovalEnabled":false}}'
+
+assert_preflight_warns "forbidden approval group blocks a grant" \
+    '{"approval":{"allowed_permissions":["read","edit","execute"],"autoApprovalEnabled":true,"forbiddenApprovalGroups":["edit"]}}'
+
+assert_preflight_silent "compliant settings" \
+    '{"approval":{"allowed_permissions":["read","edit","execute","subagent","todo"],"autoApprovalEnabled":true}}'
+
+# an absent autoApprovalEnabled key is bob's default-on case, not a false value.
+assert_preflight_silent "compliant settings without autoApprovalEnabled" \
+    '{"approval":{"allowed_permissions":["read","edit","execute"]}}'
+
+# a malformed settings file must not turn the warn-only preflight into a failure.
+run_preflight '{"approval":'
+if [[ "$preflight_rc" -eq 0 ]]; then
+    pass "malformed settings file does not abort the run"
+else
+    fail "malformed settings file aborted the run" "rc: $preflight_rc; stderr: $preflight_err"
+fi
+
+# the preflight is read-only: it must never create or modify bob's settings.
+if [[ ! -e "$preflight_home/.bob/custom_modes.yaml" &&
+    ! -e "$preflight_home/.bob/settings/custom_modes.yaml" ]]; then
+    pass "preflight writes nothing into the temporary bob home"
+else
+    fail "preflight wrote into the temporary bob home"
 fi
 
 # ---------------------------------------------------------------------------
