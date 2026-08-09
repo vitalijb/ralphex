@@ -54,18 +54,20 @@ bob v2 accepts only these tool-group names: `read`, `edit`, `execute`, `mcp`, `s
 
 ### Step 2: granting approvals
 
-Headless `bob run` registers no interactive approval handler — there is no TTY to prompt and no per-run auto-approve flag (`--yolo` was removed in v2, and `--auto-approve` exists only on `bob chat`, which `bob run` rejects). Bob's only input is the `approval` section of `~/.bob/settings/settings.json`, whose defaults are `allowed_permissions: ["read"]` and a 15-entry read-only `approvedCommands` list. Without a grant, `edit` and real commands (`go test`, `git commit`, `make lint`) are not approved and a task run does no work.
+Headless `bob run` registers no interactive approval handler — there is no TTY to prompt and no per-run auto-approve flag (`--yolo` was removed in v2, and `--auto-approve` exists only on `bob chat`, which `bob run` rejects). Bob's only input is the `approval` section of `~/.bob/settings/settings.json`, whose defaults are `allowed_permissions: ["read"]` and a read-only `approvedCommands` list. Without a grant, `edit` and real commands (`go test`, `git commit`, `make lint`) are not approved and a task run does no work.
 
 `install-modes.sh --grant-approvals` merges the needed settings:
 
 - unions `approval.allowed_permissions` with `read`, `edit`, `execute`, `subagent`, `todo`
-- unions `approval.allowedExecutors.execute_command.approvedCommands` with `git`, `go`, `make`, `npm`, `npx`, `gofmt`, `golangci-lint`, `python3` (command matching is longest-prefix with no wildcard, so prefixes must be enumerated)
+- unions `approvedCommands` on the `approval.allowedExecutors` record whose `toolId` is `execute_command` with `git`, `go`, `make`, `npm`, `npx`, `gofmt`, `golangci-lint`, `python3`, `cat`, `grep`, `head`, `tail`, `ls`, `sort`, `wc`, `which`, `du`, `df` (command matching is longest-prefix with no wildcard, so prefixes must be enumerated). `allowedExecutors` is an **array** of `{toolId, approvedCommands, deniedCommands}` records that bob looks up with `Array.prototype.find` — an object-shaped value makes every approval throw a `TypeError`
 - sets `approval.autoApprovalEnabled` to true only when the key is absent
 - never touches `deniedCommands`, warns when `forbiddenApprovalGroups` already blocks a granted permission, backs the file up, validates JSON before and after, writes atomically, and is idempotent
 
+The read-only tail of that prefix list (`cat` through `df`) is not extra privilege. Bob's settings merge does not recurse into arrays, so a written `approvedCommands` array **replaces** bob's read-only defaults wholesale; those prefixes restate the defaults the project prefixes do not already subsume. `todo` is granted for the same forward-compatibility reason — no shipped mode declares the `todo` group today.
+
 Set `BOB_SETTINGS_FILE=/path/to/settings.json` to target another file. **The grant is machine-wide:** bob's global directory is `~/.bob` with no environment override, so broadening `approvedCommands` affects all bob usage on the machine, not just ralphex-invoked runs. That is why the flag is opt-in and left to an explicit, user-run command.
 
-The wrapper itself never writes to `~/.bob/`. It only runs a preflight check and prints one actionable stderr warning naming the installer when the settings file is missing, `allowed_permissions` lacks `edit`/`execute`, `autoApprovalEnabled` is false, or `forbiddenApprovalGroups` blocks a needed permission. It warns and continues, never aborts.
+The wrapper itself never writes to `~/.bob/`. It only runs a preflight check and prints one actionable stderr warning naming the installer when the settings path cannot be resolved (file missing, or `HOME` unset with no `BOB_SETTINGS_FILE`), `allowed_permissions` lacks `edit`/`execute`, `autoApprovalEnabled` is false, or `forbiddenApprovalGroups` blocks a needed permission. A review prompt additionally requires `subagent`, since `ralphex-review` drives native subagents. It warns and continues, never aborts.
 
 **Environment variables:**
 
@@ -133,7 +135,7 @@ The unit test uses a mock bob — no real API calls are made.
 ## Security considerations
 
 - **The granted approvals auto-approve tool calls, and `--trust` writes to the real filesystem.** This is required for unattended task/review execution (ralphex has no TTY to confirm tool calls). Ensure the working directory is a git repository so changes are isolated to a feature branch. Do NOT run the wrapper in a directory with sensitive files you don't want bob to modify.
-- **Approval grants are broad and machine-wide.** `--grant-approvals` widens `allowed_permissions` and `approvedCommands` for every bob run on the machine. Review the printed summary, and keep the command-prefix list as narrow as your projects allow.
+- **Approval grants are broad and machine-wide.** `--grant-approvals` widens `allowed_permissions` and `approvedCommands` for every bob run on the machine. Review the printed summary. Narrowing the prefix list is possible by editing the settings file afterwards, but note that bob's merge does not recurse into arrays: any hand-written `approvedCommands` array replaces bob's read-only defaults, so drop the read-only prefixes only if you also accept losing those defaults.
 - **The wrapper never writes to `~/.bob/`.** Approval changes only happen through the explicit, user-run installer flag; the wrapper warns and continues.
 - **stderr signal neutralization.** The wrapper re-emits bob's non-JSON diagnostic output as `content_block_delta` events so ralphex's error/limit pattern detection works. Any literal `<<<RALPHEX:` token there is neutralized to `<<< RALPHEX:` (space inserted) so stray diagnostics cannot be mistaken for a real completion signal. Rate-limit and `API Error:` phrases pass through verbatim for error/limit detection.
 - **Fence-aware phase selection.** Review and plan markers inside ` ``` ` or `~~~` blocks are ignored. This prevents quoted documentation or examples from changing the selected mode. `<<<RALPHEX:REVIEW_DONE>>>` is intentionally not a trigger because it is an output signal.

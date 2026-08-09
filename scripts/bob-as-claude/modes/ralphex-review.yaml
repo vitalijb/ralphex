@@ -8,6 +8,7 @@ customModes:
     whenToUse: Use for ralphex internal review prompts that launch review agents or ask for a review pass.
     customInstructions: |-
       Launch every review-agent assignment as a native spawn_subagent call, issuing all assignments in a single turn so they run in parallel.
+      If spawn_subagent is unavailable in this session, carry out every review assignment yourself before consolidating; no assignment may be dropped.
       Keep temporary files inside the current workspace or Bob project temp directory, never in general-purpose `/tmp`.
       Consolidate the subagent findings into your final response: merge and deduplicate findings, then verify every finding against the actual file and surrounding context.
       Classify findings as CONFIRMED or FALSE POSITIVE and discard false positives.

@@ -442,13 +442,13 @@ Setup is two steps: install the shipped custom modes, then grant the approval se
 
 ### Approval prerequisite
 
-Headless `bob run` registers no interactive approval handler — there is no TTY to prompt, and no per-run flag to auto-approve (`--yolo` is gone and `--auto-approve` exists only on `bob chat`, which `bob run` rejects). Its only input is the `approval` section of `~/.bob/settings/settings.json`. Bob's defaults are `allowed_permissions: ["read"]` plus a 15-entry read-only `approvedCommands` list, so `edit` and real commands (`go test`, `git commit`, `make lint`) are **not** auto-approved out of the box and a task run does no work.
+Headless `bob run` registers no interactive approval handler — there is no TTY to prompt, and no per-run flag to auto-approve (`--yolo` is gone and `--auto-approve` exists only on `bob chat`, which `bob run` rejects). Its only input is the `approval` section of `~/.bob/settings/settings.json`. Bob's defaults are `allowed_permissions: ["read"]` plus a read-only `approvedCommands` list, so `edit` and real commands (`go test`, `git commit`, `make lint`) are **not** auto-approved out of the box and a task run does no work.
 
 For ralphex phases, `approval` needs:
 
-- `allowed_permissions` including `edit` and `execute` (the wrapper's modes also use `subagent` and `todo`)
+- `allowed_permissions` including `edit` and `execute`; review phases additionally need `subagent`, since `ralphex-review` drives native subagents
 - `autoApprovalEnabled` not set to `false` (an untrusted workspace forces it off, which is why `--trust` is always passed)
-- `allowedExecutors.execute_command.approvedCommands` containing the command prefixes your project runs — matching is longest-prefix with no wildcard, so prefixes must be enumerated
+- an `allowedExecutors` entry whose `toolId` is `execute_command`, with `approvedCommands` containing the command prefixes your project runs — matching is longest-prefix with no wildcard, so prefixes must be enumerated. `allowedExecutors` is an **array** of `{toolId, approvedCommands, deniedCommands}` records that bob looks up with `Array.prototype.find`; an object-shaped value makes every approval throw a `TypeError`
 - `forbiddenApprovalGroups` not listing a needed permission; it silently overrides the grant
 
 Grant these with the installer's opt-in flag:
@@ -457,11 +457,13 @@ Grant these with the installer's opt-in flag:
 bash scripts/bob-as-claude/install-modes.sh --grant-approvals
 ```
 
-That unions `allowed_permissions` with `read`, `edit`, `execute`, `subagent`, `todo`; unions `approvedCommands` with `git`, `go`, `make`, `npm`, `npx`, `gofmt`, `golangci-lint`, `python3`; sets `autoApprovalEnabled` to true only when the key is absent; never touches `deniedCommands`; and prints exactly what it changed. It backs the file up, validates JSON before and after, writes atomically, preserves unrelated keys, and is idempotent. Set `BOB_SETTINGS_FILE=/path/to/settings.json` to target another file.
+That unions `allowed_permissions` with `read`, `edit`, `execute`, `subagent`, `todo`; unions the `execute_command` record's `approvedCommands` with `git`, `go`, `make`, `npm`, `npx`, `gofmt`, `golangci-lint`, `python3`, `cat`, `grep`, `head`, `tail`, `ls`, `sort`, `wc`, `which`, `du`, `df`; sets `autoApprovalEnabled` to true only when the key is absent; never touches `deniedCommands`; and prints exactly what it changed. It backs the file up, validates JSON before and after, writes atomically, preserves unrelated keys, and is idempotent. Set `BOB_SETTINGS_FILE=/path/to/settings.json` to target another file.
+
+The trailing read-only prefixes (`cat` through `df`) are not extra privilege — bob's settings merge does not recurse into arrays, so once a written `approvedCommands` array exists it **replaces** bob's read-only defaults wholesale. They restate the defaults that the project prefixes do not already subsume. `todo` is granted for the same forward-compatibility reason; no shipped mode declares the `todo` group today.
 
 Bob's global directory is `~/.bob` with no environment override, so **the grant is machine-wide: broadening `approvedCommands` affects all bob usage on the machine, not just ralphex-invoked runs.** That is why it is opt-in and left to an explicit, user-run command rather than done silently by the wrapper — the same rule ralphex applies to `~/.codex/`.
 
-The wrapper itself only runs a preflight check: when the settings file is missing, `allowed_permissions` lacks `edit`/`execute`, `autoApprovalEnabled` is false, or `forbiddenApprovalGroups` blocks a needed permission, it prints one actionable stderr warning naming the installer. It never aborts, so a misconfigured run explains itself instead of silently doing nothing.
+The wrapper itself only runs a preflight check: when the settings file is missing (or `HOME` is unset and `BOB_SETTINGS_FILE` is not set, so the path cannot be resolved at all), `allowed_permissions` lacks `edit`/`execute` — plus `subagent` for a review prompt — `autoApprovalEnabled` is false, or `forbiddenApprovalGroups` blocks a needed permission, it prints one actionable stderr warning naming the installer. It never aborts, so a misconfigured run explains itself instead of silently doing nothing.
 
 ### Custom-mode installation and selection
 
@@ -519,11 +521,11 @@ bob v2 emits these event types, and the wrapper translates them as follows. `att
 | `tool_result` + `status == "error"` | `content_block_delta` with `[tool_error] <error.message>` (always emitted; on error `output` is absent and the text moves to `error.message`) |
 | `tool_result` + `status == "success"` | skipped by default; `[tool_result] <output>` when `BOB_VERBOSE=1` |
 | `tool_use` | skipped by default; `[tool] <tool_name>` when `BOB_VERBOSE=1` |
-| `error` + `severity == "error"` | `content_block_delta` with `error: bob: <message>`, and a forced non-zero exit |
+| `error` (any `severity`) | `content_block_delta` with `error: bob: <message>`, and a forced non-zero exit |
 | `message` (user echo) and other suppressed events | empty keepalive delta |
 | `result` (always `status: "success"`, carries `stats`) | `{"type":"result","result":""}` (end of execution) |
 
-`isReasoning` replaces v1's `<thinking>` text heuristic — there is no thinking-block parsing left. `{type:"error"}` is v2's only failure channel (for example a `--max-cost` or `--max-turns` abort): the `result` event's `status` is *always* `"success"` in v2, so a run that fails would otherwise look like a clean, silent success. The wrapper therefore treats an `error` event as a real failure, emitting a diagnostic line and forcing a non-zero exit.
+`isReasoning` replaces v1's `<thinking>` text heuristic — there is no thinking-block parsing left. `{type:"error"}` is v2's only failure channel (for example a `--max-cost` or `--max-turns` abort): the `result` event's `status` is *always* `"success"` in v2, so a run that fails would otherwise look like a clean, silent success. The wrapper therefore treats an `error` event as a real failure, emitting a diagnostic line and forcing a non-zero exit. The event's `severity` field is **not** inspected — every `error` event fails the run, since a downgraded severity on a fatal condition would otherwise be swallowed. An `error` event with no `message`, or a blank one, reports `error: bob: unspecified bob error` so the failure always names something searchable.
 
 Line buffering matters for signals: assistant text arrives as streaming deltas, so a `<<<RALPHEX:...>>>` token can be split across several events. The wrapper accumulates deltas and emits complete lines, flushing any partial trailing line at stream end, so ralphex sees each signal intact in a single `content_block_delta`.
 

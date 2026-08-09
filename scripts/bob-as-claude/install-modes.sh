@@ -97,24 +97,35 @@ grant_approval_settings() {
     local wanted_permissions_json='["read","edit","execute","subagent","todo"]'
     local wanted_commands_json='["git","go","make","npm","npx","gofmt","golangci-lint","python3","cat","grep","head","tail","ls","sort","wc","which","du","df"]'
 
+    # all five summary values come out of one jq pass, NUL-separated, so a merge
+    # costs one jq process instead of five (same pattern as parse_bob_event in
+    # bob-as-claude.sh). Values are joined lists or booleans and never contain NUL.
     local added_permissions added_commands auto_approval_was_absent
     local auto_approval_disabled forbidden_conflicts
-    added_permissions=$(jq -r --argjson wanted "$wanted_permissions_json" \
-        '(.approval.allowed_permissions // []) as $existing
-         | [$wanted[] | select(. as $p | ($existing | index($p)) == null)]
-         | join(", ")' <<<"$existing_json")
-    added_commands=$(jq -r --argjson wanted "$wanted_commands_json" \
-        '((.approval.allowedExecutors // [])
-            | map(select(.toolId == "execute_command"))
-            | first | .approvedCommands // []) as $existing
-         | [$wanted[] | select(. as $c | ($existing | index($c)) == null)]
-         | join(", ")' <<<"$existing_json")
-    auto_approval_was_absent=$(jq -r '((.approval // {}) | has("autoApprovalEnabled")) | not' <<<"$existing_json")
-    auto_approval_disabled=$(jq -r '((.approval // {}).autoApprovalEnabled) == false' <<<"$existing_json")
-    forbidden_conflicts=$(jq -r --argjson wanted "$wanted_permissions_json" \
-        '(.approval.forbiddenApprovalGroups // []) as $forbidden
-         | [$forbidden[] | select(. as $f | ($wanted | index($f)) != null)]
-         | join(", ")' <<<"$existing_json")
+    {
+        IFS= read -r -d '' added_permissions &&
+            IFS= read -r -d '' added_commands &&
+            IFS= read -r -d '' auto_approval_was_absent &&
+            IFS= read -r -d '' auto_approval_disabled &&
+            IFS= read -r -d '' forbidden_conflicts
+    } < <(
+        jq -j --argjson wanted_permissions "$wanted_permissions_json" \
+              --argjson wanted_commands "$wanted_commands_json" '
+            ((.approval.allowed_permissions // []) as $existing
+             | [$wanted_permissions[] | select(. as $p | ($existing | index($p)) == null)]
+             | join(", ")), "\u0000",
+            (((.approval.allowedExecutors // [])
+                | map(select(.toolId == "execute_command"))
+                | first | .approvedCommands // []) as $existing
+             | [$wanted_commands[] | select(. as $c | ($existing | index($c)) == null)]
+             | join(", ")), "\u0000",
+            ((((.approval // {}) | has("autoApprovalEnabled")) | not) | tostring), "\u0000",
+            ((((.approval // {}).autoApprovalEnabled) == false) | tostring), "\u0000",
+            ((.approval.forbiddenApprovalGroups // []) as $forbidden
+             | [$forbidden[] | select(. as $f | ($wanted_permissions | index($f)) != null)]
+             | join(", ")), "\u0000"
+        ' <<<"$existing_json"
+    )
 
     local updated_json
     updated_json=$(jq --argjson wanted_permissions "$wanted_permissions_json" \
@@ -155,7 +166,10 @@ grant_approval_settings() {
              "has no effect until you set it to true" >&2
     fi
 
-    if diff <(jq -S . <<<"$existing_json") <(jq -S . <<<"$updated_json") >/dev/null; then
+    # compare canonicalized single-line forms rather than shelling out to diff:
+    # only equality matters here, and the merge is union-only so key order is the
+    # sole cosmetic difference `jq -S` has to absorb.
+    if [[ "$(jq -Sc . <<<"$existing_json")" == "$(jq -Sc . <<<"$updated_json")" ]]; then
         echo "approval settings already granted in $approval_target"
         return
     fi

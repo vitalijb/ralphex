@@ -11,7 +11,9 @@
 #   BOB_VERBOSE       - set to 1 to include tool_result output, tool markers, and
 #                        reasoning message text (default: 0)
 #   BOB_EXTRA_ARGS    - extra bob arguments, word-split on whitespace
-#   BOB_SETTINGS_FILE - override path to bob's global settings.json (used by tests)
+#   BOB_SETTINGS_FILE - override path to bob's approval settings.json
+#                        (default ~/.bob/settings/settings.json); shared with
+#                        install-modes.sh --grant-approvals
 
 set -euo pipefail
 
@@ -54,7 +56,9 @@ if [[ "$BOB_VERBOSE" != "0" && "$BOB_VERBOSE" != "1" ]]; then
     BOB_VERBOSE=0
 fi
 BOB_EXTRA_ARGS="${BOB_EXTRA_ARGS:-}"
-BOB_SETTINGS_FILE="${BOB_SETTINGS_FILE:-$HOME/.bob/settings/settings.json}"
+# HOME may be unset in a sanitized child env; the preflight is a warning, so it
+# must degrade to "cannot check" rather than abort the run under `set -u`.
+BOB_SETTINGS_FILE="${BOB_SETTINGS_FILE:-${HOME:+$HOME/.bob/settings/settings.json}}"
 
 # bob v2 stable has no model selection (gated behind an internal dev gateway key), and
 # has no --effort flag either. Accept both for compatibility with ralphex's per-phase
@@ -127,6 +131,11 @@ approval_preflight() {
     local needed_json='["edit","execute"]'
     if [[ "$selected_chat_mode" == "ralphex-review" ]]; then
         needed_json='["edit","execute","subagent"]'
+    fi
+
+    if [[ -z "$BOB_SETTINGS_FILE" ]]; then
+        echo "warning: cannot locate bob v2 approval settings: HOME is unset and BOB_SETTINGS_FILE is not set, so the settings bob v2 needs for 'edit' and 'execute' work cannot be checked. Set BOB_SETTINGS_FILE to bob's settings.json path." >&2
+        return 0
     fi
 
     if [[ ! -f "$BOB_SETTINGS_FILE" ]]; then
@@ -210,6 +219,7 @@ extract_plan_boundary() {
     local body=""
     local candidate=""
     local candidate_pos=-1
+    local open_pos=-1
     local pos=-1
     local current=""
     local prefix=""
@@ -219,12 +229,20 @@ extract_plan_boundary() {
 
     for marker in '<<<RALPHEX:QUESTION>>>' '<<<RALPHEX:PLAN_DRAFT>>>'; do
         [[ "$text" == *"$marker"* ]] || continue
-        rest=${text#*"$marker"}
-        [[ "$rest" == *'<<<RALPHEX:END>>>'* ]] || continue
-        body=${rest%%'<<<RALPHEX:END>>>'*}
-        current="$marker$body<<<RALPHEX:END>>>"
         prefix=${text%%"$marker"*}
         pos=${#prefix}
+        rest=${text#*"$marker"}
+        if [[ "$rest" != *'<<<RALPHEX:END>>>'* ]]; then
+            # this boundary is still streaming. Remember where it opened so a
+            # bare marker quoted inside its unterminated body cannot be mistaken
+            # for a real terminal boundary below and discard the whole draft.
+            if [[ $open_pos -lt 0 || $pos -lt $open_pos ]]; then
+                open_pos=$pos
+            fi
+            continue
+        fi
+        body=${rest%%'<<<RALPHEX:END>>>'*}
+        current="$marker$body<<<RALPHEX:END>>>"
 
         if [[ "$marker" == '<<<RALPHEX:QUESTION>>>' ]]; then
             if ! printf '%s' "$body" | jq -e '
@@ -251,6 +269,11 @@ extract_plan_boundary() {
         [[ "$text" == *"$marker"* ]] || continue
         prefix=${text%%"$marker"*}
         pos=${#prefix}
+        # a terminal marker inside a still-open QUESTION/PLAN_DRAFT body is the
+        # model narrating its own protocol, not a boundary. Keep buffering.
+        if [[ $open_pos -ge 0 && $pos -gt $open_pos ]]; then
+            continue
+        fi
         if [[ $candidate_pos -lt 0 || $pos -lt $candidate_pos ]]; then
             candidate="$marker"
             candidate_pos=$pos
@@ -317,21 +340,35 @@ bob_result_failed=0
 # splice itself into the next real answer line.
 task_stream_buffer=""
 task_stream_kind=""
+# Emits one buffered chunk, neutralizing signal tokens when the buffered text is
+# reasoning rather than the model's own answer. Neutralization belongs here, on
+# flush, and not on the incoming chunk: bob splits message text mid-token, so a
+# token straddling two reasoning chunks matches neither per-chunk substitution and
+# the buffer would re-assemble it into a live signal.
+emit_task_chunk() {
+    if [[ "$task_stream_kind" == "reasoning" ]]; then
+        emit_text_delta "${1//<<<RALPHEX:/<<< RALPHEX:}"
+    else
+        emit_text_delta "$1"
+    fi
+}
 flush_task_buffer_remainder() {
     if [[ -n "$task_stream_buffer" ]]; then
-        emit_text_delta "$task_stream_buffer"
+        emit_task_chunk "$task_stream_buffer"
         task_stream_buffer=""
     fi
 }
 flush_task_buffer_lines() {
     local kind="$1"
+    # flush before adopting the new kind so the remainder is neutralized (or not)
+    # according to the kind it was actually buffered as.
     [[ "$task_stream_kind" == "$kind" ]] || flush_task_buffer_remainder
     task_stream_kind="$kind"
     task_stream_buffer+="$2"
     while [[ "$task_stream_buffer" == *$'\n'* ]]; do
         local line="${task_stream_buffer%%$'\n'*}"
         task_stream_buffer="${task_stream_buffer#*$'\n'}"
-        emit_text_delta "$line"$'\n'
+        emit_task_chunk "$line"$'\n'
     done
 }
 
@@ -360,6 +397,24 @@ while IFS= read -r line || [[ -n "$line" ]]; do
         continue
     fi
 
+    # {type:"error"} is bob v2's only failure channel (result.status is always
+    # "success"), so every mode must surface it — a swallowed rate-limit or auth
+    # message would otherwise be reported as a missing plan boundary, or as a
+    # silently successful task run, with no diagnostic. Handled before the mode
+    # dispatch so both paths cannot drift apart. The remainder flush is a no-op in
+    # plan mode, which never fills the task buffer.
+    if [[ "$event_type" == "error" ]]; then
+        flush_task_buffer_remainder
+        error_detail="${event_message//<<<RALPHEX:/<<< RALPHEX:}"
+        # bob may report an error with no message at all; an empty "error: bob:"
+        # line names no cause, so give the user something to search for.
+        [[ -n "${error_detail//[[:space:]]/}" ]] || error_detail="unspecified bob error"
+        emit_text_delta "error: bob: $error_detail"$'\n'
+        bob_failure_detail_emitted=1
+        bob_result_failed=1
+        continue
+    fi
+
     if [[ "$selected_chat_mode" == "ralphex-plan" ]]; then
         if [[ "$event_type" == "message" && "$event_role" == "assistant" && "$event_is_reasoning" != "true" ]]; then
             plan_stream_buffer+="$event_content"
@@ -370,15 +425,6 @@ while IFS= read -r line || [[ -n "$line" ]]; do
                 kill -TERM "$bob_pid" 2>/dev/null || true
                 break
             fi
-        elif [[ "$event_type" == "error" ]]; then
-            # {type:"error"} is bob v2's only failure channel (result.status is
-            # always "success"), so plan runs must surface it too — a swallowed
-            # rate-limit or auth message would otherwise be reported as a
-            # missing plan boundary with no diagnostic.
-            emit_text_delta "error: bob: ${event_message//<<<RALPHEX:/<<< RALPHEX:}"$'\n'
-            bob_failure_detail_emitted=1
-            bob_result_failed=1
-            continue
         fi
         emit_keepalive
         continue
@@ -389,7 +435,9 @@ while IFS= read -r line || [[ -n "$line" ]]; do
     if [[ "$event_type" == "message" && "$event_role" == "assistant" ]]; then
         if [[ "$event_is_reasoning" == "true" ]]; then
             if [[ "$BOB_VERBOSE" == "1" ]]; then
-                flush_task_buffer_lines reasoning "${event_content//<<<RALPHEX:/<<< RALPHEX:}"
+                # not neutralized here — emit_task_chunk does it on flush, after
+                # the buffer has re-assembled tokens split across chunks.
+                flush_task_buffer_lines reasoning "$event_content"
             else
                 emit_keepalive
             fi
@@ -406,11 +454,6 @@ while IFS= read -r line || [[ -n "$line" ]]; do
     elif [[ "$BOB_VERBOSE" == "1" && "$event_type" == "tool_use" ]]; then
         flush_task_buffer_remainder
         emit_text_delta "[tool] ${event_tool//<<<RALPHEX:/<<< RALPHEX:}"$'\n'
-    elif [[ "$event_type" == "error" ]]; then
-        flush_task_buffer_remainder
-        emit_text_delta "error: bob: ${event_message//<<<RALPHEX:/<<< RALPHEX:}"$'\n'
-        bob_failure_detail_emitted=1
-        bob_result_failed=1
     else
         emit_keepalive
     fi

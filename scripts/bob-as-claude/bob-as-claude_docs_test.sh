@@ -266,6 +266,33 @@ assert_contains \
     "$REPO_ROOT/scripts/bob-as-claude/README.md" \
     "BOB_SETTINGS_FILE" \
     "wrapper README documents the settings path override"
+# the grant list is 18 prefixes, not the 8 project ones alone: the read-only tail
+# exists because bob's merge does not recurse into arrays, so a doc that lists only
+# the project prefixes reads as a narrower grant than the installer actually makes.
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    '`du`, `df`' \
+    "wrapper README lists the read-only command prefixes"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "does not recurse into arrays" \
+    "wrapper README explains why read-only prefixes are restated"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    '{toolId, approvedCommands, deniedCommands}' \
+    "wrapper README documents allowedExecutors as an array of records"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "A review prompt additionally requires \`subagent\`" \
+    "wrapper README documents the review-mode subagent preflight requirement"
+assert_not_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "allowedExecutors.execute_command.approvedCommands" \
+    "wrapper README drops the object dot-path for allowedExecutors"
+assert_not_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "15-entry" \
+    "wrapper README drops the unverified default approvedCommands count"
 assert_contains \
     "$REPO_ROOT/scripts/bob-as-claude/README.md" \
     "bob run -f stream-json" \
@@ -394,6 +421,52 @@ assert_contains \
     "custom providers doc documents the settings path override"
 assert_contains \
     "$REPO_ROOT/docs/custom-providers.md" \
+    '`du`, `df`' \
+    "custom providers doc lists the read-only command prefixes"
+assert_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "does not recurse into arrays" \
+    "custom providers doc explains why read-only prefixes are restated"
+assert_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    '{toolId, approvedCommands, deniedCommands}' \
+    "custom providers doc documents allowedExecutors as an array of records"
+assert_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "no shipped mode declares the \`todo\` group" \
+    "custom providers doc corrects the todo group claim"
+assert_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "review phases additionally need \`subagent\`" \
+    "custom providers doc documents the review-mode subagent requirement"
+assert_not_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "allowedExecutors.execute_command.approvedCommands" \
+    "custom providers doc drops the object dot-path for allowedExecutors"
+assert_not_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "15-entry" \
+    "custom providers doc drops the unverified default approvedCommands count"
+# the wrapper fails the run on every error event regardless of severity, so the event
+# table must not promise a severity filter that does not exist in the code.
+assert_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    '| `error` (any `severity`) |' \
+    "custom providers doc event table matches error events at any severity"
+assert_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "The event's \`severity\` field is **not** inspected" \
+    "custom providers doc states severity is not inspected"
+assert_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "unspecified bob error" \
+    "custom providers doc documents the empty-message error placeholder"
+assert_not_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    'severity == "error"' \
+    "custom providers doc drops the stale severity filter claim"
+assert_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
     "spawn_subagent" \
     "custom providers doc documents native parallel review subagents"
 assert_contains \
@@ -501,6 +574,14 @@ assert_contains \
     "top-level README documents the approval grant flag"
 assert_contains \
     "$REPO_ROOT/README.md" \
+    "18-entry command-prefix list" \
+    "top-level README sizes the granted command-prefix list"
+assert_contains \
+    "$REPO_ROOT/README.md" \
+    "does not recurse into arrays" \
+    "top-level README explains why read-only prefixes are restated"
+assert_contains \
+    "$REPO_ROOT/README.md" \
     "BOB_SETTINGS_FILE" \
     "top-level README documents the settings path override"
 # the v1 flags and terminal tool are gone from every live doc. --yolo is excluded here:
@@ -575,6 +656,14 @@ assert_contains \
     "llms.txt documents the approval grant flag"
 assert_contains \
     "$REPO_ROOT/llms.txt" \
+    "18-entry command-prefix list" \
+    "llms.txt sizes the granted command-prefix list"
+assert_contains \
+    "$REPO_ROOT/llms.txt" \
+    "does not recurse into arrays" \
+    "llms.txt explains why read-only prefixes are restated"
+assert_contains \
+    "$REPO_ROOT/llms.txt" \
     "spawn_subagent" \
     "llms.txt documents native parallel review subagents"
 assert_contains \
@@ -623,6 +712,22 @@ assert_contains \
     "$REPO_ROOT/CLAUDE.md" \
     'before automatic selection, and add `--grant-approvals`' \
     "CLAUDE documents the approval grant flag"
+assert_contains \
+    "$REPO_ROOT/CLAUDE.md" \
+    "plus 18 command prefixes" \
+    "CLAUDE sizes the granted command-prefix list"
+assert_contains \
+    "$REPO_ROOT/CLAUDE.md" \
+    "does not recurse into arrays" \
+    "CLAUDE explains why read-only prefixes are restated"
+assert_contains \
+    "$REPO_ROOT/CLAUDE.md" \
+    "ARRAY of \`{toolId, approvedCommands, deniedCommands}\` records" \
+    "CLAUDE documents allowedExecutors as an array of records"
+assert_contains \
+    "$REPO_ROOT/CLAUDE.md" \
+    "\`severity\` is not inspected" \
+    "CLAUDE states error severity is not inspected"
 assert_contains \
     "$REPO_ROOT/CLAUDE.md" \
     "BOB_SETTINGS_FILE" \

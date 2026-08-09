@@ -20,11 +20,24 @@ TMPDIR_TEST=$(mktemp -d)
 # exported so the wrapper and the mock bob subprocess inherit it without a
 # redundant inline env assignment at every call site (avoids SC2097/SC2098)
 export TMPDIR_TEST
-trap 'rm -rf "$TMPDIR_TEST"' EXIT
 
 passed=0
 failed=0
 total=0
+# `set -e` aborts the suite on the first unguarded non-zero command, which without
+# this looks identical to a clean run that printed no summary. Report how far it got
+# so the failing region is findable.
+suite_completed=0
+cleanup() {
+    local status=$?
+    if [[ $suite_completed -eq 0 ]]; then
+        echo "" >&2
+        echo "ABORTED: suite exited early with status $status after $total assertions" \
+             "($passed passed, $failed failed)" >&2
+    fi
+    rm -rf "$TMPDIR_TEST"
+}
+trap cleanup EXIT
 
 pass() {
     passed=$((passed + 1))
@@ -53,6 +66,7 @@ import (
 	"io"
 	"os"
 	"reflect"
+	"slices"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -193,16 +207,11 @@ func validate(path string, strict bool) {
 			}
 			actualGroups = append(actualGroups, name)
 		}
-		seenGroups := make(map[string]bool, len(actualGroups))
-		for _, name := range actualGroups {
-			if seenGroups[name] {
-				invalid("mode %s declares duplicate group %q", current.Slug, name)
-			}
-			seenGroups[name] = true
-		}
-		if current.Slug == "ralphex-review" && !seenGroups["subagent"] {
+		if current.Slug == "ralphex-review" && !slices.Contains(actualGroups, "subagent") {
 			invalid("mode %s must grant the subagent group", current.Slug)
 		}
+		// the exact-match check below also rejects duplicates, since every expected
+		// list is unique — no separate duplicate scan is needed.
 		if !reflect.DeepEqual(actualGroups, expectedGroups) {
 			invalid(
 				"mode %s has groups %v, expected %v",
@@ -359,20 +368,10 @@ else
     fail "unexpected shipped mode file count" "count: $shipped_mode_count"
 fi
 
-# every shipped mode file declares only names from bob v2's group allow-list.
-invalid_group_names=$(
-    awk '
-        /^    groups:/ { in_groups = 1; next }
-        in_groups && /^      - [a-z]+$/ { print $2; next }
-        in_groups && !/^      / { in_groups = 0 }
-    ' "$SCRIPT_DIR"/modes/*.yaml |
-        grep -vxE 'read|edit|execute|mcp|skill|todo|subagent|mode' || true
-)
-if [[ -z "$invalid_group_names" ]]; then
-    pass "shipped modes declare only valid bob v2 group names"
-else
-    fail "shipped modes declare unknown group names" "$invalid_group_names"
-fi
+# the group allow-list is enforced by the YAML validator above (validGroupNames),
+# which parses the document instead of pattern-matching indentation. A second awk
+# scan here would fail open on any re-indentation, so it is deliberately absent;
+# the mutant below proves the validator's check can fail.
 
 mutant_dir="$TMPDIR_TEST/mode-mutants"
 mkdir -p "$mutant_dir"
@@ -393,12 +392,13 @@ assert_yaml_invalid \
     "must grant the subagent group" \
     --strict "$mutant_dir/no-subagent.yaml"
 
-# bob drops a whole mode document that repeats a group entry.
+# bob drops a whole mode document that repeats a group entry. The exact-match check
+# reports it as a group-set mismatch, since no expected list contains duplicates.
 sed 's/^      - edit$/      - read/' \
     "$SCRIPT_DIR/modes/ralphex-task.yaml" > "$mutant_dir/duplicate-group.yaml"
 assert_yaml_invalid \
     "validator rejects a duplicate group entry" \
-    "duplicate group" \
+    "expected" \
     --strict "$mutant_dir/duplicate-group.yaml"
 
 # the required-instruction contract must be able to fail: renaming the tool the review
@@ -530,25 +530,15 @@ else
     fail "review prompt did not select ralphex-review" "args: $recorded"
 fi
 
+# full-string equality already proves nothing was inserted anywhere in PATH, so no
+# separate first-entry check is needed. A source-text ban on the words "guard"/"shim"
+# is not asserted either: it would fail on an explanatory comment while a shim built
+# under a different name would pass.
 recorded_path=$(cat "$TMPDIR_TEST/bob_path")
 if [[ "$recorded_path" == "$expected_path" ]]; then
     pass "no guard-shim directory prepended to PATH for ralphex-review"
 else
     fail "PATH altered for ralphex-review" "got: $recorded_path"
-fi
-
-# the first PATH entry is the mock directory itself, so nothing was inserted
-# ahead of it, and no shim stub directory exists under the wrapper's tmp dir.
-if [[ "${recorded_path%%:*}" == "$TMPDIR_TEST" ]]; then
-    pass "mock directory remains the first PATH entry for ralphex-review"
-else
-    fail "unexpected first PATH entry for ralphex-review" "got: ${recorded_path%%:*}"
-fi
-
-if grep -qE 'exit 64|guard|shim' "$WRAPPER"; then
-    fail "wrapper still references a guard shim"
-else
-    pass "wrapper source contains no guard-shim stubs"
 fi
 
 # ---------------------------------------------------------------------------
@@ -1054,6 +1044,77 @@ if echo "$error_signal_output" | grep -q "<<<RALPHEX:ALL_TASKS_DONE>>>"; then
     fail "error event leaked a live ralphex signal" "got: $error_signal_output"
 else
     pass "error event signal token neutralized"
+fi
+
+# an error event carrying no usable message must still name something searchable:
+# a bare "error: bob:" line tells the user nothing about why the run failed.
+assert_error_placeholder() {
+    local label="$1"
+    local event="$2"
+    local placeholder_output=""
+    local placeholder_exit=0
+
+    printf '%s\n' "$event" > "$TMPDIR_TEST/error_empty_events.jsonl"
+    set +e
+    placeholder_output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/error_empty_events.jsonl" \
+        PATH="$TMPDIR_TEST:$PATH" \
+        bash "$WRAPPER" -p "test prompt" 2>/dev/null)
+    placeholder_exit=$?
+    set -e
+
+    if echo "$placeholder_output" | grep -q "error: bob: unspecified bob error" &&
+        [[ $placeholder_exit -ne 0 ]]; then
+        pass "$label"
+    else
+        fail "$label" "exit: $placeholder_exit output: $placeholder_output"
+    fi
+}
+
+assert_error_placeholder "error event with no message field names a placeholder cause" \
+    '{"type":"error","timestamp":"t","severity":"error"}'
+assert_error_placeholder "error event with an empty message names a placeholder cause" \
+    '{"type":"error","timestamp":"t","severity":"error","message":""}'
+assert_error_placeholder "error event with a whitespace message names a placeholder cause" \
+    '{"type":"error","timestamp":"t","severity":"error","message":"   "}'
+
+# severity is not inspected: bob may label an error event "warning" or omit the
+# field entirely, and either way {type:"error"} is the failure channel.
+cat > "$TMPDIR_TEST/error_severity_events.jsonl" << 'EOF'
+{"type":"error","timestamp":"t","severity":"warning","message":"quota exhausted"}
+EOF
+set +e
+error_severity_output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/error_severity_events.jsonl" \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "test prompt" 2>/dev/null)
+error_severity_exit=$?
+set -e
+if echo "$error_severity_output" | grep -q "error: bob: quota exhausted" &&
+    [[ $error_severity_exit -ne 0 ]]; then
+    pass "error event with a non-error severity still fails the run"
+else
+    fail "error event severity changed the outcome" \
+        "exit: $error_severity_exit output: $error_severity_output"
+fi
+
+# result.status is always "success" in v2, but a hypothetical error status must not
+# be mistaken for a failure channel — the contract is {type:"error"} only.
+cat > "$TMPDIR_TEST/result_status_error_events.jsonl" << 'EOF'
+{"type":"message","timestamp":"t","role":"assistant","content":"finished\n","isReasoning":false}
+{"type":"result","timestamp":"t","status":"error","stats":{}}
+EOF
+set +e
+result_status_output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/result_status_error_events.jsonl" \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "test prompt" 2>/dev/null)
+result_status_exit=$?
+set -e
+if [[ $result_status_exit -eq 0 ]] &&
+    echo "$result_status_output" | grep -q '"finished' &&
+    ! echo "$result_status_output" | grep -q "error: bob:"; then
+    pass "result.status is not treated as a failure channel"
+else
+    fail "result.status changed the run outcome" \
+        "exit: $result_status_exit output: $result_status_output"
 fi
 
 # a failed tool_result whose `error` is a bare string instead of {message: ...}
@@ -1777,6 +1838,104 @@ assert_bare_plan_boundary "bare TASK_FAILED forwarded alone" \
 assert_bare_plan_boundary "earliest boundary wins over a later PLAN_DRAFT" \
     $'<<<RALPHEX:PLAN_READY>>>\n<<<RALPHEX:PLAN_DRAFT>>>\nlate draft\n<<<RALPHEX:END>>>\n' \
     '<<<RALPHEX:PLAN_READY>>>'
+# a bare marker quoted INSIDE a draft is the model narrating the protocol, not a
+# boundary. Accepting it would discard the whole draft and report a plan run as
+# complete with nothing for the user to review.
+assert_bare_plan_boundary "bare marker quoted inside a draft body is not a boundary" \
+    $'<<<RALPHEX:PLAN_DRAFT>>>\n# Draft\nI will emit <<<RALPHEX:PLAN_READY>>> once written.\n<<<RALPHEX:END>>>\n' \
+    $'<<<RALPHEX:PLAN_DRAFT>>>\n# Draft\nI will emit <<<RALPHEX:PLAN_READY>>> once written.\n<<<RALPHEX:END>>>'
+# same hole, but split across deltas: the draft is still open when the quoted
+# marker arrives, so the first loop has no candidate yet to compare against.
+cat > "$TMPDIR_TEST/plan_quoted_marker_split.jsonl" << 'EOF'
+{"type":"message","timestamp":"t","role":"assistant","content":"<<<RALPHEX:PLAN_DRAFT>>>\n# Draft\nI will emit <<<RALPHEX:PLAN_READY>>> once the file is written.\n","isReasoning":false}
+{"type":"message","timestamp":"t","role":"assistant","content":"## Overview\nBody.\n<<<RALPHEX:END>>>\n","isReasoning":false}
+{"type":"result","timestamp":"t","status":"success","stats":{}}
+EOF
+quoted_marker_text=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/plan_quoted_marker_split.jsonl" \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "$plan_prompt" 2>/dev/null |
+    jq -r 'select(.type=="content_block_delta" and .delta.text != "") | .delta.text')
+if [[ "$quoted_marker_text" == '<<<RALPHEX:PLAN_DRAFT>>>'* ]] &&
+    echo "$quoted_marker_text" | grep -q 'Body.' &&
+    echo "$quoted_marker_text" | grep -q '<<<RALPHEX:END>>>'; then
+    pass "streamed draft survives a bare marker quoted before its END"
+else
+    fail "streamed draft discarded in favour of a quoted bare marker" \
+        "text: $quoted_marker_text"
+fi
+
+# ---------------------------------------------------------------------------
+# test: after a valid plan boundary the wrapper terminates bob and normalizes the
+# exit status. Bob keeps working autonomously otherwise, so a slow-exiting bob
+# must not hold the wrapper open, and bob's own status must not leak.
+# ---------------------------------------------------------------------------
+echo "test: plan boundary terminates bob"
+
+plan_stop_bin="$TMPDIR_TEST/plan_stop_bin"
+mkdir -p "$plan_stop_bin"
+cat > "$plan_stop_bin/bob" << 'PLAN_STOP_EOF'
+#!/usr/bin/env bash
+cat > /dev/null  # consume the prompt
+echo $$ > "$TMPDIR_TEST/plan_stop_pid"
+printf '%s\n' '{"type":"message","timestamp":"t","role":"assistant","content":"<<<RALPHEX:PLAN_READY>>>\n","isReasoning":false}'
+exec sleep 30
+PLAN_STOP_EOF
+chmod +x "$plan_stop_bin/bob"
+
+rm -f "$TMPDIR_TEST/plan_stop_pid"
+plan_stop_start=$SECONDS
+set +e
+plan_stop_output=$(PATH="$plan_stop_bin:$PATH" bash "$WRAPPER" -p "$plan_prompt" 2>/dev/null)
+plan_stop_exit=$?
+set -e
+plan_stop_elapsed=$((SECONDS - plan_stop_start))
+
+if [[ $plan_stop_exit -eq 0 && $plan_stop_elapsed -lt 20 ]]; then
+    pass "wrapper returns promptly with status 0 after a plan boundary"
+else
+    fail "wrapper did not stop cleanly after a plan boundary" \
+        "exit: $plan_stop_exit elapsed: ${plan_stop_elapsed}s"
+fi
+if echo "$plan_stop_output" | grep -q '<<<RALPHEX:PLAN_READY>>>'; then
+    pass "plan boundary emitted before bob was terminated"
+else
+    fail "plan boundary lost when bob was terminated" "got: $plan_stop_output"
+fi
+
+plan_stop_pid=$(cat "$TMPDIR_TEST/plan_stop_pid" 2>/dev/null || echo "")
+if [[ -n "$plan_stop_pid" ]]; then
+    for _ in $(seq 1 20); do
+        kill -0 "$plan_stop_pid" 2>/dev/null || break
+        sleep 0.1
+    done
+fi
+if [[ -n "$plan_stop_pid" ]] && kill -0 "$plan_stop_pid" 2>/dev/null; then
+    fail "bob still running after the plan boundary" "pid: $plan_stop_pid"
+    kill -9 "$plan_stop_pid" 2>/dev/null || true
+else
+    pass "bob terminated after the plan boundary"
+fi
+rm -rf "$plan_stop_bin"
+
+# the intentional stop must also override a non-zero status from the terminated
+# bob, otherwise every successful plan iteration would look like a failure.
+printf '%s\n' \
+    '{"type":"message","timestamp":"t","role":"assistant","content":"<<<RALPHEX:PLAN_READY>>>\n","isReasoning":false}' \
+    > "$TMPDIR_TEST/plan_stop_code.jsonl"
+set +e
+plan_stop_code_output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/plan_stop_code.jsonl" \
+    MOCK_EXIT_CODE=1 \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "$plan_prompt" 2>/dev/null)
+plan_stop_code_exit=$?
+set -e
+if [[ $plan_stop_code_exit -eq 0 ]] &&
+    echo "$plan_stop_code_output" | grep -q '<<<RALPHEX:PLAN_READY>>>'; then
+    pass "intentional stop overrides bob's non-zero exit after a plan boundary"
+else
+    fail "bob's exit code leaked past an emitted plan boundary" \
+        "exit: $plan_stop_code_exit output: $plan_stop_code_output"
+fi
 
 # ---------------------------------------------------------------------------
 # test: signal passthrough in assistant message text
@@ -1870,6 +2029,73 @@ if [[ "$signal_blocks" == "1" ]] &&
 else
     fail "split signal produced more than one text block" \
         "blocks: $signal_blocks output: $output"
+fi
+
+# ---------------------------------------------------------------------------
+# test: a non-message event arriving mid-line flushes the partial remainder under
+# the kind it was buffered as, so a half-written signal is never spliced into the
+# text that follows and reasoning text is never promoted to a live signal.
+# ---------------------------------------------------------------------------
+echo "test: partial line flushed on kind change"
+
+# a tool_result error between two halves of a signal line: the halves must not
+# join across it, so no live signal may appear anywhere in the output.
+cat > "$TMPDIR_TEST/partial_line_tool_error.jsonl" << 'EOF'
+{"type":"message","timestamp":"t","role":"assistant","content":"<<<RALPHEX:ALL","isReasoning":false}
+{"type":"tool_result","timestamp":"t","tool_id":"tool-1","status":"error","error":{"type":"execution","message":"command failed"}}
+{"type":"message","timestamp":"t","role":"assistant","content":"_TASKS_DONE>>>\n","isReasoning":false}
+{"type":"result","timestamp":"t","status":"success","stats":{}}
+EOF
+partial_tool_output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/partial_line_tool_error.jsonl" \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "test prompt" 2>/dev/null)
+if echo "$partial_tool_output" | grep -q "\[tool_error\] command failed" &&
+    ! echo "$partial_tool_output" | grep -q '<<<RALPHEX:ALL_TASKS_DONE>>>'; then
+    pass "tool_result error between signal halves does not splice them together"
+else
+    fail "partial signal line survived a tool_result error" "got: $partial_tool_output"
+fi
+
+# with BOB_VERBOSE=1 reasoning shares the line buffer with answer text. A signal
+# token split across two reasoning chunks is re-assembled by the buffer, so
+# neutralization has to happen on flush — a per-chunk substitution matches neither
+# half and would emit a live signal the model never actually produced.
+cat > "$TMPDIR_TEST/split_reasoning_signal.jsonl" << 'EOF'
+{"type":"message","timestamp":"t","role":"assistant","content":"planning <<<RALP","isReasoning":true}
+{"type":"message","timestamp":"t","role":"assistant","content":"HEX:ALL_TASKS_DONE>>>\n","isReasoning":true}
+{"type":"message","timestamp":"t","role":"assistant","content":"real answer\n","isReasoning":false}
+{"type":"result","timestamp":"t","status":"success","stats":{}}
+EOF
+split_reasoning_output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/split_reasoning_signal.jsonl" \
+    BOB_VERBOSE=1 \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "test prompt" 2>/dev/null)
+if echo "$split_reasoning_output" | grep -q '<<< RALPHEX:ALL_TASKS_DONE>>>' &&
+    ! echo "$split_reasoning_output" | grep -q '<<<RALPHEX:ALL_TASKS_DONE>>>'; then
+    pass "signal split across reasoning chunks is neutralized after re-assembly"
+else
+    fail "reasoning-split signal token was not neutralized" \
+        "got: $split_reasoning_output"
+fi
+
+# a reasoning chunk with no newline followed by real answer text: the remainder is
+# flushed as reasoning (neutralized) and the answer line stays live.
+cat > "$TMPDIR_TEST/reasoning_remainder_signal.jsonl" << 'EOF'
+{"type":"message","timestamp":"t","role":"assistant","content":"about to emit <<<RALPHEX:REVIEW_DONE>>>","isReasoning":true}
+{"type":"message","timestamp":"t","role":"assistant","content":"<<<RALPHEX:ALL_TASKS_DONE>>>\n","isReasoning":false}
+{"type":"result","timestamp":"t","status":"success","stats":{}}
+EOF
+reasoning_remainder_output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/reasoning_remainder_signal.jsonl" \
+    BOB_VERBOSE=1 \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "test prompt" 2>/dev/null)
+if echo "$reasoning_remainder_output" | grep -q '<<< RALPHEX:REVIEW_DONE>>>' &&
+    ! echo "$reasoning_remainder_output" | grep -q '<<<RALPHEX:REVIEW_DONE>>>' &&
+    echo "$reasoning_remainder_output" | grep -q '<<<RALPHEX:ALL_TASKS_DONE>>>'; then
+    pass "newline-less reasoning remainder is neutralized without touching the answer"
+else
+    fail "reasoning remainder handling changed the answer signal" \
+        "got: $reasoning_remainder_output"
 fi
 
 # ---------------------------------------------------------------------------
@@ -2393,10 +2619,10 @@ preflight_settings="$preflight_home/.bob/settings/settings.json"
 mkdir -p "$preflight_home/.bob/settings"
 
 # runs the wrapper against $preflight_settings; sets preflight_err/preflight_rc.
-# $preflight_prompt selects the mode the preflight sees (task by default).
-preflight_prompt="test prompt"
+# $2 is the prompt, which selects the mode the preflight sees (task by default).
 run_preflight() {
     local settings="$1"
+    local prompt="${2:-test prompt}"
     if [[ "$settings" == "MISSING" ]]; then
         rm -f "$preflight_settings"
     else
@@ -2408,7 +2634,7 @@ run_preflight() {
     preflight_err=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
         HOME="$preflight_home" \
         PATH="$TMPDIR_TEST:$PATH" \
-        env -u BOB_SETTINGS_FILE bash "$WRAPPER" -p "$preflight_prompt" 2>&1 >/dev/null) ||
+        env -u BOB_SETTINGS_FILE bash "$WRAPPER" -p "$prompt" 2>&1 >/dev/null) ||
         preflight_rc=$?
 }
 
@@ -2417,7 +2643,7 @@ assert_preflight_warns() {
     local label="$1"
     local settings="$2"
 
-    run_preflight "$settings"
+    run_preflight "$settings" "${3:-}"
     if echo "$preflight_err" | grep -qi "warning:.*approval"; then
         pass "$label: approval warning emitted"
     else
@@ -2439,7 +2665,7 @@ assert_preflight_silent() {
     local label="$1"
     local settings="$2"
 
-    run_preflight "$settings"
+    run_preflight "$settings" "${3:-}"
     if echo "$preflight_err" | grep -qi "warning:.*approval"; then
         fail "$label: unexpected approval warning" "stderr: $preflight_err"
     else
@@ -2486,16 +2712,35 @@ fi
 # review mode drives native subagents, so it additionally needs the subagent
 # permission; task mode does not, and warning there would be a false alarm.
 subagent_settings='{"approval":{"allowed_permissions":["read","edit","execute"],"autoApprovalEnabled":true}}'
-preflight_prompt='## Step 2: Launch ALL 5 Review Agents IN PARALLEL'
-run_preflight "$subagent_settings"
+run_preflight "$subagent_settings" '## Step 2: Launch ALL 5 Review Agents IN PARALLEL'
 if echo "$preflight_err" | grep -qi "warning:.*subagent"; then
     pass "review mode warns when the subagent permission is missing"
 else
     fail "review mode did not warn about a missing subagent permission" \
         "stderr: $preflight_err"
 fi
-preflight_prompt="test prompt"
 assert_preflight_silent "task mode without subagent permission" "$subagent_settings"
+
+# the default settings path is derived from HOME, which a sanitized parent env may
+# not set. The preflight is a warning, so an unset HOME must degrade to "cannot
+# check" and let the run proceed, not abort the wrapper under `set -u`.
+rm -f "$TMPDIR_TEST/bob_args"
+nohome_rc=0
+nohome_err=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
+    PATH="$TMPDIR_TEST:$PATH" \
+    env -u HOME -u BOB_SETTINGS_FILE bash "$WRAPPER" -p "test prompt" 2>&1 >/dev/null) ||
+    nohome_rc=$?
+if [[ $nohome_rc -eq 0 && -f "$TMPDIR_TEST/bob_args" ]]; then
+    pass "wrapper runs with HOME unset"
+else
+    fail "wrapper aborted with HOME unset" "rc: $nohome_rc stderr: $nohome_err"
+fi
+if echo "$nohome_err" | grep -qi "warning:.*HOME is unset" &&
+    echo "$nohome_err" | grep -qF "BOB_SETTINGS_FILE"; then
+    pass "unset HOME reported as an uncheckable approval preflight"
+else
+    fail "unset HOME not reported by the preflight" "stderr: $nohome_err"
+fi
 
 # the preflight is read-only: it must never create or modify bob's settings.
 if [[ ! -e "$preflight_home/.bob/custom_modes.yaml" &&
@@ -3163,9 +3408,14 @@ else
     fail "approval merge followed or accepted a symlinked settings target"
 fi
 
-# an unknown installer argument is rejected instead of silently ignored.
+# an unknown installer argument is rejected instead of silently ignored, and it is
+# rejected before anything is written. A fresh case dir makes the "wrote nothing"
+# half of that assertion meaningful — reusing a dir another case already populated
+# would pass whether or not the argument check ran first.
+unknown_dir="$approval_root/unknown-arg"
+mkdir -p "$unknown_dir/home"
 set +e
-unknown_output=$(run_installer_approval "$optout_dir" --grant-approval 2>&1)
+unknown_output=$(run_installer_approval "$unknown_dir" --grant-approval 2>&1)
 unknown_exit=$?
 set -e
 if [[ $unknown_exit -ne 0 && "$unknown_output" == *"unknown argument"* ]]; then
@@ -3173,10 +3423,87 @@ if [[ $unknown_exit -ne 0 && "$unknown_output" == *"unknown argument"* ]]; then
 else
     fail "installer accepted an unknown argument" "output: $unknown_output"
 fi
+if [[ ! -e "$unknown_dir/custom_modes.yaml" && ! -e "$unknown_dir/settings.json" ]]; then
+    pass "installer writes nothing when an argument is unknown"
+else
+    fail "installer wrote files before rejecting an unknown argument"
+fi
+
+# --grant-approvals with no BOB_SETTINGS_FILE must land on bob's real default path
+# under HOME. Nothing else exercises that branch, since every case above overrides
+# it, and the wrapper's preflight must then find those same settings.
+default_path_home="$approval_root/default-path-home"
+mkdir -p "$default_path_home"
+HOME="$default_path_home" \
+    BOB_CUSTOM_MODES_FILE="$approval_root/default-path-modes.yaml" \
+    env -u BOB_SETTINGS_FILE bash "$INSTALLER" --grant-approvals >/dev/null 2>&1
+default_path_settings="$default_path_home/.bob/settings/settings.json"
+if [[ -f "$default_path_settings" ]] && jq empty "$default_path_settings" 2>/dev/null; then
+    pass "installer defaults the approval target to \$HOME/.bob/settings/settings.json"
+else
+    fail "installer did not write the default approval settings path"
+fi
+
+default_path_warn_rc=0
+default_path_warn=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
+    HOME="$default_path_home" \
+    PATH="$TMPDIR_TEST:$PATH" \
+    env -u BOB_SETTINGS_FILE bash "$WRAPPER" -p "test prompt" 2>&1 >/dev/null) ||
+    default_path_warn_rc=$?
+if [[ $default_path_warn_rc -eq 0 ]] &&
+    ! echo "$default_path_warn" | grep -qi "warning:.*approval"; then
+    pass "wrapper preflight accepts the installer's default-path grant for a task prompt"
+else
+    fail "wrapper warned about the installer's default-path grant (task prompt)" \
+        "stderr: $default_path_warn"
+fi
+
+default_path_review_rc=0
+default_path_review=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
+    HOME="$default_path_home" \
+    PATH="$TMPDIR_TEST:$PATH" \
+    env -u BOB_SETTINGS_FILE bash "$WRAPPER" \
+    -p '## Step 2: Launch ALL 5 Review Agents IN PARALLEL' 2>&1 >/dev/null) ||
+    default_path_review_rc=$?
+if [[ $default_path_review_rc -eq 0 ]] &&
+    ! echo "$default_path_review" | grep -qi "warning:.*approval"; then
+    pass "wrapper preflight accepts the installer's default-path grant for a review prompt"
+else
+    fail "wrapper warned about the installer's default-path grant (review prompt)" \
+        "stderr: $default_path_review"
+fi
+
+# --grant-approvals depends on jq for every merge step, so its absence must fail
+# before the target is touched rather than part-way through.
+nojq_dir="$approval_root/no-jq"
+mkdir -p "$nojq_dir/home" "$nojq_dir/bin"
+for tool in bash cat cp mv rm ln mkdir dirname basename mktemp awk grep sed \
+    tail head wc sort tr cut ls touch env diff printf; do
+    tool_path=$(command -v "$tool" 2>/dev/null) || continue
+    ln -sf "$tool_path" "$nojq_dir/bin/$tool"
+done
+set +e
+nojq_output=$(HOME="$nojq_dir/home" \
+    BOB_CUSTOM_MODES_FILE="$nojq_dir/custom_modes.yaml" \
+    BOB_SETTINGS_FILE="$nojq_dir/settings.json" \
+    PATH="$nojq_dir/bin" bash "$INSTALLER" --grant-approvals 2>&1)
+nojq_exit=$?
+set -e
+if [[ $nojq_exit -ne 0 && "$nojq_output" == *"jq is required"* ]]; then
+    pass "installer reports a missing jq for --grant-approvals"
+else
+    fail "installer did not report a missing jq" "exit: $nojq_exit; output: $nojq_output"
+fi
+if [[ ! -e "$nojq_dir/settings.json" ]]; then
+    pass "installer creates no settings file when jq is missing"
+else
+    fail "installer wrote settings without jq"
+fi
 
 # ---------------------------------------------------------------------------
 # summary
 # ---------------------------------------------------------------------------
+suite_completed=1
 echo ""
 echo "results: $passed passed, $failed failed, $total total"
 
