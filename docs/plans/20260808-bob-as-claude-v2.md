@@ -190,15 +190,15 @@ Scope note: reuse the v2 mock helper from Task 4; do not reshape it again.
 - Modify: `CLAUDE.md`, `llms.txt`, `README.md`
 - Modify: `scripts/bob-as-claude/bob-as-claude_docs_test.sh`
 
-- [ ] Rewrite the bob wrapper section of `docs/custom-providers.md`: the `bob run -f stream-json --mode= --trust` invocation, the v2 event table (`message` with `isReasoning`, `tool_use`, `tool_result` with `error.message`, `result` with `stats`, `error`), the valid tool-group list, and the removal of `attempt_completion`, `--yolo`, and model selection
-- [ ] Document the approval prerequisite in `docs/custom-providers.md`: why headless bob cannot prompt, what `~/.bob/settings/settings.json` must contain, how to grant it with the installer flag, and that broadening `approvedCommands` affects all bob usage
-- [ ] Document that review runs use native `spawn_subagent` in parallel, that subagent activity produces no stream events, and that a generous or disabled `idle_timeout` is therefore recommended for bob review phases
-- [ ] Add a short caveat that bob v2 auto-loads skills from `~/.claude/skills`, so a conflicting skill can compete with the ralphex prompt
-- [ ] Update `scripts/bob-as-claude/README.md` with the v2 invocation, the two-step setup (install modes, then grant approvals), the `BOB_*` variables, and the removal of model selection
-- [ ] Update the bob wrapper description in `CLAUDE.md`, `llms.txt`, and `README.md` so no mention of `--chat-mode`, `--yolo`, `--output-format=stream-json`, `--hide-intermediary-output`, `attempt_completion`, or `-m`/`BOB_MODEL` model forwarding remains
-- [ ] State the minimum supported version as bob 2.0.0 in `llms.txt` requirements and in `docs/custom-providers.md`, noting that bob 1.0.x is not supported by this wrapper
-- [ ] Update `scripts/bob-as-claude/bob-as-claude_docs_test.sh` assertions to match the new documentation, replacing v1 term assertions with v2 ones and adding `assert_not_contains` checks for the removed v1 flags
-- [ ] Verify with `bash scripts/bob-as-claude/bob-as-claude_docs_test.sh`
+- [x] Rewrite the bob wrapper section of `docs/custom-providers.md`: the `bob run -f stream-json --mode= --trust` invocation, the v2 event table (`message` with `isReasoning`, `tool_use`, `tool_result` with `error.message`, `result` with `stats`, `error`), the valid tool-group list, and the removal of `attempt_completion`, `--yolo`, and model selection
+- [x] Document the approval prerequisite in `docs/custom-providers.md`: why headless bob cannot prompt, what `~/.bob/settings/settings.json` must contain, how to grant it with the installer flag, and that broadening `approvedCommands` affects all bob usage
+- [x] Document that review runs use native `spawn_subagent` in parallel, that subagent activity produces no stream events, and that a generous or disabled `idle_timeout` is therefore recommended for bob review phases
+- [x] Add a short caveat that bob v2 auto-loads skills from `~/.claude/skills`, so a conflicting skill can compete with the ralphex prompt
+- [x] Update `scripts/bob-as-claude/README.md` with the v2 invocation, the two-step setup (install modes, then grant approvals), the `BOB_*` variables, and the removal of model selection
+- [x] Update the bob wrapper description in `CLAUDE.md`, `llms.txt`, and `README.md` so no mention of `--chat-mode`, `--yolo`, `--output-format=stream-json`, `--hide-intermediary-output`, `attempt_completion`, or `-m`/`BOB_MODEL` model forwarding remains
+- [x] State the minimum supported version as bob 2.0.0 in `llms.txt` requirements and in `docs/custom-providers.md`, noting that bob 1.0.x is not supported by this wrapper
+- [x] Update `scripts/bob-as-claude/bob-as-claude_docs_test.sh` assertions to match the new documentation, replacing v1 term assertions with v2 ones and adding `assert_not_contains` checks for the removed v1 flags
+- [x] Verify with `bash scripts/bob-as-claude/bob-as-claude_docs_test.sh`
 
 ### Task 10: Verify acceptance criteria
 

@@ -901,7 +901,7 @@ Agents to launch:
 - `gemini` - alternative provider for Claude phases (optional, via `scripts/gemini-as-claude/`)
 - `agy` - Antigravity CLI, alternative provider for Claude phases (optional, via `scripts/agy-as-claude/`)
 - `pi` - alternative provider for Claude phases (optional, via `scripts/pi-as-claude/`)
-- `bob` - IBM Bob Shell CLI, alternative provider for Claude phases (optional, via `scripts/bob-as-claude/`)
+- `bob` - IBM Bob Shell CLI 2.0.0+, alternative provider for Claude phases (optional, via `scripts/bob-as-claude/`; bob 1.0.x is not supported by the wrapper)
 
 ## Configuration
 
@@ -1117,9 +1117,13 @@ Working examples are included:
 - [`scripts/agy-as-claude/agy-as-claude.sh`](https://github.com/umputun/ralphex/blob/master/scripts/agy-as-claude/agy-as-claude.sh) wraps the Antigravity (`agy`) CLI — Google's successor to Gemini CLI — for the implementation slot
 - [`scripts/opencode/opencode-as-claude.sh`](https://github.com/umputun/ralphex/blob/master/scripts/opencode/opencode-as-claude.sh) wraps OpenCode CLI for the implementation slot, and `scripts/opencode/opencode-review.sh` is shipped alongside as a turn-key custom review script
 - [`scripts/pi-as-claude/pi-as-claude.sh`](https://github.com/umputun/ralphex/blob/master/scripts/pi-as-claude/pi-as-claude.sh) wraps the pi CLI, translating its `--mode json` JSONL events into Claude-compatible events
-- [`scripts/bob-as-claude/bob-as-claude.sh`](https://github.com/umputun/ralphex/blob/master/scripts/bob-as-claude/bob-as-claude.sh) wraps the IBM Bob Shell CLI, translating its `--output-format=stream-json` events into Claude-compatible events
+- [`scripts/bob-as-claude/bob-as-claude.sh`](https://github.com/umputun/ralphex/blob/master/scripts/bob-as-claude/bob-as-claude.sh) wraps the IBM Bob Shell CLI (2.0.0+), translating its `bob run -f stream-json` events into Claude-compatible events
 
-The Bob wrapper ships `scripts/bob-as-claude/modes/ralphex-task.yaml`, `ralphex-review.yaml`, and `ralphex-plan.yaml`. Install them with `bash scripts/bob-as-claude/install-modes.sh` before automatic phase selection. The installer safely merges into Bob's active global `~/.bob/settings/custom_modes.yaml`, preserves a legacy `~/.bob/custom_modes.yaml` for Bob's migration path, preserves unrelated modes, and leaves existing ralphex slugs as user-owned overrides. Project-level `.bob/custom_modes.yaml` entries take precedence; remove an existing ralphex entry before reinstalling when you want the latest shipped definition. Automatic selection maps review start markers to `ralphex-review`, the complete `QUESTION`/`PLAN_DRAFT`/`PLAN_READY` signal set to `ralphex-plan`, and task/finalize prompts to `ralphex-task`; `BOB_CHAT_MODE=<slug>` overrides this mapping with any built-in or custom slug. Review runs block nested `bob`, `claude`, and `codex` launches and execute review assignments sequentially in the current Bob session. Plan runs validate and stop at the first complete boundary, including recovery from intermediary Bob output when its final completion summary is malformed.
+The Bob wrapper requires bob 2.0.0 or newer — it runs `bob run -f stream-json --mode=<slug> --trust` and contains no v1 compatibility layer. bob v2 has no model selection, so `--model`, `--effort`, and `BOB_MODEL` are accepted, noted on stderr, and ignored.
+
+It ships `scripts/bob-as-claude/modes/ralphex-task.yaml`, `ralphex-review.yaml`, and `ralphex-plan.yaml`. Install them with `bash scripts/bob-as-claude/install-modes.sh` before automatic phase selection. The installer safely merges into Bob's active global `~/.bob/settings/custom_modes.yaml`, preserves a legacy `~/.bob/custom_modes.yaml` for Bob's migration path, preserves unrelated modes, and leaves existing ralphex slugs as user-owned overrides. Project-level `.bob/custom_modes.yaml` entries take precedence; remove an existing ralphex entry before reinstalling when you want the latest shipped definition. Automatic selection maps review start markers to `ralphex-review`, the complete `QUESTION`/`PLAN_DRAFT`/`PLAN_READY` signal set to `ralphex-plan`, and task/finalize prompts to `ralphex-task`; `BOB_CHAT_MODE=<slug>` overrides this mapping with any built-in or custom slug.
+
+Headless `bob run` cannot prompt for tool approval and v2 removed `--yolo`, so approvals come only from `~/.bob/settings/settings.json` — whose defaults are read-only. Run `bash scripts/bob-as-claude/install-modes.sh --grant-approvals` to union in the `edit`/`execute`/`subagent`/`todo` permissions plus a documented command-prefix list; the flag is opt-in because bob offers no per-run override, so the grant affects all bob usage on the machine. The wrapper never writes to `~/.bob/` and only warns when the settings are missing or blocked. Review runs use bob v2's native subagents in parallel and consolidate their findings; because subagent activity emits no stream events, give bob review phases a generous or disabled `idle_timeout`. Plan runs validate and stop at the first complete boundary detected in assistant text, and fail closed when none arrives.
 
 To use the included Copilot wrapper:
 
@@ -1157,9 +1161,11 @@ Provider-specific environment variables:
 - `PI_PROVIDER`, `PI_MODEL`, `PI_THINKING` - pi provider, model, and thinking-level selection (used when ralphex does not append `--model`/`--effort`)
 - `PI_VERBOSE` - set to `1` to include tool execution events in the stream (default: `0`, only assistant text is shown)
 - `PI_EXTRA_ARGS` - extra flags appended verbatim to the pi invocation (word-split on whitespace); e.g. `--nolo-mode full` to auto-approve tools in non-interactive runs
-- `BOB_CHAT_MODE`, `BOB_MODEL` - bob chat-mode slug override (built-in or custom; empty enables automatic phase selection) and model selection (bob 1.0.6+)
-- `BOB_VERBOSE` - set to `1` to include task/review `tool_result` output and `[tool]` markers (default: `0`; plan mode emits only a validated boundary)
-- `BOB_EXTRA_ARGS` - extra flags appended verbatim to the bob invocation (word-split on whitespace, no quote preservation); e.g. `--max-coins=100` to cap spend
+- `BOB_CHAT_MODE` - bob mode slug override passed to `--mode` (built-in or custom; empty enables automatic phase selection)
+- `BOB_MODEL` - accepted for compatibility and ignored; bob v2 stable has no model selection
+- `BOB_VERBOSE` - set to `1` to include task/review `tool_result` output, `[tool]` markers, and reasoning text (default: `0`; plan mode emits only a validated boundary)
+- `BOB_EXTRA_ARGS` - extra flags appended verbatim to the bob invocation (word-split on whitespace, no quote preservation); e.g. `--max-cost=5` to cap spend
+- `BOB_SETTINGS_FILE` - override the bob approval-settings path (default `~/.bob/settings/settings.json`) read by the wrapper's preflight and written by `install-modes.sh --grant-approvals`
 
 See [custom providers documentation](https://github.com/umputun/ralphex/blob/master/docs/custom-providers.md) for a detailed guide on writing wrappers for other providers.
 

@@ -49,6 +49,33 @@ assert_not_contains() {
     fi
 }
 
+# asserts a needle is absent from one section of a file, so a legitimate mention of a
+# removed v1 flag elsewhere (e.g. the Copilot `--yolo` guidance) does not fail the check.
+assert_section_not_contains() {
+    local file="$1"
+    local start_regex="$2"
+    local end_regex="$3"
+    local needle="$4"
+    local label="$5"
+
+    local section
+    section=$(awk -v start="$start_regex" -v end="$end_regex" '
+        !inside && $0 ~ start { inside = 1; print; next }
+        inside && $0 ~ end { inside = 0 }
+        inside { print }
+    ' "$file")
+
+    if [[ -z "$section" ]]; then
+        fail "$label" "section matching '$start_regex' not found in $file"
+        return
+    fi
+    if grep -Fq -- "$needle" <<< "$section"; then
+        fail "$label" "unexpected '$needle' in the '$start_regex' section of $file"
+    else
+        pass "$label"
+    fi
+}
+
 assert_matches() {
     local file="$1"
     local regex="$2"
@@ -110,40 +137,73 @@ assert_contains \
     "task mode allows edit"
 assert_contains \
     "$REPO_ROOT/scripts/bob-as-claude/modes/ralphex-task.yaml" \
-    "- command" \
-    "task mode allows command"
-assert_contains \
-    "$REPO_ROOT/scripts/bob-as-claude/modes/ralphex-task.yaml" \
-    "- browser" \
-    "task mode allows browser"
+    "- execute" \
+    "task mode allows execute"
 assert_contains \
     "$REPO_ROOT/scripts/bob-as-claude/modes/ralphex-review.yaml" \
     "customInstructions" \
     "review mode contains custom instructions"
 assert_contains \
     "$REPO_ROOT/scripts/bob-as-claude/modes/ralphex-review.yaml" \
-    'Never launch `bob`, `claude`, `codex`' \
-    "review mode forbids nested agent CLIs"
+    "- subagent" \
+    "review mode allows native subagents"
 assert_contains \
     "$REPO_ROOT/scripts/bob-as-claude/modes/ralphex-review.yaml" \
-    "Never use background commands" \
-    "review mode forbids background agent orchestration"
+    "spawn_subagent" \
+    "review mode delegates through native spawn_subagent"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/modes/ralphex-review.yaml" \
+    "single turn so they run in parallel" \
+    "review mode issues subagent assignments in parallel"
 assert_contains \
     "$REPO_ROOT/scripts/bob-as-claude/modes/ralphex-plan.yaml" \
     "- read" \
     "plan mode allows read"
 assert_contains \
     "$REPO_ROOT/scripts/bob-as-claude/modes/ralphex-plan.yaml" \
-    "- command" \
-    "plan mode allows command"
-assert_contains \
-    "$REPO_ROOT/scripts/bob-as-claude/modes/ralphex-plan.yaml" \
-    "- browser" \
-    "plan mode allows browser"
+    "- execute" \
+    "plan mode allows execute"
 assert_contains \
     "$REPO_ROOT/scripts/bob-as-claude/modes/ralphex-plan.yaml" \
     "- edit" \
     "plan mode allows accepted plan write"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/modes/ralphex-plan.yaml" \
+    "Return every plan boundary as ordinary assistant text" \
+    "plan mode returns boundaries as assistant text"
+
+# v1 tool groups and the removed terminal tool must not survive in any shipped mode
+for mode in ralphex-task ralphex-review ralphex-plan; do
+    assert_not_contains \
+        "$REPO_ROOT/scripts/bob-as-claude/modes/$mode.yaml" \
+        "- command" \
+        "$mode mode drops the invalid command group"
+    assert_not_contains \
+        "$REPO_ROOT/scripts/bob-as-claude/modes/$mode.yaml" \
+        "- browser" \
+        "$mode mode drops the invalid browser group"
+    assert_not_contains \
+        "$REPO_ROOT/scripts/bob-as-claude/modes/$mode.yaml" \
+        "attempt_completion" \
+        "$mode mode drops the removed attempt_completion tool"
+    assert_not_contains \
+        "$REPO_ROOT/scripts/bob-as-claude/modes/$mode.yaml" \
+        "allowedSubagents" \
+        "$mode mode declares no allowedSubagents key"
+done
+
+# the wrapper targets bob v2 only: no v1 flags, no version-detection branch
+for needle in "--chat-mode" "--yolo" "--hide-intermediary-output" "--output-format" \
+    "attempt_completion" "<thinking>"; do
+    assert_not_contains \
+        "$REPO_ROOT/scripts/bob-as-claude/bob-as-claude.sh" \
+        "$needle" \
+        "wrapper drops v1 artifact $needle"
+done
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/bob-as-claude.sh" \
+    "run -f stream-json" \
+    "wrapper uses the v2 run subcommand and stream format"
 
 # wrapper README
 assert_contains \
@@ -180,8 +240,60 @@ assert_contains \
     "wrapper README documents review mode"
 assert_contains \
     "$REPO_ROOT/scripts/bob-as-claude/README.md" \
-    'review-only `bob`, `claude`, and `codex` guard shims' \
-    "wrapper README documents nested-agent guards"
+    "BOB_SESSION" \
+    "wrapper README documents native nesting protection"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "no guard shims" \
+    "wrapper README documents guard-shim removal"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "spawn_subagent" \
+    "wrapper README documents native parallel review subagents"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "idle_timeout" \
+    "wrapper README documents subagent silence and idle_timeout"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "--grant-approvals" \
+    "wrapper README documents the approval grant flag"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "~/.bob/settings/settings.json" \
+    "wrapper README documents the approval settings path"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "BOB_SETTINGS_FILE" \
+    "wrapper README documents the settings path override"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "bob run -f stream-json" \
+    "wrapper README documents the v2 invocation"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "bob 2.0.0 or newer" \
+    "wrapper README states the minimum bob version"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "~/.claude/skills" \
+    "wrapper README documents the auto-loaded Claude skills caveat"
+assert_not_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "--chat-mode" \
+    "wrapper README drops the v1 --chat-mode flag"
+assert_not_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "--hide-intermediary-output" \
+    "wrapper README drops the v1 --hide-intermediary-output flag"
+assert_not_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "--output-format=stream-json" \
+    "wrapper README drops the v1 --output-format flag"
+assert_not_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "attempt_completion" \
+    "wrapper README drops the removed attempt_completion tool"
 assert_contains \
     "$REPO_ROOT/scripts/bob-as-claude/README.md" \
     "ralphex-plan" \
@@ -254,8 +366,52 @@ assert_contains \
     "custom providers doc references bob wrapper path"
 assert_contains \
     "$REPO_ROOT/docs/custom-providers.md" \
-    "attempt_completion" \
+    "isReasoning" \
     "custom providers doc documents bob event translation"
+assert_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "error.message" \
+    "custom providers doc documents v2 tool_result error field"
+assert_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "bob run -f stream-json --mode=<slug> --trust" \
+    "custom providers doc documents the v2 invocation"
+assert_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "Minimum supported version: bob 2.0.0" \
+    "custom providers doc states the minimum bob version"
+assert_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "### Approval prerequisite" \
+    "custom providers doc documents the approval prerequisite"
+assert_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "install-modes.sh --grant-approvals" \
+    "custom providers doc documents the approval grant flag"
+assert_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "BOB_SETTINGS_FILE" \
+    "custom providers doc documents the settings path override"
+assert_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "spawn_subagent" \
+    "custom providers doc documents native parallel review subagents"
+assert_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "BOB_SESSION" \
+    "custom providers doc documents native nesting protection"
+assert_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "idle_timeout" \
+    "custom providers doc documents subagent silence and idle_timeout"
+assert_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "~/.claude/skills" \
+    "custom providers doc documents the auto-loaded Claude skills caveat"
+assert_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "\`read\`, \`edit\`, \`execute\`, \`mcp\`, \`skill\`, \`todo\`, \`subagent\`, \`mode\`" \
+    "custom providers doc lists the valid v2 tool groups"
 assert_contains \
     "$REPO_ROOT/docs/custom-providers.md" \
     "### Automatic phase mapping" \
@@ -335,6 +491,54 @@ assert_contains \
     "$REPO_ROOT/README.md" \
     "scripts/bob-as-claude/install-modes.sh" \
     "top-level README inventories Bob installer"
+assert_contains \
+    "$REPO_ROOT/README.md" \
+    "bob 2.0.0 or newer" \
+    "top-level README states the minimum bob version"
+assert_contains \
+    "$REPO_ROOT/README.md" \
+    "install-modes.sh --grant-approvals" \
+    "top-level README documents the approval grant flag"
+assert_contains \
+    "$REPO_ROOT/README.md" \
+    "BOB_SETTINGS_FILE" \
+    "top-level README documents the settings path override"
+# the v1 flags and terminal tool are gone from every live doc. --yolo is excluded here:
+# the bob sections mention it in "removed in v2" prose, and Copilot's docs use it for real.
+# docs/custom-providers.md is excluded from the loop for the same reason — its migration
+# paragraph names the removed flags on purpose, and is pinned by the assertion below.
+for doc in README.md llms.txt CLAUDE.md; do
+    assert_not_contains \
+        "$REPO_ROOT/$doc" \
+        "--chat-mode=" \
+        "$doc drops the v1 --chat-mode invocation"
+    assert_not_contains \
+        "$REPO_ROOT/$doc" \
+        "--hide-intermediary-output" \
+        "$doc drops the v1 --hide-intermediary-output flag"
+done
+assert_matches \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "removed \`--yolo\`, \`--hide-intermediary-output\`, and model selection" \
+    "custom providers doc names the removed v1 flags only as removed"
+assert_section_not_contains \
+    "$REPO_ROOT/CLAUDE.md" \
+    "^bob wrapper:" \
+    "^### AWS Bedrock Provider" \
+    "--output-format=stream-json" \
+    "CLAUDE bob paragraph drops the v1 --output-format flag"
+assert_section_not_contains \
+    "$REPO_ROOT/CLAUDE.md" \
+    "^bob wrapper:" \
+    "^### AWS Bedrock Provider" \
+    "attempt_completion" \
+    "CLAUDE bob paragraph drops the removed attempt_completion tool"
+assert_section_not_contains \
+    "$REPO_ROOT/llms.txt" \
+    "^The Bob wrapper requires bob 2\.0\.0" \
+    "^\*\*Codex executor mode" \
+    "attempt_completion" \
+    "llms.txt bob section drops the removed attempt_completion tool"
 
 # llms.txt
 assert_contains \
@@ -357,6 +561,26 @@ assert_contains \
     "$REPO_ROOT/llms.txt" \
     "~/.bob/settings/custom_modes.yaml" \
     "llms.txt documents bob's active global mode path"
+assert_contains \
+    "$REPO_ROOT/llms.txt" \
+    "bob 2.0.0 or newer" \
+    "llms.txt states the minimum bob version"
+assert_contains \
+    "$REPO_ROOT/llms.txt" \
+    "bob run -f stream-json --mode=<slug> --trust" \
+    "llms.txt documents the v2 invocation"
+assert_contains \
+    "$REPO_ROOT/llms.txt" \
+    "install-modes.sh --grant-approvals" \
+    "llms.txt documents the approval grant flag"
+assert_contains \
+    "$REPO_ROOT/llms.txt" \
+    "spawn_subagent" \
+    "llms.txt documents native parallel review subagents"
+assert_contains \
+    "$REPO_ROOT/llms.txt" \
+    "~/.claude/skills" \
+    "llms.txt documents the auto-loaded Claude skills caveat"
 
 # CLAUDE.md
 assert_contains \
@@ -387,6 +611,30 @@ assert_not_contains \
     "$REPO_ROOT/CLAUDE.md" \
     "Review adapter is prepended" \
     "CLAUDE removes stale Bob review-adapter trigger"
+assert_contains \
+    "$REPO_ROOT/CLAUDE.md" \
+    "bob run -f stream-json --mode=<slug> --trust" \
+    "CLAUDE documents the v2 invocation"
+assert_contains \
+    "$REPO_ROOT/CLAUDE.md" \
+    "isReasoning" \
+    "CLAUDE documents the v2 reasoning flag"
+assert_contains \
+    "$REPO_ROOT/CLAUDE.md" \
+    'before automatic selection, and add `--grant-approvals`' \
+    "CLAUDE documents the approval grant flag"
+assert_contains \
+    "$REPO_ROOT/CLAUDE.md" \
+    "BOB_SETTINGS_FILE" \
+    "CLAUDE documents the settings path override"
+assert_contains \
+    "$REPO_ROOT/CLAUDE.md" \
+    "spawn_subagent" \
+    "CLAUDE documents native parallel review subagents"
+assert_contains \
+    "$REPO_ROOT/CLAUDE.md" \
+    "BOB_SESSION" \
+    "CLAUDE documents native nesting protection"
 
 echo ""
 echo "summary: $passed passed, $failed failed, $total total"

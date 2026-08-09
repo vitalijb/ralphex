@@ -419,9 +419,11 @@ The wrapper covers task and review phases only. Plan creation mode (`ralphex --p
 
 ## IBM Bob Shell CLI wrapper (included example)
 
-The repository includes a wrapper at `scripts/bob-as-claude/bob-as-claude.sh` that translates the IBM Bob Shell CLI's (`bob`) `--output-format=stream-json` JSONL event stream to Claude stream-json format. It uses `jq` for JSON parsing and `awk` for fence-aware phase detection.
+The repository includes a wrapper at `scripts/bob-as-claude/bob-as-claude.sh` that translates the IBM Bob Shell CLI's (`bob`) `bob run -f stream-json` JSONL event stream to Claude stream-json format. It uses `jq` for JSON parsing and `awk` for fence-aware phase detection.
 
-The wrapper runs bob with an automatically selected `--chat-mode=<slug>`, `--output-format=stream-json`, `--yolo`, and `--trust`, then passes the prompt on stdin. Task and review runs use `--hide-intermediary-output` and translate the final `attempt_completion` result. Plan runs expose and buffer assistant deltas, prepend a strict Bob terminal-tool protocol, validate the first complete ralphex plan boundary, and terminate Bob before its forced continuation can replace that boundary with a prose summary.
+**Minimum supported version: bob 2.0.0.** bob 1.0.x is not supported by this wrapper — v2 renamed the headless subcommand (`chat` to `run`), replaced `--output-format` with `-f`, replaced `--chat-mode` with `--mode`, removed `--yolo`, `--hide-intermediary-output`, and model selection, and changed the event schema. No version-detection branch and no v1 compatibility layer exists; v1 users must stay on an earlier wrapper revision.
+
+The wrapper runs `bob run -f stream-json --mode=<slug> --trust` with an automatically selected mode slug, then passes the prompt on stdin. Task and review runs forward assistant `message` text line by line. Plan runs buffer the same assistant deltas, validate the first complete ralphex plan boundary, and terminate Bob before its autonomous continuation can replace that boundary with a prose summary.
 
 ### Setup
 
@@ -436,6 +438,31 @@ For a one-off run without editing config:
 ralphex --claude-command=/path/to/scripts/bob-as-claude/bob-as-claude.sh docs/plans/feature.md
 ```
 
+Setup is two steps: install the shipped custom modes, then grant the approval settings headless bob v2 needs.
+
+### Approval prerequisite
+
+Headless `bob run` registers no interactive approval handler — there is no TTY to prompt, and no per-run flag to auto-approve (`--yolo` is gone and `--auto-approve` exists only on `bob chat`, which `bob run` rejects). Its only input is the `approval` section of `~/.bob/settings/settings.json`. Bob's defaults are `allowed_permissions: ["read"]` plus a 15-entry read-only `approvedCommands` list, so `edit` and real commands (`go test`, `git commit`, `make lint`) are **not** auto-approved out of the box and a task run does no work.
+
+For ralphex phases, `approval` needs:
+
+- `allowed_permissions` including `edit` and `execute` (the wrapper's modes also use `subagent` and `todo`)
+- `autoApprovalEnabled` not set to `false` (an untrusted workspace forces it off, which is why `--trust` is always passed)
+- `allowedExecutors.execute_command.approvedCommands` containing the command prefixes your project runs — matching is longest-prefix with no wildcard, so prefixes must be enumerated
+- `forbiddenApprovalGroups` not listing a needed permission; it silently overrides the grant
+
+Grant these with the installer's opt-in flag:
+
+```bash
+bash scripts/bob-as-claude/install-modes.sh --grant-approvals
+```
+
+That unions `allowed_permissions` with `read`, `edit`, `execute`, `subagent`, `todo`; unions `approvedCommands` with `git`, `go`, `make`, `npm`, `npx`, `gofmt`, `golangci-lint`, `python3`; sets `autoApprovalEnabled` to true only when the key is absent; never touches `deniedCommands`; and prints exactly what it changed. It backs the file up, validates JSON before and after, writes atomically, preserves unrelated keys, and is idempotent. Set `BOB_SETTINGS_FILE=/path/to/settings.json` to target another file.
+
+Bob's global directory is `~/.bob` with no environment override, so **the grant is machine-wide: broadening `approvedCommands` affects all bob usage on the machine, not just ralphex-invoked runs.** That is why it is opt-in and left to an explicit, user-run command rather than done silently by the wrapper — the same rule ralphex applies to `~/.codex/`.
+
+The wrapper itself only runs a preflight check: when the settings file is missing, `allowed_permissions` lacks `edit`/`execute`, `autoApprovalEnabled` is false, or `forbiddenApprovalGroups` blocks a needed permission, it prints one actionable stderr warning naming the installer. It never aborts, so a misconfigured run explains itself instead of silently doing nothing.
+
 ### Custom-mode installation and selection
 
 Install the three shipped modes before automatic phase selection:
@@ -448,26 +475,27 @@ The installer creates Bob's active global `~/.bob/settings/custom_modes.yaml` wh
 
 Bob gives project-level `.bob/custom_modes.yaml` entries precedence over global modes. A project entry with a ralphex slug shadows the globally installed definition; set `BOB_CUSTOM_MODES_FILE=.bob/custom_modes.yaml` to install intentionally at project scope. Existing ralphex slugs are treated as user-owned, so remove an old entry before rerunning the installer when you want the latest shipped definition.
 
-The shipped mode tool groups are exact:
+The shipped mode tool groups are exact. bob v2 accepts only these group names — `read`, `edit`, `execute`, `mcp`, `skill`, `todo`, `subagent`, `mode` — and an invalid name grants nothing without reporting an error, so shell access must be spelled `execute` (v1's `command` and `browser` are not valid names). Omitting `groups` entirely grants nothing, and a duplicate slug, duplicate group, or invalid `fileRegex` drops the whole file.
 
 | Mode | Tool groups | Role |
 |---|---|---|
-| `ralphex-task` | `read`, `edit`, `command`, `browser` | Complete one task section at a time; also handles finalize prompts. |
-| `ralphex-review` | `read`, `edit`, `command`, `browser` | Run review assignments sequentially in the current Bob session, verify findings, apply fixes, test, commit, and emit ralphex signals. |
-| `ralphex-plan` | `read`, `edit`, `command`, `browser` | Explore without source edits and write the accepted plan under `docs/plans`. |
+| `ralphex-task` | `read`, `edit`, `execute` | Complete one task section at a time; also handles finalize prompts. |
+| `ralphex-review` | `read`, `edit`, `execute`, `subagent` | Launch every review assignment as a native parallel `spawn_subagent`, consolidate findings, verify them, apply fixes, test, commit, and emit ralphex signals. |
+| `ralphex-plan` | `read`, `edit`, `execute` | Explore without source edits and write the accepted plan under `docs/plans`. |
 
 ### Environment variables
 
 | Variable | Default | Description |
 |---|---|---|
-| `BOB_CHAT_MODE` | automatic | Any non-empty built-in slug (`ask`, `code`, `plan`, or `advanced`) or custom-mode slug is passed through unchanged and overrides prompt detection. Empty selects a shipped ralphex mode. |
-| `BOB_MODEL` | (bob default) | Model passed as `-m` when ralphex does not supply `--model`. bob 1.0.6+ supports `-m`/`--model`. |
-| `BOB_VERBOSE` | `0` | Set to `1` to include task/review `tool_result` output and `[tool]` markers. Plan mode emits only its validated boundary. |
-| `BOB_EXTRA_ARGS` | (none) | Extra flags appended verbatim to the bob invocation (word-split on whitespace, **no quote preservation**); e.g. `--max-coins=100` to cap spend. |
+| `BOB_CHAT_MODE` | automatic | Any non-empty built-in slug (`ask`, `code`, `plan`, or `advanced`) or custom-mode slug is passed to `--mode` unchanged and overrides prompt detection. Empty selects a shipped ralphex mode. |
+| `BOB_MODEL` | (unused) | Accepted for compatibility and **ignored** — bob v2 stable has no model selection. A non-empty value produces one stderr note. |
+| `BOB_VERBOSE` | `0` | Set to `1` to include task/review `tool_result` output, `[tool]` markers, and reasoning message text. Plan mode emits only its validated boundary. |
+| `BOB_EXTRA_ARGS` | (none) | Extra flags appended verbatim to the bob invocation (word-split on whitespace, **no quote preservation**); e.g. `--max-cost=5` to cap spend. |
+| `BOB_SETTINGS_FILE` | `~/.bob/settings/settings.json` | Approval-settings path read by the wrapper's preflight and written by `install-modes.sh --grant-approvals`. |
 
 ### Model and effort mapping
 
-ralphex supplies `--model` and `--effort` with each value in the following argv entry. The wrapper also accepts equals forms for direct calls. It forwards the model to bob's `-m`/`--model` option (bob 1.0.6+ supports it). Effort is **accepted but ignored** — bob has no `--effort` flag, and passing it would make bob exit with an "Unknown argument" error, so the wrapper strips it and prints a one-line stderr note for non-empty values.
+Neither is forwarded. bob v2 stable removed model selection (`-m`/`--model` is gated behind an internal dev gateway) and has never had an `--effort` flag. ralphex supplies `--model` and `--effort` with each value in the following argv entry; the wrapper also accepts the equals forms for direct calls, plus `BOB_MODEL`. All are **accepted but ignored**, each producing one stderr note for a non-empty value, so ralphex's per-phase model flags cannot fail a bob run. Use `BOB_CHAT_MODE` to vary behavior instead.
 
 ### Automatic phase mapping
 
@@ -481,39 +509,56 @@ Review markers take precedence over plan markers. Individual plan markers do not
 
 ### Event translation
 
-The wrapper translates bob JSONL events as follows:
+bob v2 emits these event types, and the wrapper translates them as follows. `attempt_completion` is no longer a registered tool in v2, so there is no terminal-tool branch — all assistant text arrives through streaming `message` events.
 
-| bob event | Claude event |
+| bob v2 event | Claude event |
 |---|---|
-| `tool_use` + `tool_name == "attempt_completion"` | `content_block_delta` for each line of `parameters.result` |
-| plan-mode assistant `message` deltas containing a complete valid boundary | one `content_block_delta` through `<<<RALPHEX:END>>>`, or the exact terminal marker |
-| `tool_result` + `status == "error"` | `content_block_delta` with `[tool_error] <output>` (always emitted) |
+| `message` + `role == "assistant"` + `isReasoning` falsy | line-buffered `content_block_delta` per complete line (task/review); buffered for boundary detection (plan) |
+| `message` + `role == "assistant"` + `isReasoning: true` | empty keepalive delta; forwarded as text when `BOB_VERBOSE=1` |
+| plan-mode assistant deltas containing a complete valid boundary | one `content_block_delta` through `<<<RALPHEX:END>>>`, or the exact terminal marker |
+| `tool_result` + `status == "error"` | `content_block_delta` with `[tool_error] <error.message>` (always emitted; on error `output` is absent and the text moves to `error.message`) |
 | `tool_result` + `status == "success"` | skipped by default; `[tool_result] <output>` when `BOB_VERBOSE=1` |
-| `tool_use` + other tool names | skipped by default; `[tool] <name>` when `BOB_VERBOSE=1` |
-| `init`, `message` (user echo), suppressed events | empty keepalive delta |
-| `result` | `{"type":"result","result":""}` (end of execution) |
+| `tool_use` | skipped by default; `[tool] <tool_name>` when `BOB_VERBOSE=1` |
+| `error` + `severity == "error"` | `content_block_delta` with `error: bob: <message>`, and a forced non-zero exit |
+| `message` (user echo) and other suppressed events | empty keepalive delta |
+| `result` (always `status: "success"`, carries `stats`) | `{"type":"result","result":""}` (end of execution) |
 
-bob sometimes emits a bare plaintext line between `tool_result` and `result` (the final answer echo). The task/review pipeline silently skips it because the same text is captured from `attempt_completion.parameters.result`. In plan mode, complete thinking sections and non-boundary text are suppressed. `QUESTION` JSON is validated, `PLAN_DRAFT` must be nonempty, and a run without a complete valid boundary exits non-zero.
+`isReasoning` replaces v1's `<thinking>` text heuristic — there is no thinking-block parsing left. `{type:"error"}` is v2's only failure channel (for example a `--max-cost` or `--max-turns` abort): the `result` event's `status` is *always* `"success"` in v2, so a run that fails would otherwise look like a clean, silent success. The wrapper therefore treats an `error` event as a real failure, emitting a diagnostic line and forcing a non-zero exit.
 
-A fallback `{"type":"result","result":""}` is always emitted, covering bob exiting without a `result` event. Stderr is captured and emitted as `content_block_delta` events after the main stream for error/limit pattern detection, and bob's exit code is preserved. Any literal `<<<RALPHEX:` token on stderr is neutralized first (rewritten to `<<< RALPHEX:` with an inserted space), so a stray signal token echoed in bob diagnostics cannot be mistaken for a real completion signal — rate-limit and `API Error:` phrases pass through verbatim.
+Line buffering matters for signals: assistant text arrives as streaming deltas, so a `<<<RALPHEX:...>>>` token can be split across several events. The wrapper accumulates deltas and emits complete lines, flushing any partial trailing line at stream end, so ralphex sees each signal intact in a single `content_block_delta`.
+
+In plan mode, non-boundary text and reasoning are suppressed. Boundaries are detected from assistant deltas only, `QUESTION` JSON is validated, `PLAN_DRAFT` must be nonempty, the earliest valid boundary wins, Bob is terminated once it is emitted, and a run without a complete valid boundary exits non-zero (fail closed).
+
+A fallback `{"type":"result","result":""}` is always emitted, covering bob exiting without a `result` event. bob's stdout and stderr are merged into one stream so ordering is preserved; non-JSON diagnostic lines are forwarded as text deltas for ralphex error/limit pattern detection, and bob's exit code is preserved. Any literal `<<<RALPHEX:` token in that text is neutralized first (rewritten to `<<< RALPHEX:` with an inserted space), so a stray signal token echoed in bob diagnostics cannot be mistaken for a real completion signal — rate-limit and `API Error:` phrases pass through verbatim.
 
 ### Permissions and sandbox
 
-The wrapper invokes bob with `--yolo --trust` so tool calls are auto-approved and filesystem writes persist on the real FS. If you override this via `BOB_EXTRA_ARGS` (for example with `--sandbox`), bob writes to a sandbox and changes do not persist.
+`--trust` is always passed so filesystem writes persist on the real FS; without it bob writes to a sandbox that does not persist and task work is lost. Do not override this via `BOB_EXTRA_ARGS`. Tool-call approval is *not* a flag in v2 — see [Approval prerequisite](#approval-prerequisite) above; without those settings bob has nothing to approve `edit` or `execute` with and the run does no work.
 
 ### How it works
 
 ```bash
-# bob emits JSONL like:
-{"type":"tool_use","tool_name":"attempt_completion","parameters":{"result":"fixed the bug\n"}}
-{"type":"result","status":"success","stats":{}}
+# bob v2 emits JSONL like:
+{"type":"message","role":"assistant","content":"fixed the ","isReasoning":false}
+{"type":"message","role":"assistant","content":"bug\n","isReasoning":false}
+{"type":"result","status":"success","stats":{"turns":3}}
 
 # wrapper translates to:
 {"type":"content_block_delta","delta":{"type":"text_delta","text":"fixed the bug\n"}}
 {"type":"result","result":""}
 ```
 
-Review instructions are stored in the `customInstructions` field of `ralphex-review`; the wrapper passes review prompts unchanged. Bob has no native sub-agent orchestration, so review assignments run sequentially in the current session. The wrapper resolves its top-level Bob executable before installing review-only `bob`, `claude`, and `codex` guard shims on the child `PATH`. This prevents command-tool attempts to emulate review sub-agents with nested or background agent CLIs, which can outlive tool timeouts and exhaust provider concurrency. Review temporary files must remain in the workspace or Bob's project temp directory rather than general-purpose `/tmp`. Plan instructions are stored in `ralphex-plan` and reinforced by a wrapper-prepended protocol requiring the exact boundary in `attempt_completion.result` and forbidding writes to the ralphex progress log. The wrapper can recover a valid intermediary boundary if Bob ignores that instruction. Task and finalize instructions are stored in `ralphex-task`.
+### Review subagents and idle_timeout
+
+Review instructions live in the `customInstructions` field of `ralphex-review`; the wrapper passes review prompts unchanged. bob v2 has native subagents, so the mode instructs Bob to launch every review-agent assignment as a `spawn_subagent` call, issuing all of them in a single turn so they run in parallel, then consolidate the findings into its final response. Nested bob is blocked natively by bob itself through a `BOB_SESSION` environment check, so the wrapper installs no guard shims and the mode carries no "never delegate" instruction.
+
+Subagent lifecycle callbacks are debug-log only in v2, so **subagent work produces no stream events**. A parallel review can stay silent for a long stretch while agents run. Use a generous `idle_timeout` for bob review phases, or leave it disabled — a value tuned for Claude's chattier stream will kill healthy bob review sessions.
+
+Review temporary files must remain in the workspace or Bob's project temp directory rather than general-purpose `/tmp`. Plan instructions are stored in `ralphex-plan`, which requires every plan boundary to be returned as ordinary assistant text rather than a tool call, and forbids writes to the ralphex progress log. Task and finalize instructions are stored in `ralphex-task`.
+
+### Caveat: bob v2 auto-loads Claude skills
+
+bob v2's default global skill directories include `~/.claude/skills`, so any Claude Code skill installed there is auto-loaded into bob sessions. A skill whose instructions conflict with the ralphex prompt can compete with it — the same skill-conflict class already documented for codex. If a bob run behaves as though it is following different instructions, check what is installed under `~/.claude/skills`.
 
 ## Writing your own wrapper
 
