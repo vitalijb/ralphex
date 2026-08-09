@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
-# bob-as-claude.sh - wraps IBM Bob Shell CLI to produce Claude-compatible stream-json output.
+# bob-as-claude.sh - wraps IBM Bob Shell CLI (v2.0.0+) to produce Claude-compatible stream-json output.
 #
-# this script translates bob's stream-json event stream into the Claude stream-json format
-# that ralphex's ClaudeExecutor can parse.
+# this script translates bob v2's `bob run -f stream-json` event stream into the Claude
+# stream-json format that ralphex's ClaudeExecutor can parse. bob 1.0.x is not supported.
 #
 # environment variables:
-#   BOB_CHAT_MODE  - explicit bob chat-mode slug override (default: automatic)
-#   BOB_MODEL      - model to use when --model is absent
-#   BOB_VERBOSE    - set to 1 to include tool_result output and tool markers (default: 0)
-#   BOB_EXTRA_ARGS - extra bob arguments, word-split on whitespace
+#   BOB_CHAT_MODE     - explicit bob --mode slug override (default: automatic)
+#   BOB_MODEL         - model to accept for compatibility; bob v2 stable has no model
+#                        selection, so the value is reported and ignored
+#   BOB_VERBOSE       - set to 1 to include tool_result output, tool markers, and
+#                        reasoning message text (default: 0)
+#   BOB_EXTRA_ARGS    - extra bob arguments, word-split on whitespace
+#   BOB_SETTINGS_FILE - override path to bob's global settings.json (used by tests)
 
 set -euo pipefail
 
@@ -51,10 +54,16 @@ if [[ "$BOB_VERBOSE" != "0" && "$BOB_VERBOSE" != "1" ]]; then
     BOB_VERBOSE=0
 fi
 BOB_EXTRA_ARGS="${BOB_EXTRA_ARGS:-}"
+BOB_SETTINGS_FILE="${BOB_SETTINGS_FILE:-$HOME/.bob/settings/settings.json}"
 
-# resolve the model and retain the existing effort compatibility note.
+# bob v2 stable has no model selection (gated behind an internal dev gateway key), and
+# has no --effort flag either. Accept both for compatibility with ralphex's per-phase
+# model/effort flags and report that they are ignored rather than failing the run.
 model="$model_flag"
 [[ -z "$model" ]] && model="$BOB_MODEL"
+if [[ -n "$model" ]]; then
+    echo "note: bob v2 stable has no model selection; ignoring '$model'" >&2
+fi
 if [[ -n "$effort_flag" ]]; then
     echo "note: bob has no --effort flag; ignoring '$effort_flag'" >&2
 fi
@@ -109,24 +118,39 @@ if [[ -z "$selected_chat_mode" ]]; then
     ')
 fi
 
-# Bob only exposes attempt_completion when intermediary output is hidden. In plan
-# mode that is not sufficient: Bob may print a valid QUESTION / PLAN_DRAFT as an
-# assistant message, then replace it with a prose summary in attempt_completion.
-# Tell it which channel is authoritative, and keep intermediary deltas available
-# as a recovery path if it still fails to follow the terminal-tool contract.
-if [[ "$selected_chat_mode" == "ralphex-plan" ]]; then
-    plan_adapter=$'BOB/RALPHEX PLAN PROTOCOL (strict):\n- Never emit QUESTION, PLAN_DRAFT, PLAN_READY, or TASK_FAILED as ordinary assistant prose.\n- When a plan boundary is ready, call attempt_completion exactly once and put the complete boundary in its result argument.\n- QUESTION result must be exactly <<<RALPHEX:QUESTION>>> followed by one valid JSON object and <<<RALPHEX:END>>>; include no summary or surrounding prose.\n- PLAN_DRAFT result must be exactly the complete <<<RALPHEX:PLAN_DRAFT>>> body through <<<RALPHEX:END>>>; include no trailing prose.\n- PLAN_READY result must be exactly <<<RALPHEX:PLAN_READY>>>. TASK_FAILED result must be exactly <<<RALPHEX:TASK_FAILED>>>.\n- Do not append questions, answers, drafts, markers, or status text to the ralphex progress file; ralphex alone owns that log.\n- Once you call attempt_completion, stop.'
-    prompt="$plan_adapter"$'\n\n'"$prompt"
-fi
+# Headless `bob run` registers no interactive approval handler; its only input is
+# ~/.bob/settings/settings.json. Warn (never abort) when the settings bob v2 requires
+# for edit/execute work are missing, so a hang or silent no-op has an explained cause.
+approval_preflight() {
+    if [[ ! -f "$BOB_SETTINGS_FILE" ]]; then
+        echo "warning: bob v2 approval settings not found at $BOB_SETTINGS_FILE; 'edit' and 'execute' actions require approvals bob does not grant by default. Run scripts/bob-as-claude/install-modes.sh with its approval flag to grant them." >&2
+        return
+    fi
 
-# build bob arguments. the prompt is delivered through stdin, not argv. Task and
-# review runs retain the clean terminal-only stream. Plan runs expose assistant
-# deltas so the wrapper can stop on a valid boundary before Bob's forced
-# "you must use a tool" continuation discards it.
-bob_args=("--chat-mode=$selected_chat_mode" --output-format=stream-json)
-[[ "$selected_chat_mode" != "ralphex-plan" ]] && bob_args+=(--hide-intermediary-output)
-bob_args+=(--yolo --trust)
-[[ -n "$model" ]] && bob_args+=(-m "$model")
+    local reason=""
+    reason=$(jq -r '
+        (.approval.allowed_permissions // []) as $perms |
+        (.approval.forbiddenApprovalGroups // []) as $forbidden |
+        (.approval.autoApprovalEnabled) as $auto |
+        if ($perms | index("edit")) == null or ($perms | index("execute")) == null then
+            "allowed_permissions is missing edit and/or execute"
+        elif ($auto == false) then
+            "autoApprovalEnabled is false"
+        elif ([$forbidden[] | select(. == "edit" or . == "execute")] | length) > 0 then
+            "forbiddenApprovalGroups blocks a needed permission"
+        else
+            ""
+        end
+    ' "$BOB_SETTINGS_FILE" 2>/dev/null) || reason=""
+
+    [[ -n "$reason" ]] && echo "warning: bob v2 approval settings may block task/review work ($reason); run scripts/bob-as-claude/install-modes.sh with its approval flag to grant edit/execute approvals" >&2
+    return 0
+}
+approval_preflight
+
+# build bob arguments. the prompt is delivered through stdin, not argv. Never pass
+# --disable-subagents: review mode relies on native subagent orchestration.
+bob_args=(run -f stream-json "--mode=$selected_chat_mode" --trust)
 if [[ -n "$BOB_EXTRA_ARGS" ]]; then
     read -ra bob_extra_args <<< "$BOB_EXTRA_ARGS"
     for arg in "${bob_extra_args[@]}"; do
@@ -140,29 +164,6 @@ cleanup() {
     rm -rf "$tmp_dir"
 }
 trap cleanup EXIT
-
-# Review prompts ask Claude-compatible providers to launch multiple sub-agents.
-# Bob has no native sub-agent orchestration, and may try to emulate it by
-# spawning bob/claude/codex through its command tool. Those nested CLIs inherit
-# credentials and can outlive a timed-out tool call, exhaust provider limits,
-# or deadlock the parent session. Resolve the real top-level Bob executable
-# before placing review-only guard shims on PATH, so only nested launches are
-# rejected. Absolute paths can bypass PATH, so the custom mode also forbids all
-# shell-based agent orchestration explicitly.
-if [[ "$selected_chat_mode" == "ralphex-review" ]]; then
-    review_guard_dir="$tmp_dir/review-agent-guard"
-    mkdir -p "$review_guard_dir"
-    for guarded_cli in bob claude codex; do
-        guard_path="$review_guard_dir/$guarded_cli"
-        printf '%s\n' \
-            '#!/usr/bin/env bash' \
-            'tool_name=${0##*/}' \
-            'printf '\''error: nested %s invocation blocked by bob-as-claude review guard; perform review assignments sequentially in the current Bob session\n'\'' "$tool_name" >&2' \
-            'exit 64' > "$guard_path"
-        chmod +x "$guard_path"
-    done
-    export PATH="$review_guard_dir:$PATH"
-fi
 
 stream_pipe="$tmp_dir/stream.fifo"
 mkfifo "$stream_pipe"
@@ -186,28 +187,6 @@ emit_text_delta() {
 
 emit_keepalive() {
     printf '%s\n' '{"type":"content_block_delta","delta":{"type":"text_delta","text":""}}'
-}
-
-# Remove complete Bob thinking sections before looking for protocol markers.
-# An unfinished thinking section is hidden as well, so marker examples in model
-# reasoning can never become plan boundaries.
-strip_thinking_blocks() {
-    local text="$1"
-    local before=""
-    local rest=""
-    local after=""
-
-    while [[ "$text" == *"<thinking>"* ]]; do
-        before=${text%%"<thinking>"*}
-        rest=${text#*"<thinking>"}
-        if [[ "$rest" != *"</thinking>"* ]]; then
-            text="$before"
-            break
-        fi
-        after=${rest#*"</thinking>"}
-        text="$before$after"
-    done
-    printf '%s' "$text"
 }
 
 plan_boundary_text=""
@@ -276,34 +255,37 @@ parse_bob_event() {
     event_type=""
     event_role=""
     event_content=""
+    event_is_reasoning=""
     event_tool=""
-    event_completion=""
     event_status=""
     event_output=""
-    event_error=""
-    event_has_error="false"
+    event_error_message=""
+    event_severity=""
+    event_message=""
 
     {
         IFS= read -r -d '' event_type &&
             IFS= read -r -d '' event_role &&
             IFS= read -r -d '' event_content &&
+            IFS= read -r -d '' event_is_reasoning &&
             IFS= read -r -d '' event_tool &&
-            IFS= read -r -d '' event_completion &&
             IFS= read -r -d '' event_status &&
             IFS= read -r -d '' event_output &&
-            IFS= read -r -d '' event_error &&
-            IFS= read -r -d '' event_has_error
+            IFS= read -r -d '' event_error_message &&
+            IFS= read -r -d '' event_severity &&
+            IFS= read -r -d '' event_message
     } < <(
         printf '%s\n' "$line" | jq -j '
             (.type // ""), "\u0000",
             (.role // ""), "\u0000",
             ((.content // "") | tostring), "\u0000",
+            ((.isReasoning // false) | tostring), "\u0000",
             (.tool_name // ""), "\u0000",
-            ((.parameters.result // "") | tostring), "\u0000",
             ((.status // "") | tostring), "\u0000",
             ((.output // "") | tostring), "\u0000",
-            ((.error.message // .error // .message // "") | tostring), "\u0000",
-            ((.error != null) | tostring), "\u0000"
+            ((.error.message // "") | tostring), "\u0000",
+            ((.severity // "") | tostring), "\u0000",
+            ((.message // "") | tostring), "\u0000"
         ' 2>/dev/null
     )
 }
@@ -317,13 +299,16 @@ neutralize_signal_text() {
     printf '%s' "${1//<<<RALPHEX:/<<< RALPHEX:}"
 }
 
-emit_completion_lines() {
-    local completion="$1"
-    local completion_line=""
-
-    while IFS= read -r completion_line || [[ -n "$completion_line" ]]; do
-        emit_text_delta "$completion_line"$'\n'
-    done < <(printf '%s' "$completion")
+# Line-buffers assistant message text so a signal token split across several
+# streaming deltas is re-assembled and emitted intact in one content_block_delta.
+task_stream_buffer=""
+flush_task_buffer_lines() {
+    task_stream_buffer+="$1"
+    while [[ "$task_stream_buffer" == *$'\n'* ]]; do
+        local line="${task_stream_buffer%%$'\n'*}"
+        task_stream_buffer="${task_stream_buffer#*$'\n'}"
+        emit_text_delta "$line"$'\n'
+    done
 }
 
 bob_start_seconds=$SECONDS
@@ -348,55 +333,56 @@ while IFS= read -r line || [[ -n "$line" ]]; do
     fi
 
     if [[ "$selected_chat_mode" == "ralphex-plan" ]]; then
-        if [[ "$event_type" == "message" && "$event_role" == "assistant" ]]; then
+        if [[ "$event_type" == "message" && "$event_role" == "assistant" && "$event_is_reasoning" != "true" ]]; then
             plan_stream_buffer+="$event_content"
-            visible_plan_text=$(strip_thinking_blocks "$plan_stream_buffer")
-            if extract_plan_boundary "$visible_plan_text"; then
+            if extract_plan_boundary "$plan_stream_buffer"; then
                 emit_text_delta "$plan_boundary_text"
                 plan_boundary_emitted=1
                 intentional_stop=1
                 kill -TERM "$bob_pid" 2>/dev/null || true
                 break
             fi
-        elif [[ "$event_type" == "tool_use" && "$event_tool" == "attempt_completion" ]]; then
-            if extract_plan_boundary "$event_completion"; then
-                emit_text_delta "$plan_boundary_text"
-                plan_boundary_emitted=1
-                intentional_stop=1
-                kill -TERM "$bob_pid" 2>/dev/null || true
-                break
-            fi
-            [[ -n "$plan_boundary_error" ]] || \
-                plan_boundary_error="attempt_completion did not contain a complete valid ralphex plan boundary"
         fi
         emit_keepalive
         continue
     fi
 
-    # Task/review translation stays terminal-only and line-oriented.
-    if [[ "$event_type" == "tool_use" && "$event_tool" == "attempt_completion" ]]; then
-        emit_completion_lines "$event_completion"
-    elif [[ "$event_type" == "result" ]]; then
-        if [[ "$event_has_error" == "true" || ( -n "$event_status" && "$event_status" != "success" ) ]]; then
-            result_detail="$event_error"
-            [[ -n "$result_detail" ]] || result_detail="status $event_status"
-            result_detail=$(neutralize_signal_text "$result_detail")
-            emit_text_delta "error: bob result failed: $result_detail"$'\n'
-            bob_failure_detail_emitted=1
-            bob_result_failed=1
+    # Task/review translation forwards assistant message text line-by-line and
+    # otherwise stays terminal-only.
+    if [[ "$event_type" == "message" && "$event_role" == "assistant" ]]; then
+        if [[ "$event_is_reasoning" == "true" ]]; then
+            if [[ "$BOB_VERBOSE" == "1" ]]; then
+                flush_task_buffer_lines "$event_content"
+            else
+                emit_keepalive
+            fi
+        else
+            flush_task_buffer_lines "$event_content"
         fi
+    elif [[ "$event_type" == "result" ]]; then
         printf '%s\n' '{"type":"result","result":""}'
     elif [[ "$event_type" == "tool_result" && "$event_status" == "error" ]]; then
-        emit_text_delta "[tool_error] $event_output"$'\n'
+        emit_text_delta "[tool_error] $event_error_message"$'\n'
         bob_failure_detail_emitted=1
     elif [[ "$BOB_VERBOSE" == "1" && "$event_type" == "tool_result" && "$event_status" == "success" ]]; then
         emit_text_delta "[tool_result] $event_output"$'\n'
     elif [[ "$BOB_VERBOSE" == "1" && "$event_type" == "tool_use" ]]; then
         emit_text_delta "[tool] $event_tool"$'\n'
+    elif [[ "$event_type" == "error" ]]; then
+        error_detail=$(neutralize_signal_text "$event_message")
+        emit_text_delta "error: bob: $error_detail"$'\n'
+        bob_failure_detail_emitted=1
+        bob_result_failed=1
     else
         emit_keepalive
     fi
 done < "$stream_pipe"
+
+# flush any partial trailing line left in the task/review buffer.
+if [[ -n "$task_stream_buffer" ]]; then
+    emit_text_delta "$task_stream_buffer"
+    task_stream_buffer=""
+fi
 
 # preserve bob's exit status after the translation process has drained.
 bob_exit=0

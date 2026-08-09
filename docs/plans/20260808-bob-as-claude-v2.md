@@ -80,21 +80,21 @@ Per bob's own bundled mode-schema documentation, the only valid group names are 
 **Files:**
 - Modify: `scripts/bob-as-claude/bob-as-claude.sh`
 
-- [ ] Replace the bob argument construction with `run -f stream-json --mode=<slug> --trust`, keeping the prompt on stdin and keeping `BOB_EXTRA_ARGS` word-split passthrough appended last
-- [ ] Remove `--output-format`, `--chat-mode=`, `--yolo`, `--hide-intermediary-output`, and the `-m "$model"` argument entirely; never pass `--disable-subagents`
-- [ ] Keep accepting `--model`, `--model=`, `--effort`, `--effort=`, and `BOB_MODEL`, but treat model like effort is treated today: emit a single stderr note that bob v2 stable has no model selection and ignore the value
-- [ ] Update `parse_bob_event` to extract the v2 fields: add `.isReasoning`, add `.severity`, read tool errors from `.error.message`, and drop `.parameters.result`
-- [ ] Replace `strip_thinking_blocks` with an `isReasoning` filter: drop assistant `message` events whose `isReasoning` is true (show them only under `BOB_VERBOSE=1`), and delete the `<thinking>` helper
-- [ ] Add line-buffered forwarding of assistant `message` text for task and review phases, replacing the `attempt_completion` branch, so a `<<<RALPHEX:...>>>` token split across streaming deltas is re-assembled and emitted in one `content_block_delta`; flush any partial trailing line at stream end
-- [ ] Translate `tool_result` with `status == "error"` using `.error.message` instead of `.output`, keeping the `[tool_error] ` prefix and the failure-detail flag
-- [ ] Handle `{type:"error"}` events: emit `error: bob: <message>` with signal-token neutralization, set the failure-detail flag, and force a non-zero exit code
-- [ ] Simplify the `result` branch: `status` is always `"success"` in v2, so drop the result-failure detection and keep emitting the terminating `{"type":"result","result":""}` after flushing the line buffer
-- [ ] Delete the plan-mode `attempt_completion` protocol adapter text and the `tool_use`/`attempt_completion` boundary branch; extract plan boundaries from the assistant delta buffer only, keeping the existing QUESTION JSON validation, empty-PLAN_DRAFT rejection, earliest-marker selection, terminate-on-boundary, and fail-closed behavior
-- [ ] Delete the `ralphex-review` PATH guard-shim block (the `bob claude codex` `exit 64` stub loop and its `export PATH`), and update the surrounding comment to record that bob v2 blocks nested bob natively via `BOB_SESSION`
-- [ ] Add an approval preflight that reads `~/.bob/settings/settings.json` (honoring an override variable for tests) and prints one actionable stderr warning naming `install-modes.sh` when `approval.allowed_permissions` lacks `edit` or `execute`, or when `approval.autoApprovalEnabled` is false, or when `approval.forbiddenApprovalGroups` contains a needed permission; warn only, never abort
-- [ ] Update the script header comment block to document the v2 invocation and the current `BOB_*` variables
-- [ ] Preserve unchanged: the fence-aware awk mode classifier and its markers, `BOB_CHAT_MODE` override, `BOB_VERBOSE` validation, `emit_keepalive`, `neutralize_signal_text`, non-JSON diagnostic passthrough, `mktemp -d` plus FIFO stream merge, SIGTERM forwarding, exit-code preservation, and the no-diagnostic fallback message
-- [ ] Verify with `bash -n scripts/bob-as-claude/bob-as-claude.sh` and `shellcheck scripts/bob-as-claude/bob-as-claude.sh` if available
+- [x] Replace the bob argument construction with `run -f stream-json --mode=<slug> --trust`, keeping the prompt on stdin and keeping `BOB_EXTRA_ARGS` word-split passthrough appended last
+- [x] Remove `--output-format`, `--chat-mode=`, `--yolo`, `--hide-intermediary-output`, and the `-m "$model"` argument entirely; never pass `--disable-subagents`
+- [x] Keep accepting `--model`, `--model=`, `--effort`, `--effort=`, and `BOB_MODEL`, but treat model like effort is treated today: emit a single stderr note that bob v2 stable has no model selection and ignore the value
+- [x] Update `parse_bob_event` to extract the v2 fields: add `.isReasoning`, add `.severity`, read tool errors from `.error.message`, and drop `.parameters.result`
+- [x] Replace `strip_thinking_blocks` with an `isReasoning` filter: drop assistant `message` events whose `isReasoning` is true (show them only under `BOB_VERBOSE=1`), and delete the `<thinking>` helper
+- [x] Add line-buffered forwarding of assistant `message` text for task and review phases, replacing the `attempt_completion` branch, so a `<<<RALPHEX:...>>>` token split across streaming deltas is re-assembled and emitted in one `content_block_delta`; flush any partial trailing line at stream end
+- [x] Translate `tool_result` with `status == "error"` using `.error.message` instead of `.output`, keeping the `[tool_error] ` prefix and the failure-detail flag
+- [x] Handle `{type:"error"}` events: emit `error: bob: <message>` with signal-token neutralization, set the failure-detail flag, and force a non-zero exit code
+- [x] Simplify the `result` branch: `status` is always `"success"` in v2, so drop the result-failure detection and keep emitting the terminating `{"type":"result","result":""}` after flushing the line buffer
+- [x] Delete the plan-mode `attempt_completion` protocol adapter text and the `tool_use`/`attempt_completion` boundary branch; extract plan boundaries from the assistant delta buffer only, keeping the existing QUESTION JSON validation, empty-PLAN_DRAFT rejection, earliest-marker selection, terminate-on-boundary, and fail-closed behavior
+- [x] Delete the `ralphex-review` PATH guard-shim block (the `bob claude codex` `exit 64` stub loop and its `export PATH`), and update the surrounding comment to record that bob v2 blocks nested bob natively via `BOB_SESSION`
+- [x] Add an approval preflight that reads `~/.bob/settings/settings.json` (honoring an override variable for tests) and prints one actionable stderr warning naming `install-modes.sh` when `approval.allowed_permissions` lacks `edit` or `execute`, or when `approval.autoApprovalEnabled` is false, or when `approval.forbiddenApprovalGroups` contains a needed permission; warn only, never abort
+- [x] Update the script header comment block to document the v2 invocation and the current `BOB_*` variables
+- [x] Preserve unchanged: the fence-aware awk mode classifier and its markers, `BOB_CHAT_MODE` override, `BOB_VERBOSE` validation, `emit_keepalive`, `neutralize_signal_text`, non-JSON diagnostic passthrough, `mktemp -d` plus FIFO stream merge, SIGTERM forwarding, exit-code preservation, and the no-diagnostic fallback message
+- [x] Verify with `bash -n scripts/bob-as-claude/bob-as-claude.sh` and `shellcheck scripts/bob-as-claude/bob-as-claude.sh` if available (shellcheck not installed in this environment; `bash -n` passed)
 
 ### Task 2: Rewrite the three custom modes for v2 groups and native subagents
 
