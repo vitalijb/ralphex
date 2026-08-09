@@ -11,9 +11,6 @@
 #   BOB_VERBOSE       - set to 1 to include tool_result output, tool markers, and
 #                        reasoning message text (default: 0)
 #   BOB_EXTRA_ARGS    - extra bob arguments, word-split on whitespace
-#   BOB_SETTINGS_FILE - override path to bob's approval settings.json
-#                        (default ~/.bob/settings/settings.json); shared with
-#                        install-modes.sh --grant-approvals
 
 set -euo pipefail
 
@@ -56,9 +53,6 @@ if [[ "$BOB_VERBOSE" != "0" && "$BOB_VERBOSE" != "1" ]]; then
     BOB_VERBOSE=0
 fi
 BOB_EXTRA_ARGS="${BOB_EXTRA_ARGS:-}"
-# HOME may be unset in a sanitized child env; the preflight is a warning, so it
-# must degrade to "cannot check" rather than abort the run under `set -u`.
-BOB_SETTINGS_FILE="${BOB_SETTINGS_FILE:-${HOME:+$HOME/.bob/settings/settings.json}}"
 
 # bob v2 stable has no model selection (gated behind an internal dev gateway key), and
 # has no --effort flag either. Accept both for compatibility with ralphex's per-phase
@@ -122,57 +116,10 @@ if [[ -z "$selected_chat_mode" ]]; then
     ')
 fi
 
-# Headless `bob run` registers no interactive approval handler; its only input is
-# ~/.bob/settings/settings.json. Warn (never abort) when the settings bob v2 requires
-# for edit/execute work are missing, so a hang or silent no-op has an explained cause.
-approval_preflight() {
-    # review mode drives native subagents, so it needs the subagent permission on
-    # top of edit/execute. warning about it in task mode would be a false alarm.
-    # needed_list mirrors needed_json for the messages below: naming only
-    # edit/execute in a review run would point at the wrong permissions when
-    # subagent is the one actually missing.
-    local needed_json='["edit","execute"]'
-    local needed_list="'edit' and 'execute'"
-    if [[ "$selected_chat_mode" == "ralphex-review" ]]; then
-        needed_json='["edit","execute","subagent"]'
-        needed_list="'edit', 'execute', and 'subagent'"
-    fi
-
-    if [[ -z "$BOB_SETTINGS_FILE" ]]; then
-        echo "warning: cannot locate bob v2 approval settings: HOME is unset and BOB_SETTINGS_FILE is not set, so the settings bob v2 needs for $needed_list work cannot be checked. Set BOB_SETTINGS_FILE to bob's settings.json path." >&2
-        return 0
-    fi
-
-    if [[ ! -f "$BOB_SETTINGS_FILE" ]]; then
-        echo "warning: bob v2 approval settings not found at $BOB_SETTINGS_FILE; $needed_list actions require approvals bob does not grant by default. Run scripts/bob-as-claude/install-modes.sh --grant-approvals to grant them." >&2
-        return 0
-    fi
-
-    local reason=""
-    if ! reason=$(jq -r --argjson needed "$needed_json" '
-        (.approval.allowed_permissions // []) as $perms |
-        (.approval.forbiddenApprovalGroups // []) as $forbidden |
-        (.approval.autoApprovalEnabled) as $auto |
-        [$needed[] | select(. as $n | ($perms | index($n)) == null)] as $missing |
-        [$needed[] | select(. as $n | ($forbidden | index($n)) != null)] as $blocked |
-        if ($missing | length) > 0 then
-            "allowed_permissions is missing " + ($missing | join(", "))
-        elif ($auto == false) then
-            "autoApprovalEnabled is false"
-        elif ($blocked | length) > 0 then
-            "forbiddenApprovalGroups blocks " + ($blocked | join(", "))
-        else
-            ""
-        end
-    ' "$BOB_SETTINGS_FILE" 2>/dev/null); then
-        echo "warning: cannot read bob v2 approval settings at $BOB_SETTINGS_FILE; bob will fall back to its read-only defaults, which cannot approve $needed_list. Fix the file, or run scripts/bob-as-claude/install-modes.sh --grant-approvals" >&2
-        return 0
-    fi
-
-    [[ -n "$reason" ]] && echo "warning: bob v2 approval settings may block task/review work ($reason); run scripts/bob-as-claude/install-modes.sh --grant-approvals to grant the needed approvals" >&2
-    return 0
-}
-approval_preflight
+# Tool access in headless `bob run` is governed by the mode's `groups` list plus
+# `--trust` (and bob's own outside-workspace block). The `approval.*` settings in
+# ~/.bob/settings/settings.json are read only by the interactive approval handler,
+# which `bob run` never constructs, so there is nothing to preflight here.
 
 # build bob arguments. the prompt is delivered through stdin, not argv. Never pass
 # --disable-subagents: review mode relies on native subagent orchestration.
@@ -551,7 +498,12 @@ while IFS= read -r line || [[ -n "$line" ]]; do
         fi
     elif [[ "$event_type" == "tool_result" && "$event_status" == "error" ]]; then
         flush_task_buffer_remainder
-        emit_text_delta "[tool_error] ${event_error_message//<<<RALPHEX:/<<< RALPHEX:}"$'\n'
+        # same reasoning as the `error` event above: this line marks the failure
+        # detail as emitted, so a message-less tool error must still name a cause
+        # instead of leaving a bare "[tool_error]" behind.
+        tool_error_detail="${event_error_message//<<<RALPHEX:/<<< RALPHEX:}"
+        [[ -n "${tool_error_detail//[[:space:]]/}" ]] || tool_error_detail="unspecified bob tool error"
+        emit_text_delta "[tool_error] $tool_error_detail"$'\n'
         bob_failure_detail_emitted=1
     elif [[ "$BOB_VERBOSE" == "1" && "$event_type" == "tool_result" && "$event_status" == "success" ]]; then
         flush_task_buffer_remainder
@@ -584,7 +536,10 @@ stop_bob_bounded() {
         # here means bob is gone rather than an unreaped zombie.
         for ((waited = 0; waited < 20; waited++)); do
             kill -0 "$bob_pid" 2>/dev/null || return 0
-            sleep 0.1
+            # `set -e` is active: a sleep interrupted by a signal, or a sleep that
+            # rejects the fractional argument, must not abort the whole wrapper
+            # before the result event is emitted.
+            sleep 0.1 || true
         done
     done
 }

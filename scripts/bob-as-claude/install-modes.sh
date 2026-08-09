@@ -1,26 +1,19 @@
 #!/usr/bin/env bash
-# install the shipped ralphex modes into Bob's global custom-mode document,
-# and optionally grant the approval settings headless bob v2 requires.
+# install the shipped ralphex modes into Bob's global custom-mode document.
 #
 # usage:
-#   install-modes.sh                    # install modes only (default)
-#   install-modes.sh --grant-approvals  # also merge ~/.bob/settings/settings.json
+#   install-modes.sh
 #
-# --grant-approvals broadens approval.allowed_permissions and the
-# execute_command entry of approval.allowedExecutors for ALL bob usage on this
-# machine, not just ralphex-invoked runs. It is opt-in on purpose.
+# tool access for headless `bob run` comes from each mode's `groups` list plus
+# `--trust`; the approval.* settings in ~/.bob/settings/settings.json are read
+# only by bob's interactive approval handler, which `bob run` never constructs.
+# So installing the modes is the whole setup step.
 
 set -euo pipefail
 
-grant_approvals=0
 for arg in "$@"; do
-    case "$arg" in
-        --grant-approvals) grant_approvals=1 ;;
-        *)
-            echo "error: unknown argument: $arg" >&2
-            exit 1
-            ;;
-    esac
+    echo "error: unknown argument: $arg" >&2
+    exit 1
 done
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -44,205 +37,15 @@ error() {
     exit 1
 }
 
-# both temp files are tracked from here, before any of them exists, so the trap
-# covers every exit path — including --grant-approvals on the "modes already
-# installed" branch, which returns before the mode temp file is ever created.
+# tracked from here, before the file exists, so the trap covers every exit path.
 tmp_file=""
-approval_tmp_file=""
 cleanup() {
     if [[ -n "$tmp_file" && -e "$tmp_file" ]]; then
         rm -f "$tmp_file"
     fi
-    if [[ -n "$approval_tmp_file" && -e "$approval_tmp_file" ]]; then
-        rm -f "$approval_tmp_file"
-    fi
     return 0
 }
 trap cleanup EXIT
-
-# resolve the approval-settings path once so the precondition check and the merge
-# below can never disagree about which file is being inspected.
-approval_settings_target() {
-    if [[ -n "${BOB_SETTINGS_FILE:-}" ]]; then
-        printf '%s\n' "$BOB_SETTINGS_FILE"
-    else
-        printf '%s\n' "${HOME:?HOME is required}/.bob/settings/settings.json"
-    fi
-}
-
-# every reason the grant can refuse, factored out so it runs BEFORE the modes are
-# installed. Refusing afterwards leaves the modes written while the nonzero exit
-# reads as "nothing happened", and the re-run then reports the modes as already
-# installed with no hint that half the operation had succeeded.
-check_approval_preconditions() {
-    command -v jq >/dev/null 2>&1 ||
-        error "jq is required for --grant-approvals"
-
-    local approval_target
-    approval_target="$(approval_settings_target)"
-
-    if [[ -L "$approval_target" ]]; then
-        error "refusing to replace symlink: $approval_target"
-    fi
-    if [[ -e "$approval_target" && ! -f "$approval_target" ]]; then
-        error "approval-settings target is not a regular file: $approval_target"
-    fi
-    if [[ -e "$approval_target" && -L "$approval_target.bak" ]]; then
-        error "refusing to write backup through symlink: $approval_target.bak"
-    fi
-    if [[ -e "$approval_target" && -s "$approval_target" ]]; then
-        # a document that is not an object, or whose approval block does not match
-        # bob v2's schema, cannot be merged without guessing. Refuse up front
-        # rather than letting the merge queries abort with a raw jq type error
-        # after the modes have already been installed.
-        jq -e '
-            type == "object" and
-            ((.approval // {}) | type == "object") and
-            (((.approval // {}).allowed_permissions // []) | type == "array") and
-            (((.approval // {}).forbiddenApprovalGroups // []) | type == "array") and
-            (((.approval // {}).allowedExecutors // []) |
-                type == "array" and
-                all(type == "object" and
-                    ((.approvedCommands // []) | type == "array") and
-                    ((.deniedCommands // []) | type == "array")))
-        ' "$approval_target" >/dev/null 2>&1 ||
-            error "cannot safely merge existing approval-settings document: $approval_target"
-    fi
-}
-
-# merge the approval settings headless bob v2 needs into settings.json.
-# union-only: never removes existing entries, never touches deniedCommands,
-# and is a no-op on a second run against the same input.
-grant_approval_settings() {
-    # re-checked here so the function is safe on its own; the caller runs it
-    # earlier too, where a refusal still leaves nothing installed.
-    check_approval_preconditions
-
-    local approval_target
-    approval_target="$(approval_settings_target)"
-    local approval_dir
-    approval_dir="$(dirname "$approval_target")"
-
-    local existing_json
-    if [[ -e "$approval_target" && -s "$approval_target" ]]; then
-        existing_json="$(cat "$approval_target")"
-    else
-        existing_json='{}'
-    fi
-
-    # bob v2 stores allowedExecutors as an ARRAY of {toolId, approvedCommands,
-    # deniedCommands} records and looks the executor up with Array.prototype.find,
-    # so an object-shaped value makes every approval throw a TypeError. bob's
-    # settings merge also does not recurse into arrays, which means a user-supplied
-    # array REPLACES its read-only defaults wholesale — hence the trailing
-    # read-only prefixes below, which restate the defaults the bare `git` prefix
-    # does not already subsume.
-    local wanted_permissions_json='["read","edit","execute","subagent","todo"]'
-    local wanted_commands_json='["git","go","make","npm","npx","gofmt","golangci-lint","python3","cat","grep","head","tail","ls","sort","wc","which","du","df"]'
-
-    # all five summary values come out of one jq pass, NUL-separated, so a merge
-    # costs one jq process instead of five (same pattern as parse_bob_event in
-    # bob-as-claude.sh). Values are joined lists or booleans and never contain NUL.
-    local added_permissions added_commands auto_approval_was_absent
-    local auto_approval_disabled forbidden_conflicts
-    {
-        IFS= read -r -d '' added_permissions &&
-            IFS= read -r -d '' added_commands &&
-            IFS= read -r -d '' auto_approval_was_absent &&
-            IFS= read -r -d '' auto_approval_disabled &&
-            IFS= read -r -d '' forbidden_conflicts
-    } < <(
-        jq -j --argjson wanted_permissions "$wanted_permissions_json" \
-              --argjson wanted_commands "$wanted_commands_json" '
-            ((.approval.allowed_permissions // []) as $existing
-             | [$wanted_permissions[] | select(. as $p | ($existing | index($p)) == null)]
-             | join(", ")), "\u0000",
-            (((.approval.allowedExecutors // [])
-                | map(select(.toolId == "execute_command"))
-                | first | .approvedCommands // []) as $existing
-             | [$wanted_commands[] | select(. as $c | ($existing | index($c)) == null)]
-             | join(", ")), "\u0000",
-            ((((.approval // {}) | has("autoApprovalEnabled")) | not) | tostring), "\u0000",
-            ((((.approval // {}).autoApprovalEnabled) == false) | tostring), "\u0000",
-            ((.approval.forbiddenApprovalGroups // []) as $forbidden
-             | [$forbidden[] | select(. as $f | ($wanted_permissions | index($f)) != null)]
-             | join(", ")), "\u0000"
-        ' <<<"$existing_json"
-    )
-
-    local updated_json
-    updated_json=$(jq --argjson wanted_permissions "$wanted_permissions_json" \
-                       --argjson wanted_commands "$wanted_commands_json" '
-        .approval = (.approval // {})
-        | .approval.allowed_permissions =
-            (((.approval.allowed_permissions // []) + $wanted_permissions) | unique)
-        | .approval.autoApprovalEnabled =
-            (if (.approval | has("autoApprovalEnabled"))
-             then .approval.autoApprovalEnabled
-             else true end)
-        | .approval.allowedExecutors = (
-            (.approval.allowedExecutors // []) as $executors
-            | ($executors | map(.toolId) | index("execute_command")) as $idx
-            | if $idx == null then
-                  $executors + [{
-                      toolId: "execute_command",
-                      approvedCommands: ($wanted_commands | unique),
-                      deniedCommands: []
-                  }]
-              else
-                  $executors
-                  | .[$idx] = (.[$idx]
-                      | .approvedCommands =
-                          (((.approvedCommands // []) + $wanted_commands) | unique)
-                      | .deniedCommands = (.deniedCommands // []))
-              end
-          )
-    ' <<<"$existing_json")
-
-    if [[ -n "$forbidden_conflicts" ]]; then
-        echo "warning: approval.forbiddenApprovalGroups already contains: $forbidden_conflicts" \
-             "— those groups override the corresponding grant even after this change" >&2
-    fi
-    if [[ "$auto_approval_disabled" == "true" ]]; then
-        echo "warning: approval.autoApprovalEnabled is false in $approval_target" \
-             "— bob refuses every auto-approval while it stays false, so this grant" \
-             "has no effect until you set it to true" >&2
-    fi
-
-    # compare canonicalized single-line forms rather than shelling out to diff:
-    # only equality matters here, and the merge is union-only so key order is the
-    # sole cosmetic difference `jq -S` has to absorb.
-    if [[ "$(jq -Sc . <<<"$existing_json")" == "$(jq -Sc . <<<"$updated_json")" ]]; then
-        echo "approval settings already granted in $approval_target"
-        return
-    fi
-
-    mkdir -p "$approval_dir"
-    if [[ -e "$approval_target" ]]; then
-        if [[ -L "$approval_target.bak" ]]; then
-            error "refusing to write backup through symlink: $approval_target.bak"
-        fi
-        cp -p "$approval_target" "$approval_target.bak"
-    fi
-
-    # the document came out of jq, but the file about to replace the user's real
-    # settings is what matters: a short write (full disk, interrupted printf) would
-    # install a truncated document. Validate the temp file, not the string.
-    local approval_tmp
-    approval_tmp=$(mktemp "$approval_dir/.settings.json.tmp.XXXXXX")
-    approval_tmp_file="$approval_tmp"
-    printf '%s\n' "$updated_json" > "$approval_tmp"
-    jq -e . "$approval_tmp" >/dev/null 2>&1 ||
-        error "generated approval-settings document failed validation: $approval_target"
-    mv -f "$approval_tmp" "$approval_target"
-    approval_tmp_file=""
-
-    echo "granted approval settings in $approval_target:"
-    [[ -n "$added_permissions" ]] && echo "  added permissions: $added_permissions"
-    [[ "$auto_approval_was_absent" == "true" ]] && echo "  set autoApprovalEnabled: true (was unset)"
-    [[ -n "$added_commands" ]] && echo "  added command prefixes: $added_commands"
-    echo "  warning: broadening approvedCommands affects all bob usage on this machine, not just ralphex"
-}
 
 # accept a conservative yaml subset with one top-level customModes sequence.
 # rejecting unsupported yaml features is preferable to replacing a document
@@ -553,12 +356,6 @@ if [[ -e "$target" ]]; then
     document_is_safe "$target" || error "cannot safely merge existing custom-mode document: $target"
 fi
 
-# refuse an unmergeable settings.json before writing any mode, so a rejected
-# grant never leaves a half-applied install behind.
-if [[ "$grant_approvals" -eq 1 ]]; then
-    check_approval_preconditions
-fi
-
 missing=()
 if [[ ! -e "$target" || ! -s "$target" ]]; then
     missing=("${modes[@]}")
@@ -570,9 +367,6 @@ fi
 
 if [[ ${#missing[@]} -eq 0 ]]; then
     echo "ralphex modes already installed in $target"
-    if [[ "$grant_approvals" -eq 1 ]]; then
-        grant_approval_settings
-    fi
     exit 0
 fi
 
@@ -607,7 +401,3 @@ document_is_safe "$tmp_file" ||
 mv -f "$tmp_file" "$target"
 tmp_file=""
 echo "installed ralphex modes in $target"
-
-if [[ "$grant_approvals" -eq 1 ]]; then
-    grant_approval_settings
-fi

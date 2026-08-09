@@ -254,41 +254,40 @@ assert_contains \
     "$REPO_ROOT/scripts/bob-as-claude/README.md" \
     "idle_timeout" \
     "wrapper README documents subagent silence and idle_timeout"
+# headless `bob run` never constructs bob's approval handler, so the docs must describe
+# mode groups + --trust as the only gate and must not send users to a settings grant.
 assert_contains \
     "$REPO_ROOT/scripts/bob-as-claude/README.md" \
-    "--grant-approvals" \
-    "wrapper README documents the approval grant flag"
+    "### What governs tool access" \
+    "wrapper README documents what governs headless tool access"
 assert_contains \
     "$REPO_ROOT/scripts/bob-as-claude/README.md" \
-    "~/.bob/settings/settings.json" \
-    "wrapper README documents the approval settings path"
+    "getToolsForGroups" \
+    "wrapper README names the mode-group tool resolution"
 assert_contains \
     "$REPO_ROOT/scripts/bob-as-claude/README.md" \
-    "BOB_SETTINGS_FILE" \
-    "wrapper README documents the settings path override"
-# the grant list is 18 prefixes, not the 8 project ones alone: the read-only tail
-# exists because bob's merge does not recurse into arrays, so a doc that lists only
-# the project prefixes reads as a narrower grant than the installer actually makes.
+    "is **not** read by \`bob run\`" \
+    "wrapper README states approval settings are unread headlessly"
 assert_contains \
     "$REPO_ROOT/scripts/bob-as-claude/README.md" \
-    '`du`, `df`' \
-    "wrapper README lists the read-only command prefixes"
+    "handleToolApproval" \
+    "wrapper README names the interactive-only approval entry point"
 assert_contains \
     "$REPO_ROOT/scripts/bob-as-claude/README.md" \
-    "does not recurse into arrays" \
-    "wrapper README explains why read-only prefixes are restated"
-assert_contains \
-    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
-    '{toolId, approvedCommands, deniedCommands}' \
-    "wrapper README documents allowedExecutors as an array of records"
-assert_contains \
-    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
-    "A review prompt additionally requires \`subagent\`" \
-    "wrapper README documents the review-mode subagent preflight requirement"
+    "\`--auto-approve\` exists on \`bob chat\` but not on \`bob run\`" \
+    "wrapper README cites --auto-approve as evidence"
 assert_not_contains \
     "$REPO_ROOT/scripts/bob-as-claude/README.md" \
-    "allowedExecutors.execute_command.approvedCommands" \
-    "wrapper README drops the object dot-path for allowedExecutors"
+    "--grant-approvals" \
+    "wrapper README drops the removed approval grant flag"
+assert_not_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "BOB_SETTINGS_FILE" \
+    "wrapper README drops the removed settings path override"
+assert_not_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "allowedExecutors" \
+    "wrapper README drops the unreachable allowedExecutors guidance"
 assert_not_contains \
     "$REPO_ROOT/scripts/bob-as-claude/README.md" \
     "15-entry" \
@@ -409,40 +408,40 @@ assert_contains \
     "custom providers doc states the minimum bob version"
 assert_contains \
     "$REPO_ROOT/docs/custom-providers.md" \
-    "### Approval prerequisite" \
-    "custom providers doc documents the approval prerequisite"
+    "### What governs tool access" \
+    "custom providers doc documents what governs headless tool access"
 assert_contains \
     "$REPO_ROOT/docs/custom-providers.md" \
-    "install-modes.sh --grant-approvals" \
-    "custom providers doc documents the approval grant flag"
+    "getToolsForGroups" \
+    "custom providers doc names the mode-group tool resolution"
 assert_contains \
     "$REPO_ROOT/docs/custom-providers.md" \
-    "BOB_SETTINGS_FILE" \
-    "custom providers doc documents the settings path override"
+    "is **not** consulted by \`bob run\`" \
+    "custom providers doc states approval settings are unread headlessly"
 assert_contains \
     "$REPO_ROOT/docs/custom-providers.md" \
-    '`du`, `df`' \
-    "custom providers doc lists the read-only command prefixes"
+    "handleToolApproval" \
+    "custom providers doc names the interactive-only approval entry point"
 assert_contains \
     "$REPO_ROOT/docs/custom-providers.md" \
-    "does not recurse into arrays" \
-    "custom providers doc explains why read-only prefixes are restated"
+    "\`--auto-approve\` exists on \`bob chat\` but not on \`bob run\`" \
+    "custom providers doc cites --auto-approve as evidence"
 assert_contains \
     "$REPO_ROOT/docs/custom-providers.md" \
-    '{toolId, approvedCommands, deniedCommands}' \
-    "custom providers doc documents allowedExecutors as an array of records"
-assert_contains \
-    "$REPO_ROOT/docs/custom-providers.md" \
-    "no shipped mode declares the \`todo\` group" \
-    "custom providers doc corrects the todo group claim"
-assert_contains \
-    "$REPO_ROOT/docs/custom-providers.md" \
-    "review phases additionally need \`subagent\`" \
-    "custom providers doc documents the review-mode subagent requirement"
+    "\`ralphex-review\` adds \`subagent\`" \
+    "custom providers doc documents the review-mode subagent group"
 assert_not_contains \
     "$REPO_ROOT/docs/custom-providers.md" \
-    "allowedExecutors.execute_command.approvedCommands" \
-    "custom providers doc drops the object dot-path for allowedExecutors"
+    "--grant-approvals" \
+    "custom providers doc drops the removed approval grant flag"
+assert_not_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "BOB_SETTINGS_FILE" \
+    "custom providers doc drops the removed settings path override"
+assert_not_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "allowedExecutors" \
+    "custom providers doc drops the unreachable allowedExecutors guidance"
 assert_not_contains \
     "$REPO_ROOT/docs/custom-providers.md" \
     "15-entry" \
@@ -570,20 +569,20 @@ assert_contains \
     "top-level README states the minimum bob version"
 assert_contains \
     "$REPO_ROOT/README.md" \
-    "install-modes.sh --grant-approvals" \
-    "top-level README documents the approval grant flag"
+    "does not read the \`approval\` section" \
+    "top-level README states approval settings are unread headlessly"
 assert_contains \
     "$REPO_ROOT/README.md" \
-    "18-entry command-prefix list" \
-    "top-level README sizes the granted command-prefix list"
-assert_contains \
+    "installing the modes is the whole setup step" \
+    "top-level README states mode installation is the only setup step"
+assert_not_contains \
     "$REPO_ROOT/README.md" \
-    "does not recurse into arrays" \
-    "top-level README explains why read-only prefixes are restated"
-assert_contains \
+    "--grant-approvals" \
+    "top-level README drops the removed approval grant flag"
+assert_not_contains \
     "$REPO_ROOT/README.md" \
     "BOB_SETTINGS_FILE" \
-    "top-level README documents the settings path override"
+    "top-level README drops the removed settings path override"
 # the v1 flags and terminal tool are gone from every live doc. --yolo is excluded here:
 # the bob sections mention it in "removed in v2" prose, and Copilot's docs use it for real.
 # docs/custom-providers.md is excluded from the loop for the same reason — its migration
@@ -652,16 +651,16 @@ assert_contains \
     "llms.txt documents the v2 invocation"
 assert_contains \
     "$REPO_ROOT/llms.txt" \
-    "install-modes.sh --grant-approvals" \
-    "llms.txt documents the approval grant flag"
+    "it does not read the \`approval\` section" \
+    "llms.txt states approval settings are unread headlessly"
 assert_contains \
     "$REPO_ROOT/llms.txt" \
-    "18-entry command-prefix list" \
-    "llms.txt sizes the granted command-prefix list"
-assert_contains \
+    "installing the shipped modes is the whole setup step" \
+    "llms.txt states mode installation is the only setup step"
+assert_not_contains \
     "$REPO_ROOT/llms.txt" \
-    "does not recurse into arrays" \
-    "llms.txt explains why read-only prefixes are restated"
+    "--grant-approvals" \
+    "llms.txt drops the removed approval grant flag"
 assert_contains \
     "$REPO_ROOT/llms.txt" \
     "spawn_subagent" \
@@ -710,28 +709,24 @@ assert_contains \
     "CLAUDE documents the v2 reasoning flag"
 assert_contains \
     "$REPO_ROOT/CLAUDE.md" \
-    'before automatic selection, and add `--grant-approvals`' \
-    "CLAUDE documents the approval grant flag"
+    "there is no approval preflight and no \`BOB_SETTINGS_FILE\` handling" \
+    "CLAUDE states the approval preflight is gone"
 assert_contains \
     "$REPO_ROOT/CLAUDE.md" \
-    "plus 18 command prefixes" \
-    "CLAUDE sizes the granted command-prefix list"
+    "Do not reintroduce an approval preflight" \
+    "CLAUDE warns against reintroducing the approval preflight"
 assert_contains \
     "$REPO_ROOT/CLAUDE.md" \
-    "does not recurse into arrays" \
-    "CLAUDE explains why read-only prefixes are restated"
-assert_contains \
-    "$REPO_ROOT/CLAUDE.md" \
-    "ARRAY of \`{toolId, approvedCommands, deniedCommands}\` records" \
-    "CLAUDE documents allowedExecutors as an array of records"
+    "the installer takes no arguments and rejects unknown ones" \
+    "CLAUDE documents the argument-free installer"
 assert_contains \
     "$REPO_ROOT/CLAUDE.md" \
     "\`severity\` is not inspected" \
     "CLAUDE states error severity is not inspected"
-assert_contains \
+assert_not_contains \
     "$REPO_ROOT/CLAUDE.md" \
-    "BOB_SETTINGS_FILE" \
-    "CLAUDE documents the settings path override"
+    "\`BOB_VERBOSE\`, \`BOB_EXTRA_ARGS\`, \`BOB_SETTINGS_FILE\`" \
+    "CLAUDE drops BOB_SETTINGS_FILE from the bob env-var list"
 assert_contains \
     "$REPO_ROOT/CLAUDE.md" \
     "spawn_subagent" \

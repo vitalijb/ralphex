@@ -31,14 +31,13 @@ ralphex --claude-command=/path/to/scripts/bob-as-claude/bob-as-claude.sh docs/pl
 
 ## Setup
 
-Setup is two steps: install the custom modes, then grant bob the approvals a headless run needs.
+Setup is one step: install the custom modes.
 
 ```bash
-bash scripts/bob-as-claude/install-modes.sh                    # step 1: modes only
-bash scripts/bob-as-claude/install-modes.sh --grant-approvals  # step 2: modes + approvals
+bash scripts/bob-as-claude/install-modes.sh
 ```
 
-### Step 1: installing custom modes
+### Installing custom modes
 
 The installer creates Bob's active global `~/.bob/settings/custom_modes.yaml` when needed. If only the legacy `~/.bob/custom_modes.yaml` exists, it merges that file so Bob can migrate the complete document on its next start. It preserves unrelated modes, appends only missing ralphex slugs, treats an existing ralphex slug as a user-owned override, and is idempotent. Conservative syntax checks run before and after the merge, followed by an atomic replacement; malformed or unsupported input fails without changing the target. Set `BOB_CUSTOM_MODES_FILE=/path/to/custom_modes.yaml` to use another target.
 
@@ -52,22 +51,18 @@ bob v2 accepts only these tool-group names: `read`, `edit`, `execute`, `mcp`, `s
 | `ralphex-review` | `read`, `edit`, `execute`, `subagent` | Parallel native `spawn_subagent` review work, consolidated and verified fixes, tests, commits, and ralphex signals. |
 | `ralphex-plan` | `read`, `edit`, `execute` | Interactive plan creation without source edits; writes the accepted plan under `docs/plans`. |
 
-### Step 2: granting approvals
+### What governs tool access
 
-Headless `bob run` registers no interactive approval handler — there is no TTY to prompt and no per-run auto-approve flag (`--yolo` was removed in v2, and `--auto-approve` exists only on `bob chat`, which `bob run` rejects). Bob's only input is the `approval` section of `~/.bob/settings/settings.json`, whose defaults are `allowed_permissions: ["read"]` and a read-only `approvedCommands` list. Without a grant, `edit` and real commands (`go test`, `git commit`, `make lint`) are not approved and a task run does no work.
+Two things decide what bob may do in a headless run:
 
-`install-modes.sh --grant-approvals` merges the needed settings:
+- **the active mode's `groups` list** (the table above) — `getToolsForMode()` resolves to `getToolsForGroups(groups)`, so only tools in a declared group are registered with the model at all.
+- **`--trust`**, always passed — bob refuses an untrusted directory outright, and it is what makes writes land on the real filesystem.
 
-- unions `approval.allowed_permissions` with `read`, `edit`, `execute`, `subagent`, `todo`
-- unions `approvedCommands` on the `approval.allowedExecutors` record whose `toolId` is `execute_command` with `git`, `go`, `make`, `npm`, `npx`, `gofmt`, `golangci-lint`, `python3`, `cat`, `grep`, `head`, `tail`, `ls`, `sort`, `wc`, `which`, `du`, `df` (command matching is longest-prefix with no wildcard, so prefixes must be enumerated). `allowedExecutors` is an **array** of `{toolId, approvedCommands, deniedCommands}` records that bob looks up with `Array.prototype.find` — an object-shaped value makes every approval throw a `TypeError`
-- sets `approval.autoApprovalEnabled` to true only when the key is absent
-- never touches `deniedCommands`, warns when `forbiddenApprovalGroups` already blocks a granted permission, backs the file up, validates JSON before and after, writes atomically, and is idempotent
+Bob also blocks tool calls targeting paths outside the workspace; that check is installed unconditionally on the headless path.
 
-The read-only tail of that prefix list (`cat` through `df`) is not extra privilege. Bob's settings merge does not recurse into arrays, so a written `approvedCommands` array **replaces** bob's read-only defaults wholesale; those prefixes restate the defaults the project prefixes do not already subsume. `todo` is granted for the same forward-compatibility reason — no shipped mode declares the `todo` group today.
+The `approval` section of `~/.bob/settings/settings.json` is **not** read by `bob run`. Bob's `ApprovalEngine` is reachable only through `ToolApprovalHandler.handleToolApproval`, whose one caller is the interactive TUI's pending-tool reducer; the handler is constructed only in the interactive session controller's `initialize()`, which the headless path never calls (it registers just the outside-workspace blocker and the renderer). That is also why `--auto-approve` exists on `bob chat` but not on `bob run`.
 
-Set `BOB_SETTINGS_FILE=/path/to/settings.json` to target another file. **The grant is machine-wide:** bob's global directory is `~/.bob` with no environment override, so broadening `approvedCommands` affects all bob usage on the machine, not just ralphex-invoked runs. That is why the flag is opt-in and left to an explicit, user-run command.
-
-The wrapper itself never writes to `~/.bob/`. It only runs a preflight check and prints one actionable stderr warning naming the installer when the settings path cannot be resolved (file missing, or `HOME` unset with no `BOB_SETTINGS_FILE`), `allowed_permissions` lacks `edit`/`execute`, `autoApprovalEnabled` is false, or `forbiddenApprovalGroups` blocks a needed permission. A review prompt additionally requires `subagent`, since `ralphex-review` drives native subagents. It warns and continues, never aborts.
+So there is nothing to grant: a stock bob install with `allowed_permissions: ["read"]` and `autoApprovalEnabled: false` runs ralphex task and review phases fine. Changing `approval.*` affects only interactive `bob chat` — setting `autoApprovalEnabled: true` there turns off your own confirmation prompts — so neither the wrapper nor the installer writes to `~/.bob/settings/settings.json`.
 
 **Environment variables:**
 
@@ -75,7 +70,6 @@ The wrapper itself never writes to `~/.bob/`. It only runs a preflight check and
 - `BOB_MODEL` — accepted for compatibility and **ignored**; bob v2 stable has no model selection. A non-empty value produces one stderr note.
 - `BOB_VERBOSE` — set to `1` to include task/review `tool_result` output, `[tool]` markers, and reasoning message text (default: `0`; plan mode emits only the validated boundary)
 - `BOB_EXTRA_ARGS` — extra flags appended verbatim to the bob invocation (word-split on whitespace). The wrapper builds the bob command line itself and ignores unknown flags, so this is the only way to pass through arbitrary bob options. Example: `BOB_EXTRA_ARGS="--max-cost=5"`. **Limitation:** word-splitting does NOT preserve quotes; arguments containing spaces or quotes cannot be expressed via `BOB_EXTRA_ARGS`.
-- `BOB_SETTINGS_FILE` — override the approval-settings path (default `~/.bob/settings/settings.json`) used by the wrapper's preflight and by `install-modes.sh --grant-approvals`.
 
 **Model and effort:** neither is forwarded to bob. ralphex supplies `--model` and `--effort` with each value in the following argv entry; the wrapper also accepts `--model=<m>` and `--effort=<e>` for direct invocations, plus `BOB_MODEL`. All are accepted and **ignored** — bob v2 stable removed `-m`/`--model` (it is gated behind an internal dev gateway key) and has never had an `--effort` flag — with one stderr note per non-empty value so ralphex's per-phase model flags cannot fail a bob run.
 
@@ -97,7 +91,7 @@ Subagent lifecycle callbacks are debug-log only in v2, so subagent work produces
 
 ### `--trust`
 
-The wrapper always passes `--trust` so bob writes to the real filesystem. Without it, bob's writes go to a sandbox and do not persist — task work would be lost. Do NOT pass `--sandbox` via `BOB_EXTRA_ARGS`; it would override the real-filesystem behavior. `--trust` also keeps `autoApprovalEnabled` in effect, since an untrusted workspace forces it off.
+The wrapper always passes `--trust` so bob writes to the real filesystem. Without it, bob's writes go to a sandbox and do not persist — task work would be lost. Do NOT pass `--sandbox` via `BOB_EXTRA_ARGS`; it would override the real-filesystem behavior. Bob refuses an untrusted directory outright, so `--trust` is not optional for unattended runs.
 
 ### Plan-mode boundaries
 
@@ -119,13 +113,12 @@ The unit test uses a mock bob — no real API calls are made.
 - `bob` CLI installed and accessible, **version 2.0.0 or newer** (the wrapper depends on the `run` subcommand, `-f stream-json`, `--mode=<slug>`, `--trust`, and the v2 event schema). bob 1.0.x is not supported: it has no `run` subcommand, and the wrapper contains no version-detection branch or v1 compatibility layer. Verify with `bob --version`.
 - `jq` for JSON translation
 - `awk` for fence-aware phase-marker detection outside ```/~~~ blocks
-- approvals granted in `~/.bob/settings/settings.json` (see [Step 2: granting approvals](#step-2-granting-approvals))
 
 ## Limitations
 
 - **`BOB_EXTRA_ARGS` word-splitting does not preserve quotes.** A value like `--flag="a b"` is split into multiple tokens, and arguments containing spaces or quotes cannot be expressed via `BOB_EXTRA_ARGS`. Use a wrapper script that calls bob directly instead.
 - **No model or effort selection.** bob v2 stable removed `-m`/`--model`, and bob has never had an `--effort` flag. `--model`, `--effort`, and `BOB_MODEL` are accepted and ignored with a stderr note; there is no `BOB_EFFORT` env var. Use `BOB_CHAT_MODE` to control behavior instead.
-- **Approvals are a machine-wide prerequisite.** Headless bob cannot prompt, so `edit`/`execute` work depends on `~/.bob/settings/settings.json`. Bob offers no per-run or per-directory override, so granting approvals affects every bob invocation on the machine.
+- **No per-tool confirmation is possible.** Headless `bob run` never constructs bob's approval handler, so the active mode's `groups` list is the only thing narrowing what bob may call. A mode granting `execute` grants every command bob decides to run.
 - **Custom modes must be installed for automatic selection.** Run `bash scripts/bob-as-claude/install-modes.sh` first, or set `BOB_CHAT_MODE` to a mode that is already installed. The wrapper does not silently fall back to built-in modes.
 - **Subagent activity is invisible.** bob v2 emits no stream events for subagent lifecycle, so a parallel review phase can look idle for a long time. Tune or disable `idle_timeout` accordingly.
 - **bob v2 auto-loads skills from `~/.claude/skills`.** Its default global skill directories include Claude Code's, so a skill installed there is loaded into bob sessions and its instructions can compete with the ralphex prompt — the same skill-conflict class documented for codex. If a run behaves as though following different instructions, check what is installed there.
@@ -134,9 +127,9 @@ The unit test uses a mock bob — no real API calls are made.
 
 ## Security considerations
 
-- **The granted approvals auto-approve tool calls, and `--trust` writes to the real filesystem.** This is required for unattended task/review execution (ralphex has no TTY to confirm tool calls). Ensure the working directory is a git repository so changes are isolated to a feature branch. Do NOT run the wrapper in a directory with sensitive files you don't want bob to modify.
-- **Approval grants are broad and machine-wide.** `--grant-approvals` widens `allowed_permissions` and `approvedCommands` for every bob run on the machine. Review the printed summary. Narrowing the prefix list is possible by editing the settings file afterwards, but note that bob's merge does not recurse into arrays: any hand-written `approvedCommands` array replaces bob's read-only defaults, so drop the read-only prefixes only if you also accept losing those defaults.
-- **The wrapper never writes to `~/.bob/`.** Approval changes only happen through the explicit, user-run installer flag; the wrapper warns and continues.
+- **Headless runs are unconfirmed by design, and `--trust` writes to the real filesystem.** `bob run` has no approval prompt and no approval config, so every tool call the active mode permits executes without confirmation. This is required for unattended task/review execution (ralphex has no TTY). Ensure the working directory is a git repository so changes are isolated to a feature branch. Do NOT run the wrapper in a directory with sensitive files you don't want bob to modify.
+- **Restrict access by editing the mode, not bob's settings.** To narrow what a phase may do, drop a group from the corresponding `modes/*.yaml` (for example remove `execute` from `ralphex-plan`). Broadening `approval.*` in `~/.bob/settings/settings.json` does nothing for a headless run and silently disables the confirmation prompts in your interactive `bob chat` sessions.
+- **The wrapper never writes to `~/.bob/`.** Only the mode installer writes there, and only to `custom_modes.yaml`; bob's `settings.json` is never read or modified.
 - **stderr signal neutralization.** The wrapper re-emits bob's non-JSON diagnostic output as `content_block_delta` events so ralphex's error/limit pattern detection works. Any literal `<<<RALPHEX:` token there is neutralized to `<<< RALPHEX:` (space inserted) so stray diagnostics cannot be mistaken for a real completion signal. Rate-limit and `API Error:` phrases pass through verbatim for error/limit detection.
 - **Fence-aware phase selection.** Review and plan markers inside ` ``` ` or `~~~` blocks are ignored. This prevents quoted documentation or examples from changing the selected mode. `<<<RALPHEX:REVIEW_DONE>>>` is intentionally not a trigger because it is an output signal.
 - **Prompt delivery via stdin, not argv.** The prompt is written to a temp file and piped to bob via stdin, avoiding the 128KB per-arg cap and preventing the prompt from appearing in `ps`/process listings (argv is visible to other users on the same host).
@@ -145,13 +138,13 @@ The unit test uses a mock bob — no real API calls are made.
 
 ### bob does nothing, or reports it cannot edit files / run commands
 
-Approvals are missing. Headless `bob run` cannot prompt for them and there is no auto-approve flag in v2. Run:
+The tool is not in the active mode's `groups` list, so it was never registered. Check which mode was selected (the wrapper passes `--mode=<slug>`) and that the shipped modes are installed:
 
 ```bash
-bash scripts/bob-as-claude/install-modes.sh --grant-approvals
+bash scripts/bob-as-claude/install-modes.sh
 ```
 
-The wrapper prints a stderr warning naming this command when its preflight detects missing or blocked approvals.
+If the modes are installed and the groups look right, confirm `--trust` reached bob and that the target path is inside the workspace — bob blocks tool calls outside it. Bob's `approval.*` settings are not involved: `bob run` never reads them.
 
 ### No assistant text in the progress log
 
@@ -166,7 +159,7 @@ A review phase that goes quiet for a long stretch is expected: subagents emit no
 
 ### Files not written to disk
 
-Ensure `--trust` is present (it is by default). Do NOT pass `--sandbox` via `BOB_EXTRA_ARGS`; it would redirect bob's writes to a sandbox that doesn't persist. If files are still unwritten, check that `edit` is in `approval.allowed_permissions`.
+Ensure `--trust` is present (it is by default). Do NOT pass `--sandbox` via `BOB_EXTRA_ARGS`; it would redirect bob's writes to a sandbox that doesn't persist. If files are still unwritten, check that `edit` is in the selected mode's `groups` list and that the target is inside the workspace.
 
 ### Model selection not working
 

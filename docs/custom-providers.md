@@ -438,32 +438,20 @@ For a one-off run without editing config:
 ralphex --claude-command=/path/to/scripts/bob-as-claude/bob-as-claude.sh docs/plans/feature.md
 ```
 
-Setup is two steps: install the shipped custom modes, then grant the approval settings headless bob v2 needs.
+Setup is one step: install the shipped custom modes.
 
-### Approval prerequisite
+### What governs tool access
 
-Headless `bob run` registers no interactive approval handler — there is no TTY to prompt, and no per-run flag to auto-approve (`--yolo` is gone and `--auto-approve` exists only on `bob chat`, which `bob run` rejects). Its only input is the `approval` section of `~/.bob/settings/settings.json`. Bob's defaults are `allowed_permissions: ["read"]` plus a read-only `approvedCommands` list, so `edit` and real commands (`go test`, `git commit`, `make lint`) are **not** auto-approved out of the box and a task run does no work.
+Two things decide what bob may do in a headless run, and neither lives in bob's settings file:
 
-For ralphex phases, `approval` needs:
+- **the mode's `groups` list** — `getToolsForMode()` resolves a mode to `getToolsForGroups(groups)`, so only tools whose group the active mode declares are registered with the model at all. The shipped modes grant `read`/`edit`/`execute`, and `ralphex-review` adds `subagent`.
+- **`--trust`** — always passed. Without it `createRunContext` refuses an untrusted directory, and writes would not persist on the real filesystem.
 
-- `allowed_permissions` including `edit` and `execute`; review phases additionally need `subagent`, since `ralphex-review` drives native subagents
-- `autoApprovalEnabled` not set to `false` (an untrusted workspace forces it off, which is why `--trust` is always passed)
-- an `allowedExecutors` entry whose `toolId` is `execute_command`, with `approvedCommands` containing the command prefixes your project runs — matching is longest-prefix with no wildcard, so prefixes must be enumerated. `allowedExecutors` is an **array** of `{toolId, approvedCommands, deniedCommands}` records that bob looks up with `Array.prototype.find`; an object-shaped value makes every approval throw a `TypeError`
-- `forbiddenApprovalGroups` not listing a needed permission; it silently overrides the grant
+Bob additionally blocks tool calls that target paths outside the workspace; that observer is installed unconditionally on the headless path and is not configurable.
 
-Grant these with the installer's opt-in flag:
+The `approval` section of `~/.bob/settings/settings.json` is **not** consulted by `bob run`. Bob's `ApprovalEngine` is only reachable through `ToolApprovalHandler.handleToolApproval`, which is called from one place: the interactive TUI's pending-tool reducer. The handler itself is constructed once, inside the interactive session controller's `initialize()`, which the headless run path never calls — it installs only the outside-workspace blocker and the chosen renderer as `onToolCall` observers. This is also why `--auto-approve` exists on `bob chat` but not on `bob run`: there is nothing headless for it to override.
 
-```bash
-bash scripts/bob-as-claude/install-modes.sh --grant-approvals
-```
-
-That unions `allowed_permissions` with `read`, `edit`, `execute`, `subagent`, `todo`; unions the `execute_command` record's `approvedCommands` with `git`, `go`, `make`, `npm`, `npx`, `gofmt`, `golangci-lint`, `python3`, `cat`, `grep`, `head`, `tail`, `ls`, `sort`, `wc`, `which`, `du`, `df`; sets `autoApprovalEnabled` to true only when the key is absent; never touches `deniedCommands`; and prints exactly what it changed. It backs the file up, validates JSON before and after, writes atomically, preserves unrelated keys, and is idempotent. Set `BOB_SETTINGS_FILE=/path/to/settings.json` to target another file.
-
-The trailing read-only prefixes (`cat` through `df`) are not extra privilege — bob's settings merge does not recurse into arrays, so once a written `approvedCommands` array exists it **replaces** bob's read-only defaults wholesale. They restate the defaults that the project prefixes do not already subsume. `todo` is granted for the same forward-compatibility reason; no shipped mode declares the `todo` group today.
-
-Bob's global directory is `~/.bob` with no environment override, so **the grant is machine-wide: broadening `approvedCommands` affects all bob usage on the machine, not just ralphex-invoked runs.** That is why it is opt-in and left to an explicit, user-run command rather than done silently by the wrapper — the same rule ralphex applies to `~/.codex/`.
-
-The wrapper itself only runs a preflight check: when the settings file is missing (or `HOME` is unset and `BOB_SETTINGS_FILE` is not set, so the path cannot be resolved at all), `allowed_permissions` lacks `edit`/`execute` — plus `subagent` for a review prompt — `autoApprovalEnabled` is false, or `forbiddenApprovalGroups` blocks a needed permission, it prints one actionable stderr warning naming the installer. It never aborts, so a misconfigured run explains itself instead of silently doing nothing.
+So there is no approval prerequisite and nothing to grant. A default bob install with `allowed_permissions: ["read"]` and `autoApprovalEnabled: false` runs ralphex task and review phases fine. Editing `approval.*` changes only interactive `bob chat` behavior — in particular, setting `autoApprovalEnabled: true` there disables the confirmation prompts in your own interactive sessions, which is why the wrapper never writes to `~/.bob/` and the installer no longer offers to.
 
 ### Custom-mode installation and selection
 
@@ -493,7 +481,6 @@ The shipped mode tool groups are exact. bob v2 accepts only these group names �
 | `BOB_MODEL` | (unused) | Accepted for compatibility and **ignored** — bob v2 stable has no model selection. A non-empty value produces one stderr note. |
 | `BOB_VERBOSE` | `0` | Set to `1` to include task/review `tool_result` output, `[tool]` markers, and reasoning message text. Plan mode emits only its validated boundary. |
 | `BOB_EXTRA_ARGS` | (none) | Extra flags appended verbatim to the bob invocation (word-split on whitespace, **no quote preservation**); e.g. `--max-cost=5` to cap spend. |
-| `BOB_SETTINGS_FILE` | `~/.bob/settings/settings.json` | Approval-settings path read by the wrapper's preflight and written by `install-modes.sh --grant-approvals`. |
 
 ### Model and effort mapping
 
@@ -518,7 +505,7 @@ bob v2 emits these event types, and the wrapper translates them as follows. `att
 | `message` + `role == "assistant"` + `isReasoning` falsy | line-buffered `content_block_delta` per complete line (task/review); buffered for boundary detection (plan) |
 | `message` + `role == "assistant"` + `isReasoning: true` | empty keepalive delta; forwarded as text when `BOB_VERBOSE=1` |
 | plan-mode assistant deltas containing a complete valid boundary | one `content_block_delta` through `<<<RALPHEX:END>>>`, or the exact terminal marker |
-| `tool_result` + `status == "error"` | `content_block_delta` with `[tool_error] <error.message>` (always emitted; on error `output` is absent and the text moves to `error.message`) |
+| `tool_result` + `status == "error"` | `content_block_delta` with `[tool_error] <error.message>` (task/review; plan mode emits only its validated boundary. On error `output` is absent and the text moves to `error.message`) |
 | `tool_result` + `status == "success"` | skipped by default; `[tool_result] <output>` when `BOB_VERBOSE=1` |
 | `tool_use` | skipped by default; `[tool] <tool_name>` when `BOB_VERBOSE=1` |
 | `error` (any `severity`) | `content_block_delta` with `error: bob: <message>`, and a forced non-zero exit |
@@ -535,7 +522,7 @@ Exactly one `{"type":"result","result":""}` is emitted, unconditionally, after t
 
 ### Permissions and sandbox
 
-`--trust` is always passed so filesystem writes persist on the real FS; without it bob writes to a sandbox that does not persist and task work is lost. Do not override this via `BOB_EXTRA_ARGS`. Tool-call approval is *not* a flag in v2 — see [Approval prerequisite](#approval-prerequisite) above; without those settings bob has nothing to approve `edit` or `execute` with and the run does no work.
+`--trust` is always passed so filesystem writes persist on the real FS; without it bob refuses the directory and task work is lost. Do not override this via `BOB_EXTRA_ARGS`. Which tools bob may call is decided by the active mode's `groups` list, not by a flag and not by bob's approval settings — see [What governs tool access](#what-governs-tool-access) above.
 
 ### How it works
 

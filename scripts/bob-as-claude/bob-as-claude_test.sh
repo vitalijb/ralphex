@@ -340,18 +340,6 @@ MOCK_EOF
 
 create_mock_bob > /dev/null
 
-# every test runs against a compliant temporary approval file so the wrapper's
-# preflight stays silent and no test reads a developer's real ~/.bob/.
-cat > "$TMPDIR_TEST/bob_settings.json" << 'SETTINGS_EOF'
-{
-  "approval": {
-    "allowed_permissions": ["read", "edit", "execute", "subagent", "todo"],
-    "autoApprovalEnabled": true
-  }
-}
-SETTINGS_EOF
-export BOB_SETTINGS_FILE="$TMPDIR_TEST/bob_settings.json"
-
 # validate every shipped mode against bob's yaml shape, its v2 group allow-list,
 # and its v2 instruction contract. the glob (rather than a fixed slug list) makes
 # a newly added mode file fail until the validator knows about it.
@@ -1130,6 +1118,22 @@ if echo "$tool_error_string_output" | grep -q "\[tool_error\] plain string failu
     pass "string-shaped tool_result error text surfaced"
 else
     fail "string-shaped tool_result error text lost" "got: $tool_error_string_output"
+fi
+
+# a failed tool_result with no usable message must still name a cause: this line
+# marks the failure detail as emitted, so a bare "[tool_error]" would leave the
+# progress log with no searchable text for the failure at all.
+cat > "$TMPDIR_TEST/tool_error_blank_events.jsonl" << 'EOF'
+{"type":"tool_result","timestamp":"t","tool_id":"tool-1","status":"error","error":{"type":"execution","message":"   "}}
+{"type":"result","timestamp":"t","status":"success","stats":{}}
+EOF
+tool_error_blank_output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/tool_error_blank_events.jsonl" \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "test prompt" 2>/dev/null)
+if echo "$tool_error_blank_output" | grep -q "\[tool_error\] unspecified bob tool error"; then
+    pass "message-less tool_result error falls back to a named cause"
+else
+    fail "message-less tool_result error emitted no cause" "got: $tool_error_blank_output"
 fi
 
 # ---------------------------------------------------------------------------
@@ -2832,167 +2836,91 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# test: approval preflight warns when bob v2 cannot auto-approve edit/execute
+# test: the wrapper does not inspect bob's approval settings
 #
-# headless `bob run` registers no interactive approval handler, so its only
-# input is bob's global settings.json. The wrapper warns and continues; it must
-# never abort. Every case below uses a temporary HOME and clears the exported
-# BOB_SETTINGS_FILE override, so the default path is exercised without reading
-# or writing a real ~/.bob/.
+# tool access in headless `bob run` comes from the mode's `groups` list plus
+# `--trust`. The approval.* block in bob's settings.json is read only by the
+# interactive approval handler, which `bob run` never constructs, so the wrapper
+# must not warn about it — a warning there fires on every default install and
+# points at a setting that changes nothing for a headless run.
 # ---------------------------------------------------------------------------
-echo "test: approval preflight"
+echo "test: no approval preflight"
 
 preflight_home="$TMPDIR_TEST/preflight-home"
-preflight_settings="$preflight_home/.bob/settings/settings.json"
 mkdir -p "$preflight_home/.bob/settings"
+# bob's own read-only default shape: nothing here grants edit or execute.
+printf '%s\n' '{"approval":{"allowed_permissions":["read"],"autoApprovalEnabled":false}}' \
+    > "$preflight_home/.bob/settings/settings.json"
 
-# runs the wrapper against $preflight_settings; sets preflight_err/preflight_rc.
-# $2 is the prompt, which selects the mode the preflight sees (task by default).
-run_preflight() {
-    local settings="$1"
-    local prompt="${2:-test prompt}"
-    if [[ "$settings" == "MISSING" ]]; then
-        rm -f "$preflight_settings"
-    else
-        printf '%s\n' "$settings" > "$preflight_settings"
-    fi
-
+run_wrapper_with_home() {
+    local prompt="${1:-test prompt}"
     rm -f "$TMPDIR_TEST/bob_args"
     preflight_rc=0
     preflight_err=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
         HOME="$preflight_home" \
         PATH="$TMPDIR_TEST:$PATH" \
-        env -u BOB_SETTINGS_FILE bash "$WRAPPER" -p "$prompt" 2>&1 >/dev/null) ||
+        bash "$WRAPPER" -p "$prompt" 2>&1 >/dev/null) ||
         preflight_rc=$?
 }
 
-# asserts a warning naming the installer, and that the run still proceeded.
-assert_preflight_warns() {
-    local label="$1"
-    local settings="$2"
-
-    run_preflight "$settings" "${3:-}"
-    if echo "$preflight_err" | grep -qi "warning:.*approval"; then
-        pass "$label: approval warning emitted"
+for preflight_prompt_label in task review; do
+    if [[ "$preflight_prompt_label" == "review" ]]; then
+        run_wrapper_with_home '## Step 2: Launch ALL 5 Review Agents IN PARALLEL'
     else
-        fail "$label: approval warning missing" "stderr: $preflight_err"
-    fi
-    if echo "$preflight_err" | grep -qF "install-modes.sh"; then
-        pass "$label: warning names install-modes.sh"
-    else
-        fail "$label: warning does not name install-modes.sh" "stderr: $preflight_err"
+        run_wrapper_with_home 'test prompt'
     fi
     if [[ "$preflight_rc" -eq 0 && -f "$TMPDIR_TEST/bob_args" ]]; then
-        pass "$label: warning does not abort the run"
+        pass "$preflight_prompt_label prompt runs against read-only bob settings"
     else
-        fail "$label: run aborted after warning" "rc: $preflight_rc"
+        fail "$preflight_prompt_label prompt aborted on read-only bob settings" \
+            "rc: $preflight_rc stderr: $preflight_err"
     fi
-}
-
-assert_preflight_silent() {
-    local label="$1"
-    local settings="$2"
-
-    run_preflight "$settings" "${3:-}"
-    if echo "$preflight_err" | grep -qi "warning:.*approval"; then
-        fail "$label: unexpected approval warning" "stderr: $preflight_err"
+    if echo "$preflight_err" | grep -qi "approval"; then
+        fail "$preflight_prompt_label prompt warned about approvals" \
+            "stderr: $preflight_err"
     else
-        pass "$label: no approval warning emitted"
+        pass "$preflight_prompt_label prompt emits no approval warning"
     fi
-}
+    if echo "$preflight_err" | grep -qF "install-modes.sh --grant-approvals"; then
+        fail "$preflight_prompt_label prompt still points at --grant-approvals" \
+            "stderr: $preflight_err"
+    else
+        pass "$preflight_prompt_label prompt does not point at --grant-approvals"
+    fi
+done
 
-assert_preflight_warns "missing settings file" "MISSING"
-
-assert_preflight_warns "default read-only permissions" \
-    '{"approval":{"allowed_permissions":["read"],"autoApprovalEnabled":true}}'
-
-assert_preflight_warns "edit granted without execute" \
-    '{"approval":{"allowed_permissions":["read","edit"],"autoApprovalEnabled":true}}'
-
-assert_preflight_warns "auto approval disabled" \
-    '{"approval":{"allowed_permissions":["read","edit","execute"],"autoApprovalEnabled":false}}'
-
-assert_preflight_warns "forbidden approval group blocks a grant" \
-    '{"approval":{"allowed_permissions":["read","edit","execute"],"autoApprovalEnabled":true,"forbiddenApprovalGroups":["edit"]}}'
-
-assert_preflight_silent "compliant settings" \
-    '{"approval":{"allowed_permissions":["read","edit","execute","subagent","todo"],"autoApprovalEnabled":true}}'
-
-# an absent autoApprovalEnabled key is bob's default-on case, not a false value.
-assert_preflight_silent "compliant settings without autoApprovalEnabled" \
-    '{"approval":{"allowed_permissions":["read","edit","execute"]}}'
-
-# a malformed settings file must not turn the warn-only preflight into a failure —
-# but it must still be reported, since bob will fall back to read-only defaults.
-run_preflight '{"approval":'
-if [[ "$preflight_rc" -eq 0 ]]; then
-    pass "malformed settings file does not abort the run"
-else
-    fail "malformed settings file aborted the run" "rc: $preflight_rc; stderr: $preflight_err"
-fi
-if echo "$preflight_err" | grep -qi "warning:.*approval settings" &&
-    echo "$preflight_err" | grep -qF "install-modes.sh"; then
-    pass "malformed settings file is reported"
-else
-    fail "malformed settings file was silently ignored" "stderr: $preflight_err"
-fi
-
-# review mode drives native subagents, so it additionally needs the subagent
-# permission; task mode does not, and warning there would be a false alarm.
-subagent_settings='{"approval":{"allowed_permissions":["read","edit","execute"],"autoApprovalEnabled":true}}'
-run_preflight "$subagent_settings" '## Step 2: Launch ALL 5 Review Agents IN PARALLEL'
-if echo "$preflight_err" | grep -qi "warning:.*subagent"; then
-    pass "review mode warns when the subagent permission is missing"
-else
-    fail "review mode did not warn about a missing subagent permission" \
-        "stderr: $preflight_err"
-fi
-assert_preflight_silent "task mode without subagent permission" "$subagent_settings"
-
-# the missing-file warning names the permissions it could not verify, so a review
-# run is not told to look at edit/execute when subagent is the one it needs.
-run_preflight "MISSING" '## Step 2: Launch ALL 5 Review Agents IN PARALLEL'
-if echo "$preflight_err" | grep -qF "subagent"; then
-    pass "missing-settings warning names subagent for a review prompt"
-else
-    fail "missing-settings warning omits subagent in review mode" \
-        "stderr: $preflight_err"
-fi
-run_preflight "MISSING"
-if ! echo "$preflight_err" | grep -qF "subagent"; then
-    pass "missing-settings warning omits subagent for a task prompt"
-else
-    fail "missing-settings warning names subagent in task mode" \
-        "stderr: $preflight_err"
-fi
-
-# the default settings path is derived from HOME, which a sanitized parent env may
-# not set. The preflight is a warning, so an unset HOME must degrade to "cannot
-# check" and let the run proceed, not abort the wrapper under `set -u`.
+# HOME is not needed by the wrapper at all; a sanitized parent env must not trip
+# `set -u` or produce a diagnostic about bob's settings path.
 rm -f "$TMPDIR_TEST/bob_args"
 nohome_rc=0
 nohome_err=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
     PATH="$TMPDIR_TEST:$PATH" \
-    env -u HOME -u BOB_SETTINGS_FILE bash "$WRAPPER" -p "test prompt" 2>&1 >/dev/null) ||
+    env -u HOME bash "$WRAPPER" -p "test prompt" 2>&1 >/dev/null) ||
     nohome_rc=$?
 if [[ $nohome_rc -eq 0 && -f "$TMPDIR_TEST/bob_args" ]]; then
     pass "wrapper runs with HOME unset"
 else
     fail "wrapper aborted with HOME unset" "rc: $nohome_rc stderr: $nohome_err"
 fi
-if echo "$nohome_err" | grep -qi "warning:.*HOME is unset" &&
-    echo "$nohome_err" | grep -qF "BOB_SETTINGS_FILE"; then
-    pass "unset HOME reported as an uncheckable approval preflight"
+if echo "$nohome_err" | grep -qi "BOB_SETTINGS_FILE\|settings.json"; then
+    fail "wrapper still reports a bob settings path with HOME unset" \
+        "stderr: $nohome_err"
 else
-    fail "unset HOME not reported by the preflight" "stderr: $nohome_err"
+    pass "wrapper reports no settings path with HOME unset"
 fi
 
-# the preflight is read-only: it must never create or modify bob's settings.
+# the wrapper is read-only with respect to bob's home.
 if [[ ! -e "$preflight_home/.bob/custom_modes.yaml" &&
     ! -e "$preflight_home/.bob/settings/custom_modes.yaml" ]]; then
-    pass "preflight writes nothing into the temporary bob home"
+    pass "wrapper writes nothing into the temporary bob home"
 else
-    fail "preflight wrote into the temporary bob home"
+    fail "wrapper wrote into the temporary bob home"
+fi
+if [[ "$(cat "$preflight_home/.bob/settings/settings.json")" == \
+    '{"approval":{"allowed_permissions":["read"],"autoApprovalEnabled":false}}' ]]; then
+    pass "wrapper leaves bob settings.json untouched"
+else
+    fail "wrapper modified bob settings.json"
 fi
 
 # ---------------------------------------------------------------------------
@@ -3386,431 +3314,73 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# test: installer approval merge (--grant-approvals) is opt-in, union-only,
-# non-destructive, and idempotent. every run targets a temporary settings file,
-# so no real ~/.bob/settings/settings.json is read or written.
+# test: the installer does not touch bob's approval settings
+#
+# the removed --grant-approvals flag wrote approval.* into settings.json, which
+# only bob's interactive approval handler reads. Granting it changed nothing for
+# a headless `bob run` while silently disabling approval prompts in the user's
+# interactive sessions, so the flag must stay rejected as an unknown argument.
 # ---------------------------------------------------------------------------
-echo "test: installer approval merge"
+echo "test: installer leaves approval settings alone"
 
 approval_root="$TMPDIR_TEST/approval-installer"
 mkdir -p "$approval_root"
 
-# run the installer against isolated modes and settings targets. HOME points at
-# a temporary directory too, so a bug in the override handling cannot escape.
-run_installer_approval() {
+run_installer_isolated() {
     local case_dir="$1"
     shift
-    HOME="$case_dir/home" \
+    mkdir -p "$case_dir"
+    HOME="$case_dir" \
         BOB_CUSTOM_MODES_FILE="$case_dir/custom_modes.yaml" \
-        BOB_SETTINGS_FILE="$case_dir/settings.json" \
-        bash "$INSTALLER" "$@"
+        bash "$SCRIPT_DIR/install-modes.sh" "$@" 2>&1
 }
 
-# the default run stays modes-only: no settings file is created.
-optout_dir="$approval_root/opt-out"
-mkdir -p "$optout_dir/home"
-run_installer_approval "$optout_dir" >/dev/null
-if [[ -f "$optout_dir/custom_modes.yaml" && ! -e "$optout_dir/settings.json" ]]; then
-    pass "installer without --grant-approvals leaves settings untouched"
+grant_dir="$approval_root/grant-flag"
+grant_exit=0
+grant_output=$(run_installer_isolated "$grant_dir" --grant-approvals) || grant_exit=$?
+if [[ "$grant_exit" -ne 0 ]] &&
+    echo "$grant_output" | grep -qF "unknown argument: --grant-approvals"; then
+    pass "installer rejects --grant-approvals as an unknown argument"
 else
-    fail "default installer run created or removed an approval settings file"
+    fail "installer accepted --grant-approvals" \
+        "exit: $grant_exit; output: $grant_output"
+fi
+if [[ ! -e "$grant_dir/custom_modes.yaml" ]]; then
+    pass "rejected argument installs no modes"
+else
+    fail "installer wrote modes despite a rejected argument"
 fi
 
-# an absent settings file is created with every needed permission and command.
-fresh_dir="$approval_root/fresh"
-mkdir -p "$fresh_dir/home"
-run_installer_approval "$fresh_dir" --grant-approvals > "$fresh_dir/output" 2>&1
-fresh_settings="$fresh_dir/settings.json"
-if [[ -f "$fresh_settings" ]] && jq empty "$fresh_settings" 2>/dev/null; then
-    pass "installer creates a valid approval settings document"
+# a default run must install modes and still leave settings.json alone.
+default_dir="$approval_root/default"
+mkdir -p "$default_dir/.bob/settings"
+default_settings="$default_dir/.bob/settings/settings.json"
+printf '%s\n' '{"approval":{"allowed_permissions":["read"],"autoApprovalEnabled":false}}' \
+    > "$default_settings"
+default_before=$(cat "$default_settings")
+run_installer_isolated "$default_dir" >/dev/null
+if [[ -s "$default_dir/custom_modes.yaml" ]]; then
+    pass "default installer run installs the modes"
 else
-    fail "installer did not create a valid approval settings document"
+    fail "default installer run did not install the modes"
 fi
-missing_permissions=""
-for permission in read edit execute subagent todo; do
-    if [[ "$(jq --arg p "$permission" \
-        '(.approval.allowed_permissions // []) | index($p) != null' \
-        "$fresh_settings")" != "true" ]]; then
-        missing_permissions="$missing_permissions $permission"
-    fi
-done
-if [[ -z "$missing_permissions" ]]; then
-    pass "granted approval settings include every needed permission"
+if [[ "$(cat "$default_settings")" == "$default_before" ]]; then
+    pass "default installer run leaves settings.json untouched"
 else
-    fail "granted approval settings miss permissions" "missing:$missing_permissions"
+    fail "default installer run modified settings.json" \
+        "after: $(cat "$default_settings")"
 fi
-# bob v2 looks the executor up with Array.prototype.find, so allowedExecutors must
-# be an ARRAY of {toolId,...} records — an object-shaped value throws a TypeError
-# and breaks approvals for every bob run on the machine.
-if [[ "$(jq -r '.approval.allowedExecutors | type' "$fresh_settings")" == "array" ]] &&
-    [[ "$(jq -r '[.approval.allowedExecutors[] | select(.toolId == "execute_command")] | length' \
-        "$fresh_settings")" == "1" ]] &&
-    [[ "$(jq -r '.approval.allowedExecutors[0].deniedCommands | type' "$fresh_settings")" == "array" ]]; then
-    pass "allowedExecutors is written in bob v2's array-of-records shape"
+if [[ ! -e "$default_settings.bak" ]]; then
+    pass "default installer run writes no settings backup"
 else
-    fail "allowedExecutors written in a shape bob v2 cannot read" \
-        "document: $(cat "$fresh_settings")"
-fi
-missing_commands=""
-# a user-supplied array replaces bob's read-only defaults wholesale, so the grant
-# must restate the defaults the bare `git` prefix does not already cover.
-for command_prefix in git go make npm npx gofmt golangci-lint python3 \
-    cat grep head tail ls sort wc which du df; do
-    if [[ "$(jq --arg c "$command_prefix" \
-        '[.approval.allowedExecutors[] | select(.toolId == "execute_command")]
-            | first | (.approvedCommands // []) | index($c) != null' \
-        "$fresh_settings")" != "true" ]]; then
-        missing_commands="$missing_commands $command_prefix"
-    fi
-done
-if [[ -z "$missing_commands" ]]; then
-    pass "granted approval settings include every documented command prefix"
-else
-    fail "granted approval settings miss command prefixes" "missing:$missing_commands"
-fi
-if [[ "$(jq -r '.approval.autoApprovalEnabled' "$fresh_settings")" == "true" ]]; then
-    pass "absent autoApprovalEnabled is set to true"
-else
-    fail "installer did not enable autoApprovalEnabled on a fresh document"
-fi
-if grep -q "affects all bob usage on this machine" "$fresh_dir/output"; then
-    pass "installer reports the machine-wide approvedCommands warning"
-else
-    fail "installer omitted the machine-wide approvedCommands warning" \
-        "output: $(cat "$fresh_dir/output")"
-fi
-if grep -q "added permissions:" "$fresh_dir/output" &&
-    grep -q "added command prefixes:" "$fresh_dir/output"; then
-    pass "installer summarizes what the approval merge changed"
-else
-    fail "installer did not summarize the approval merge" \
-        "output: $(cat "$fresh_dir/output")"
+    fail "default installer run created a settings backup"
 fi
 
-# a pre-existing document is unioned, never replaced: user permissions, user
-# commands, deniedCommands, a false autoApprovalEnabled, and unrelated keys all
-# survive.
-union_dir="$approval_root/union"
-mkdir -p "$union_dir/home"
-union_settings="$union_dir/settings.json"
-cat > "$union_settings" << 'EOF'
-{
-  "theme": "dark",
-  "mcpServers": {"example": {"command": "example-server"}},
-  "approval": {
-    "allowed_permissions": ["read", "user-permission"],
-    "autoApprovalEnabled": false,
-    "allowedExecutors": [
-      {
-        "toolId": "execute_command",
-        "approvedCommands": ["cargo", "ls"],
-        "deniedCommands": ["rm"]
-      },
-      {"toolId": "user_tool", "approvedCommands": ["rustc"]}
-    ]
-  }
-}
-EOF
-run_installer_approval "$union_dir" --grant-approvals > "$union_dir/output" 2>&1
-union_checks=$(jq -r '
-    ([.approval.allowedExecutors[] | select(.toolId == "execute_command")] | first) as $exec |
-    [ ((.approval.allowed_permissions | index("user-permission")) != null),
-      ((.approval.allowed_permissions | index("execute")) != null),
-      (.approval.autoApprovalEnabled == false),
-      ((.approval.allowedExecutors | type) == "array"),
-      (($exec.approvedCommands | index("cargo")) != null),
-      (($exec.approvedCommands | index("ls")) != null),
-      ([$exec.approvedCommands[] | select(. == "git")] | length == 1),
-      ($exec.deniedCommands == ["rm"]),
-      ([.approval.allowedExecutors[] | select(.toolId == "user_tool")]
-          | first | .approvedCommands == ["rustc"]),
-      (.theme == "dark"),
-      (.mcpServers.example.command == "example-server")
-    ] | all' "$union_settings")
-if [[ "$union_checks" == "true" ]]; then
-    pass "approval merge unions values and preserves unrelated keys"
+# the installer must not reference the removed grant path anywhere.
+if ! grep -qF -- "--grant-approvals" "$SCRIPT_DIR/install-modes.sh"; then
+    pass "installer source has no --grant-approvals handling left"
 else
-    fail "approval merge lost or overwrote existing settings" \
-        "document: $(cat "$union_settings")"
-fi
-# an explicitly disabled autoApprovalEnabled is preserved, which makes the whole
-# grant inert — bob's shouldAutoApprove short-circuits — so it must be reported.
-if grep -q "autoApprovalEnabled is false" "$union_dir/output"; then
-    pass "approval merge warns that a false autoApprovalEnabled voids the grant"
-else
-    fail "approval merge did not warn about a false autoApprovalEnabled" \
-        "output: $(cat "$union_dir/output")"
-fi
-if [[ -f "$union_settings.bak" ]]; then
-    pass "approval merge backs up the original settings document"
-else
-    fail "approval merge did not back up the original settings document"
-fi
-
-# a second run against an already-granted document is a byte-for-byte no-op.
-cp "$union_settings" "$union_dir/settings-before-second-run"
-run_installer_approval "$union_dir" --grant-approvals \
-    > "$union_dir/second-output" 2>&1
-if cmp -s "$union_settings" "$union_dir/settings-before-second-run"; then
-    pass "repeated approval merge is idempotent"
-else
-    fail "repeated approval merge changed the document" \
-        "document: $(cat "$union_settings")"
-fi
-if grep -q "already granted" "$union_dir/second-output"; then
-    pass "repeated approval merge reports the document as already granted"
-else
-    fail "repeated approval merge did not report an unchanged document" \
-        "output: $(cat "$union_dir/second-output")"
-fi
-
-# forbiddenApprovalGroups silently overrides a grant, so it must be reported.
-forbidden_dir="$approval_root/forbidden"
-mkdir -p "$forbidden_dir/home"
-cat > "$forbidden_dir/settings.json" << 'EOF'
-{
-  "approval": {
-    "forbiddenApprovalGroups": ["edit"]
-  }
-}
-EOF
-run_installer_approval "$forbidden_dir" --grant-approvals \
-    > "$forbidden_dir/output" 2>&1
-if grep -q "forbiddenApprovalGroups already contains: edit" "$forbidden_dir/output"; then
-    pass "approval merge warns about a conflicting forbiddenApprovalGroups entry"
-else
-    fail "approval merge did not warn about forbiddenApprovalGroups" \
-        "output: $(cat "$forbidden_dir/output")"
-fi
-
-# an unparseable settings document must fail before it is replaced.
-broken_dir="$approval_root/broken"
-mkdir -p "$broken_dir/home"
-printf '%s\n' '{not json' > "$broken_dir/settings.json"
-cp "$broken_dir/settings.json" "$broken_dir/settings-before"
-set +e
-run_installer_approval "$broken_dir" --grant-approvals >/dev/null 2>&1
-broken_exit=$?
-set -e
-if [[ $broken_exit -ne 0 ]] &&
-    cmp -s "$broken_dir/settings.json" "$broken_dir/settings-before"; then
-    pass "approval merge rejects an unparseable settings document unchanged"
-else
-    fail "approval merge changed or accepted an unparseable settings document"
-fi
-
-# valid JSON of an unexpected shape must be refused too, rather than aborting with
-# a raw jq type error after the modes have already been installed.
-shape_dir="$approval_root/shape"
-mkdir -p "$shape_dir/home"
-printf '%s\n' '{"approval": {"allowed_permissions": "read"}}' > "$shape_dir/settings.json"
-cp "$shape_dir/settings.json" "$shape_dir/settings-before"
-set +e
-shape_output=$(run_installer_approval "$shape_dir" --grant-approvals 2>&1)
-shape_exit=$?
-set -e
-if [[ $shape_exit -ne 0 ]] &&
-    [[ "$shape_output" == *"cannot safely merge existing approval-settings document"* ]] &&
-    cmp -s "$shape_dir/settings.json" "$shape_dir/settings-before"; then
-    pass "approval merge rejects an unexpected settings shape unchanged"
-else
-    fail "approval merge accepted an unexpected settings shape" \
-        "output: $shape_output"
-fi
-
-# a refused grant must leave the MODES uninstalled too. Validating after the mode
-# document was written makes the nonzero exit a lie: nothing appears to have
-# happened, and the re-run then reports the modes as already installed.
-for refusal_case in unparseable shape missing-jq; do
-    order_dir="$approval_root/order-$refusal_case"
-    mkdir -p "$order_dir/home"
-    case "$refusal_case" in
-        unparseable) printf '%s\n' '{not json' > "$order_dir/settings.json" ;;
-        shape) printf '%s\n' '{"approval": {"allowed_permissions": "read"}}' \
-            > "$order_dir/settings.json" ;;
-        missing-jq) printf '%s\n' '{}' > "$order_dir/settings.json" ;;
-    esac
-    set +e
-    if [[ "$refusal_case" == "missing-jq" ]]; then
-        # only the installer's own jq lookup may fail, so the stub PATH keeps the
-        # rest of its tools available.
-        order_bin="$order_dir/bin"
-        mkdir -p "$order_bin"
-        for tool in bash awk sed cat cp mv mkdir dirname rm printf tail; do
-            tool_path=$(command -v "$tool" 2>/dev/null) &&
-                ln -sf "$tool_path" "$order_bin/$tool"
-        done
-        HOME="$order_dir/home" \
-            BOB_CUSTOM_MODES_FILE="$order_dir/custom_modes.yaml" \
-            BOB_SETTINGS_FILE="$order_dir/settings.json" \
-            PATH="$order_bin" bash "$INSTALLER" --grant-approvals >/dev/null 2>&1
-    else
-        run_installer_approval "$order_dir" --grant-approvals >/dev/null 2>&1
-    fi
-    order_exit=$?
-    set -e
-    if [[ $order_exit -ne 0 && ! -e "$order_dir/custom_modes.yaml" ]]; then
-        pass "refused grant ($refusal_case) installs no modes"
-    else
-        fail "refused grant ($refusal_case) left modes installed" \
-            "exit: $order_exit modes: $(cat "$order_dir/custom_modes.yaml" 2>/dev/null || echo none)"
-    fi
-done
-
-# the shape guard has to reach INSIDE each allowedExecutors record: a string-valued
-# approvedCommands passes an array-of-objects check and then makes the merge query
-# abort with a raw "string and array cannot be added" jq error, leaving no stray
-# temp file but also no usable diagnostic.
-for bad_field in approvedCommands deniedCommands; do
-    executor_dir="$approval_root/executor-$bad_field"
-    mkdir -p "$executor_dir/home"
-    printf '{"approval":{"allowedExecutors":[{"toolId":"execute_command","%s":"git"}]}}\n' \
-        "$bad_field" > "$executor_dir/settings.json"
-    cp "$executor_dir/settings.json" "$executor_dir/settings-before"
-    set +e
-    executor_output=$(run_installer_approval "$executor_dir" --grant-approvals 2>&1)
-    executor_exit=$?
-    set -e
-    if [[ $executor_exit -ne 0 ]] &&
-        [[ "$executor_output" == *"cannot safely merge existing approval-settings document"* ]] &&
-        cmp -s "$executor_dir/settings.json" "$executor_dir/settings-before"; then
-        pass "approval merge rejects a non-array $bad_field unchanged"
-    else
-        fail "approval merge mishandled a non-array $bad_field" \
-            "exit: $executor_exit output: $executor_output"
-    fi
-    if [[ -z "$(find "$executor_dir" -name '.settings.json.tmp.*' -print -quit)" ]]; then
-        pass "rejected non-array $bad_field leaves no temp file behind"
-    else
-        fail "rejected non-array $bad_field left a temp file behind"
-    fi
-done
-
-# the backup must not be written through a symlink either.
-bak_sentinel="$approval_root/bak-sentinel"
-bak_dir="$approval_root/bak-symlink"
-mkdir -p "$bak_dir/home"
-printf '%s\n' 'sentinel' > "$bak_sentinel"
-printf '%s\n' '{"approval":{"allowed_permissions":["read"]}}' > "$bak_dir/settings.json"
-ln -s "$bak_sentinel" "$bak_dir/settings.json.bak"
-set +e
-run_installer_approval "$bak_dir" --grant-approvals >/dev/null 2>&1
-bak_exit=$?
-set -e
-if [[ $bak_exit -ne 0 ]] && [[ "$(cat "$bak_sentinel")" == "sentinel" ]]; then
-    pass "approval merge refuses to write its backup through a symlink"
-else
-    fail "approval merge wrote its backup through a symlink" \
-        "sentinel: $(cat "$bak_sentinel")"
-fi
-
-# the approval merge must refuse a symlink rather than follow it.
-approval_sentinel="$approval_root/approval-sentinel"
-symlink_dir="$approval_root/symlink"
-mkdir -p "$symlink_dir/home"
-printf '%s\n' '{"approval":{"allowed_permissions":["read"]}}' > "$approval_sentinel"
-ln -s "$approval_sentinel" "$symlink_dir/settings.json"
-set +e
-run_installer_approval "$symlink_dir" --grant-approvals >/dev/null 2>&1
-symlink_approval_exit=$?
-set -e
-if [[ $symlink_approval_exit -ne 0 ]] &&
-    [[ "$(cat "$approval_sentinel")" == '{"approval":{"allowed_permissions":["read"]}}' ]]; then
-    pass "approval merge refuses a symlinked settings target"
-else
-    fail "approval merge followed or accepted a symlinked settings target"
-fi
-
-# an unknown installer argument is rejected instead of silently ignored, and it is
-# rejected before anything is written. A fresh case dir makes the "wrote nothing"
-# half of that assertion meaningful — reusing a dir another case already populated
-# would pass whether or not the argument check ran first.
-unknown_dir="$approval_root/unknown-arg"
-mkdir -p "$unknown_dir/home"
-set +e
-unknown_output=$(run_installer_approval "$unknown_dir" --grant-approval 2>&1)
-unknown_exit=$?
-set -e
-if [[ $unknown_exit -ne 0 && "$unknown_output" == *"unknown argument"* ]]; then
-    pass "installer rejects an unknown argument"
-else
-    fail "installer accepted an unknown argument" "output: $unknown_output"
-fi
-if [[ ! -e "$unknown_dir/custom_modes.yaml" && ! -e "$unknown_dir/settings.json" ]]; then
-    pass "installer writes nothing when an argument is unknown"
-else
-    fail "installer wrote files before rejecting an unknown argument"
-fi
-
-# --grant-approvals with no BOB_SETTINGS_FILE must land on bob's real default path
-# under HOME. Nothing else exercises that branch, since every case above overrides
-# it, and the wrapper's preflight must then find those same settings.
-default_path_home="$approval_root/default-path-home"
-mkdir -p "$default_path_home"
-HOME="$default_path_home" \
-    BOB_CUSTOM_MODES_FILE="$approval_root/default-path-modes.yaml" \
-    env -u BOB_SETTINGS_FILE bash "$INSTALLER" --grant-approvals >/dev/null 2>&1
-default_path_settings="$default_path_home/.bob/settings/settings.json"
-if [[ -f "$default_path_settings" ]] && jq empty "$default_path_settings" 2>/dev/null; then
-    pass "installer defaults the approval target to \$HOME/.bob/settings/settings.json"
-else
-    fail "installer did not write the default approval settings path"
-fi
-
-default_path_warn_rc=0
-default_path_warn=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
-    HOME="$default_path_home" \
-    PATH="$TMPDIR_TEST:$PATH" \
-    env -u BOB_SETTINGS_FILE bash "$WRAPPER" -p "test prompt" 2>&1 >/dev/null) ||
-    default_path_warn_rc=$?
-if [[ $default_path_warn_rc -eq 0 ]] &&
-    ! echo "$default_path_warn" | grep -qi "warning:.*approval"; then
-    pass "wrapper preflight accepts the installer's default-path grant for a task prompt"
-else
-    fail "wrapper warned about the installer's default-path grant (task prompt)" \
-        "stderr: $default_path_warn"
-fi
-
-default_path_review_rc=0
-default_path_review=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
-    HOME="$default_path_home" \
-    PATH="$TMPDIR_TEST:$PATH" \
-    env -u BOB_SETTINGS_FILE bash "$WRAPPER" \
-    -p '## Step 2: Launch ALL 5 Review Agents IN PARALLEL' 2>&1 >/dev/null) ||
-    default_path_review_rc=$?
-if [[ $default_path_review_rc -eq 0 ]] &&
-    ! echo "$default_path_review" | grep -qi "warning:.*approval"; then
-    pass "wrapper preflight accepts the installer's default-path grant for a review prompt"
-else
-    fail "wrapper warned about the installer's default-path grant (review prompt)" \
-        "stderr: $default_path_review"
-fi
-
-# --grant-approvals depends on jq for every merge step, so its absence must fail
-# before the target is touched rather than part-way through.
-nojq_dir="$approval_root/no-jq"
-mkdir -p "$nojq_dir/home" "$nojq_dir/bin"
-for tool in bash cat cp mv rm ln mkdir dirname basename mktemp awk grep sed \
-    tail head wc sort tr cut ls touch env diff printf; do
-    tool_path=$(command -v "$tool" 2>/dev/null) || continue
-    ln -sf "$tool_path" "$nojq_dir/bin/$tool"
-done
-set +e
-nojq_output=$(HOME="$nojq_dir/home" \
-    BOB_CUSTOM_MODES_FILE="$nojq_dir/custom_modes.yaml" \
-    BOB_SETTINGS_FILE="$nojq_dir/settings.json" \
-    PATH="$nojq_dir/bin" bash "$INSTALLER" --grant-approvals 2>&1)
-nojq_exit=$?
-set -e
-if [[ $nojq_exit -ne 0 && "$nojq_output" == *"jq is required"* ]]; then
-    pass "installer reports a missing jq for --grant-approvals"
-else
-    fail "installer did not report a missing jq" "exit: $nojq_exit; output: $nojq_output"
-fi
-if [[ ! -e "$nojq_dir/settings.json" ]]; then
-    pass "installer creates no settings file when jq is missing"
-else
-    fail "installer wrote settings without jq"
+    fail "installer source still handles --grant-approvals"
 fi
 
 # ---------------------------------------------------------------------------
