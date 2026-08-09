@@ -228,31 +228,69 @@ extract_plan_boundary() {
     local pos=-1
     local current=""
     local prefix=""
+    local scan=""
+    local consumed=0
+    local leading=0
+    local chosen_pos=-1
+    local chosen_rest=""
+    local chosen_leading=0
 
     plan_boundary_text=""
     plan_boundary_error=""
 
     for marker in '<<<RALPHEX:QUESTION>>>' '<<<RALPHEX:PLAN_DRAFT>>>'; do
         [[ "$text" == *"$marker"* ]] || continue
-        prefix=${text%%"$marker"*}
-        pos=${#prefix}
-        rest=${text#*"$marker"}
-        if [[ "$rest" != *'<<<RALPHEX:END>>>'* ]]; then
-            # this boundary may still be streaming. Remember where it opened so a
-            # bare marker quoted inside its unterminated body cannot be mistaken
-            # for a real terminal boundary below and discard the whole draft.
-            # Only a marker that starts a line can be a real boundary opening: an
-            # unterminated marker never clears, so arming on a mid-sentence
-            # mention ("I considered asking via <<<RALPHEX:QUESTION>>> but ...")
-            # would suppress every later PLAN_READY for the rest of the run and
-            # fail the plan on benign narration.
-            if [[ -z "$prefix" || "$prefix" == *$'\n' ]]; then
-                if [[ $open_pos -lt 0 || $pos -lt $open_pos ]]; then
+        # Walk EVERY occurrence rather than binding to the first one. The plan
+        # prompt teaches the model these exact tokens, so it may name a marker in
+        # prose before emitting the real boundary; taking the first occurrence
+        # would then start the body at the narration and swallow the real opening
+        # marker into it. ralphex extracts leftmost-marker-to-nearest-END
+        # (planDraftSignalRe in pkg/processor/phase/signals.go), so that
+        # narration and a stray protocol token would reach the user as the draft.
+        scan="$text"
+        consumed=0
+        chosen_pos=-1
+        chosen_rest=""
+        chosen_leading=0
+        while [[ "$scan" == *"$marker"* ]]; do
+            prefix=${scan%%"$marker"*}
+            pos=$((consumed + ${#prefix}))
+            rest=${scan#*"$marker"}
+            consumed=$((pos + ${#marker}))
+            scan="$rest"
+            # markers are documented as standing on their own line, so a
+            # line-leading occurrence is the real boundary and a mid-sentence one
+            # is narration. Non-leading occurrences still qualify as a fallback,
+            # keeping tolerance for a model that inlines the marker.
+            if [[ $pos -eq 0 || "${text:pos-1:1}" == $'\n' ]]; then
+                leading=1
+            else
+                leading=0
+            fi
+            if [[ "$rest" != *'<<<RALPHEX:END>>>'* ]]; then
+                # this boundary may still be streaming. Remember where it opened
+                # so a bare marker quoted inside its unterminated body cannot be
+                # mistaken for a real terminal boundary below and discard the
+                # whole draft. Only a marker that starts a line can be a real
+                # boundary opening: an unterminated marker never clears, so
+                # arming on a mid-sentence mention ("I considered asking via
+                # <<<RALPHEX:QUESTION>>> but ...") would suppress every later
+                # PLAN_READY for the rest of the run and fail the plan on benign
+                # narration.
+                if [[ $leading -eq 1 ]] && [[ $open_pos -lt 0 || $pos -lt $open_pos ]]; then
                     open_pos=$pos
                 fi
+                continue
             fi
-            continue
-        fi
+            if [[ $chosen_pos -lt 0 ]] || [[ $chosen_leading -eq 0 && $leading -eq 1 ]]; then
+                chosen_pos=$pos
+                chosen_rest="$rest"
+                chosen_leading=$leading
+            fi
+        done
+        [[ $chosen_pos -ge 0 ]] || continue
+        pos=$chosen_pos
+        rest="$chosen_rest"
         body=${rest%%'<<<RALPHEX:END>>>'*}
         current="$marker$body<<<RALPHEX:END>>>"
 
@@ -367,8 +405,37 @@ emit_task_chunk() {
         emit_text_delta "$2"
     fi
 }
+# True when the buffered answer text may still be receiving a signal token: an
+# opened `<<<RALPHEX:` with no closing `>>>` yet, or a tail that is a proper
+# prefix of the opening marker. ralphex matches signals per content_block_delta
+# (detectSignal in pkg/executor/executor.go scans each block's text with a plain
+# substring), so emitting such a buffer would split the token across two deltas
+# and make it undetectable — the finished iteration would then be re-run.
+signal_token_in_flight() {
+    local buffer="$1"
+    local marker='<<<RALPHEX:'
+    local tail=""
+    local i=0
+    if [[ "$buffer" == *"$marker"* ]]; then
+        tail=${buffer##*"$marker"}
+        [[ "$tail" != *'>>>'* ]] && return 0
+    fi
+    for ((i = ${#marker} - 1; i > 0; i--)); do
+        [[ "$buffer" == *"${marker:0:i}" ]] && return 0
+    done
+    return 1
+}
+# Emits whatever is left in the buffers, used by the non-answer branches so a
+# diagnostic is not logged ahead of assistant text buffered before it. An answer
+# remainder that may hold half a signal token is kept instead: log interleaving
+# for one partial line is worth less than the signal, and the token is emitted
+# whole as soon as its line completes. Pass "force" at stream end, where holding
+# text would lose it outright; reasoning is never held because it is neutralized
+# on flush and so can never carry a live signal.
 flush_task_buffer_remainder() {
-    if [[ -n "$task_answer_buffer" ]]; then
+    local force="${1:-}"
+    if [[ -n "$task_answer_buffer" ]] &&
+        { [[ "$force" == "force" ]] || ! signal_token_in_flight "$task_answer_buffer"; }; then
         emit_task_chunk text "$task_answer_buffer"
         task_answer_buffer=""
     fi
@@ -461,7 +528,6 @@ while IFS= read -r line || [[ -n "$line" ]]; do
                 emit_text_delta "$plan_boundary_text"
                 plan_boundary_emitted=1
                 intentional_stop=1
-                kill -TERM "$bob_pid" 2>/dev/null || true
                 break
             fi
         fi
@@ -500,7 +566,31 @@ done < "$stream_pipe"
 
 # flush any partial trailing line left in the task/review buffer. this runs before
 # the single terminating result event below, so no buffered text lands after it.
-flush_task_buffer_remainder
+# forced: no further text can complete the line, so holding it back would lose it.
+flush_task_buffer_remainder force
+
+# Stop bob on a deadline once a plan boundary has been emitted. bob v2's handler
+# (`e&&process.exit(1),e=!0,t.abort(...)`) only ABORTS the in-flight task on the
+# first TERM and needs a second one to exit, and the abort does not necessarily
+# interrupt a spawned command, so a single TERM can leave bob alive and the
+# unbounded `wait` below would hang after the plan boundary was already delivered.
+stop_bob_bounded() {
+    local signal=""
+    local waited=0
+    for signal in TERM TERM KILL; do
+        kill -0 "$bob_pid" 2>/dev/null || return 0
+        kill -"$signal" "$bob_pid" 2>/dev/null || true
+        # bash reaps background children asynchronously, so a `kill -0` failure
+        # here means bob is gone rather than an unreaped zombie.
+        for ((waited = 0; waited < 20; waited++)); do
+            kill -0 "$bob_pid" 2>/dev/null || return 0
+            sleep 0.1
+        done
+    done
+}
+if [[ "$intentional_stop" == "1" ]]; then
+    stop_bob_bounded
+fi
 
 # preserve bob's exit status after the translation process has drained.
 bob_exit=0

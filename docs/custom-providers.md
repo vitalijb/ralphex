@@ -489,7 +489,7 @@ The shipped mode tool groups are exact. bob v2 accepts only these group names �
 
 | Variable | Default | Description |
 |---|---|---|
-| `BOB_CHAT_MODE` | automatic | Any non-empty built-in slug (`ask`, `code`, `plan`, or `advanced`) or custom-mode slug is passed to `--mode` unchanged and overrides prompt detection. Empty selects a shipped ralphex mode. |
+| `BOB_CHAT_MODE` | automatic | Any non-empty built-in slug (`agent`, `plan`, or `ask`) or custom-mode slug is passed to `--mode` unchanged and overrides prompt detection. Empty selects a shipped ralphex mode. |
 | `BOB_MODEL` | (unused) | Accepted for compatibility and **ignored** — bob v2 stable has no model selection. A non-empty value produces one stderr note. |
 | `BOB_VERBOSE` | `0` | Set to `1` to include task/review `tool_result` output, `[tool]` markers, and reasoning message text. Plan mode emits only its validated boundary. |
 | `BOB_EXTRA_ARGS` | (none) | Extra flags appended verbatim to the bob invocation (word-split on whitespace, **no quote preservation**); e.g. `--max-cost=5` to cap spend. |
@@ -523,7 +523,7 @@ bob v2 emits these event types, and the wrapper translates them as follows. `att
 | `tool_use` | skipped by default; `[tool] <tool_name>` when `BOB_VERBOSE=1` |
 | `error` (any `severity`) | `content_block_delta` with `error: bob: <message>`, and a forced non-zero exit |
 | `message` (user echo) and other suppressed events | empty keepalive delta |
-| `result` (always `status: "success"`, carries `stats`) | `{"type":"result","result":""}` (end of execution) |
+| `result` (always `status: "success"`, carries `stats`) | empty keepalive delta — suppressed, not translated |
 
 `isReasoning` replaces v1's `<thinking>` text heuristic — there is no thinking-block parsing left. `{type:"error"}` is v2's only failure channel (for example a `--max-cost` or `--max-turns` abort): the `result` event's `status` is *always* `"success"` in v2, so a run that fails would otherwise look like a clean, silent success. The wrapper therefore treats an `error` event as a real failure, emitting a diagnostic line and forcing a non-zero exit. The event's `severity` field is **not** inspected — every `error` event fails the run, since a downgraded severity on a fatal condition would otherwise be swallowed. The diagnostic text comes from the top-level `message`, falling back to a nested `error.message` if bob ever moves it there — discarding an already-parsed cause would also keep ralphex's limit/error pattern matching from seeing it. An `error` event with neither, or a blank one, reports `error: bob: unspecified bob error` so the failure always names something searchable.
 
@@ -531,7 +531,7 @@ Line buffering matters for signals: assistant text arrives as streaming deltas, 
 
 In plan mode, non-boundary text and reasoning are suppressed. Boundaries are detected from assistant deltas only, `QUESTION` JSON is validated, `PLAN_DRAFT` must be nonempty, the earliest valid boundary wins, Bob is terminated once it is emitted, and a run without a complete valid boundary exits non-zero (fail closed).
 
-A fallback `{"type":"result","result":""}` is always emitted, covering bob exiting without a `result` event. bob's stdout and stderr are merged into one stream so ordering is preserved; non-JSON diagnostic lines are forwarded as text deltas for ralphex error/limit pattern detection, and bob's exit code is preserved. Any literal `<<<RALPHEX:` token in that text is neutralized first (rewritten to `<<< RALPHEX:` with an inserted space), so a stray signal token echoed in bob diagnostics cannot be mistaken for a real completion signal — rate-limit and `API Error:` phrases pass through verbatim.
+Exactly one `{"type":"result","result":""}` is emitted, unconditionally, after the stream drains — bob's own `result` event is suppressed rather than translated, so a run that ends without one (or with more than one) still produces a single terminating event. bob's stdout and stderr are merged into one stream so ordering is preserved; non-JSON diagnostic lines are forwarded as text deltas for ralphex error/limit pattern detection, and bob's exit code is preserved. Any literal `<<<RALPHEX:` token in that text is neutralized first (rewritten to `<<< RALPHEX:` with an inserted space), so a stray signal token echoed in bob diagnostics cannot be mistaken for a real completion signal — rate-limit and `API Error:` phrases pass through verbatim.
 
 ### Permissions and sandbox
 

@@ -60,21 +60,26 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# merge the approval settings headless bob v2 needs into settings.json.
-# union-only: never removes existing entries, never touches deniedCommands,
-# and is a no-op on a second run against the same input.
-grant_approval_settings() {
+# resolve the approval-settings path once so the precondition check and the merge
+# below can never disagree about which file is being inspected.
+approval_settings_target() {
+    if [[ -n "${BOB_SETTINGS_FILE:-}" ]]; then
+        printf '%s\n' "$BOB_SETTINGS_FILE"
+    else
+        printf '%s\n' "${HOME:?HOME is required}/.bob/settings/settings.json"
+    fi
+}
+
+# every reason the grant can refuse, factored out so it runs BEFORE the modes are
+# installed. Refusing afterwards leaves the modes written while the nonzero exit
+# reads as "nothing happened", and the re-run then reports the modes as already
+# installed with no hint that half the operation had succeeded.
+check_approval_preconditions() {
     command -v jq >/dev/null 2>&1 ||
         error "jq is required for --grant-approvals"
 
     local approval_target
-    if [[ -n "${BOB_SETTINGS_FILE:-}" ]]; then
-        approval_target="$BOB_SETTINGS_FILE"
-    else
-        approval_target="${HOME:?HOME is required}/.bob/settings/settings.json"
-    fi
-    local approval_dir
-    approval_dir="$(dirname "$approval_target")"
+    approval_target="$(approval_settings_target)"
 
     if [[ -L "$approval_target" ]]; then
         error "refusing to replace symlink: $approval_target"
@@ -82,12 +87,13 @@ grant_approval_settings() {
     if [[ -e "$approval_target" && ! -f "$approval_target" ]]; then
         error "approval-settings target is not a regular file: $approval_target"
     fi
-
-    local existing_json
+    if [[ -e "$approval_target" && -L "$approval_target.bak" ]]; then
+        error "refusing to write backup through symlink: $approval_target.bak"
+    fi
     if [[ -e "$approval_target" && -s "$approval_target" ]]; then
         # a document that is not an object, or whose approval block does not match
         # bob v2's schema, cannot be merged without guessing. Refuse up front
-        # rather than letting the queries below abort with a raw jq type error
+        # rather than letting the merge queries abort with a raw jq type error
         # after the modes have already been installed.
         jq -e '
             type == "object" and
@@ -101,6 +107,24 @@ grant_approval_settings() {
                     ((.deniedCommands // []) | type == "array")))
         ' "$approval_target" >/dev/null 2>&1 ||
             error "cannot safely merge existing approval-settings document: $approval_target"
+    fi
+}
+
+# merge the approval settings headless bob v2 needs into settings.json.
+# union-only: never removes existing entries, never touches deniedCommands,
+# and is a no-op on a second run against the same input.
+grant_approval_settings() {
+    # re-checked here so the function is safe on its own; the caller runs it
+    # earlier too, where a refusal still leaves nothing installed.
+    check_approval_preconditions
+
+    local approval_target
+    approval_target="$(approval_settings_target)"
+    local approval_dir
+    approval_dir="$(dirname "$approval_target")"
+
+    local existing_json
+    if [[ -e "$approval_target" && -s "$approval_target" ]]; then
         existing_json="$(cat "$approval_target")"
     else
         existing_json='{}'
@@ -527,6 +551,12 @@ if [[ -e "$target" && ! -f "$target" ]]; then
 fi
 if [[ -e "$target" ]]; then
     document_is_safe "$target" || error "cannot safely merge existing custom-mode document: $target"
+fi
+
+# refuse an unmergeable settings.json before writing any mode, so a rejected
+# grant never leaves a half-applied install behind.
+if [[ "$grant_approvals" -eq 1 ]]; then
+    check_approval_preconditions
 fi
 
 missing=()

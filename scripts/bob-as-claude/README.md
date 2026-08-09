@@ -71,7 +71,7 @@ The wrapper itself never writes to `~/.bob/`. It only runs a preflight check and
 
 **Environment variables:**
 
-- `BOB_CHAT_MODE` — explicit mode slug override, passed to bob's `--mode`. Any non-empty built-in slug (`ask`, `code`, `plan`, or `advanced`) or custom-mode slug is passed through unchanged and overrides automatic phase detection. Empty: select a shipped ralphex mode from the prompt markers.
+- `BOB_CHAT_MODE` — explicit mode slug override, passed to bob's `--mode`. Any non-empty built-in slug (`agent`, `plan`, or `ask` — bob v2's only built-ins) or custom-mode slug is passed through unchanged and overrides automatic phase detection. Empty: select a shipped ralphex mode from the prompt markers.
 - `BOB_MODEL` — accepted for compatibility and **ignored**; bob v2 stable has no model selection. A non-empty value produces one stderr note.
 - `BOB_VERBOSE` — set to `1` to include task/review `tool_result` output, `[tool]` markers, and reasoning message text (default: `0`; plan mode emits only the validated boundary)
 - `BOB_EXTRA_ARGS` — extra flags appended verbatim to the bob invocation (word-split on whitespace). The wrapper builds the bob command line itself and ignores unknown flags, so this is the only way to pass through arbitrary bob options. Example: `BOB_EXTRA_ARGS="--max-cost=5"`. **Limitation:** word-splitting does NOT preserve quotes; arguments containing spaces or quotes cannot be expressed via `BOB_EXTRA_ARGS`.
@@ -130,7 +130,7 @@ The unit test uses a mock bob — no real API calls are made.
 - **Subagent activity is invisible.** bob v2 emits no stream events for subagent lifecycle, so a parallel review phase can look idle for a long time. Tune or disable `idle_timeout` accordingly.
 - **bob v2 auto-loads skills from `~/.claude/skills`.** Its default global skill directories include Claude Code's, so a skill installed there is loaded into bob sessions and its instructions can compete with the ralphex prompt — the same skill-conflict class documented for codex. If a run behaves as though following different instructions, check what is installed there.
 - **bob version drift.** The wrapper is tested against bob 2.0.0. If bob changes its stream-json schema, the jq field extraction will need updating. A line that does not parse as an event is forwarded as a diagnostic rather than crashing the run, but an unrecognized event type translates to a keepalive, so new schema shapes would go unreported.
-- **A built-in mode may still call tools you did not intend.** Bob's built-in modes are not replacements for the tool restrictions in the shipped ralphex modes; prefer the shipped slugs over `BOB_CHAT_MODE=code`.
+- **A built-in mode may still call tools you did not intend.** Bob's built-in modes are not replacements for the tool restrictions in the shipped ralphex modes; prefer the shipped slugs over `BOB_CHAT_MODE=agent`.
 
 ## Security considerations
 

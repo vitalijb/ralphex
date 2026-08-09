@@ -1875,6 +1875,21 @@ assert_bare_plan_boundary "narrated mid-sentence marker does not suppress TASK_F
     $'A <<<RALPHEX:PLAN_DRAFT>>> was never viable here.\n<<<RALPHEX:TASK_FAILED>>>\n' \
     '<<<RALPHEX:TASK_FAILED>>>'
 
+# a marker named in prose BEFORE the real boundary must not capture it. ralphex
+# extracts leftmost-marker-to-nearest-END, so binding to the first occurrence
+# would hand the user the narration plus a stray protocol token as the draft.
+assert_bare_plan_boundary "narrated marker before the real draft does not capture it" \
+    $'I will emit <<<RALPHEX:PLAN_DRAFT>>> once ready.\n<<<RALPHEX:PLAN_DRAFT>>>\n# Draft\nBody.\n<<<RALPHEX:END>>>\n' \
+    $'<<<RALPHEX:PLAN_DRAFT>>>\n# Draft\nBody.\n<<<RALPHEX:END>>>'
+assert_bare_plan_boundary "narrated marker before the real QUESTION does not capture it" \
+    $'I could ask via <<<RALPHEX:QUESTION>>> here.\n<<<RALPHEX:QUESTION>>>\n{"question":"Which store?","options":["postgres","sqlite"]}\n<<<RALPHEX:END>>>\n' \
+    $'<<<RALPHEX:QUESTION>>>\n{"question":"Which store?","options":["postgres","sqlite"]}\n<<<RALPHEX:END>>>'
+# tolerance for an inlined marker is preserved: with no line-leading occurrence
+# anywhere, the mid-sentence one is still accepted rather than failing closed.
+assert_bare_plan_boundary "inlined marker with no line-leading occurrence still parses" \
+    $'Here it is: <<<RALPHEX:PLAN_DRAFT>>>\n# Draft\nBody.\n<<<RALPHEX:END>>>\n' \
+    $'<<<RALPHEX:PLAN_DRAFT>>>\n# Draft\nBody.\n<<<RALPHEX:END>>>'
+
 # ---------------------------------------------------------------------------
 # test: after a valid plan boundary the wrapper terminates bob and normalizes the
 # exit status. Bob keeps working autonomously otherwise, so a slow-exiting bob
@@ -1927,6 +1942,62 @@ else
     pass "bob terminated after the plan boundary"
 fi
 rm -rf "$plan_stop_bin"
+
+# bob v2's own handler (`e&&process.exit(1),e=!0,t.abort(...)`) treats the FIRST
+# TERM as "abort the in-flight task" and only exits on a second one, so a mock
+# that dies on one TERM cannot prove the wrapper gets out. These two emulate the
+# real ladder: abort-then-exit, and a bob that never honors TERM at all.
+assert_stubborn_bob_stops() {
+    local label="$1"
+    local trap_body="$2"
+    local stubborn_bin="$TMPDIR_TEST/stubborn_bin"
+    local pid_file="$TMPDIR_TEST/stubborn_pid"
+    local start=0 elapsed=0 exit_code=0 output="" pid=""
+
+    rm -rf "$stubborn_bin"
+    mkdir -p "$stubborn_bin"
+    {
+        printf '%s\n' '#!/usr/bin/env bash'
+        printf '%s\n' 'cat > /dev/null'
+        printf 'echo $$ > "%s"\n' "$pid_file"
+        printf '%s\n' "$trap_body"
+        printf '%s\n' \
+            "printf '%s\\n' '{\"type\":\"message\",\"timestamp\":\"t\",\"role\":\"assistant\",\"content\":\"<<<RALPHEX:PLAN_READY>>>\\n\",\"isReasoning\":false}'"
+        printf '%s\n' 'while true; do sleep 0.2; done'
+    } > "$stubborn_bin/bob"
+    chmod +x "$stubborn_bin/bob"
+
+    rm -f "$pid_file"
+    start=$SECONDS
+    set +e
+    output=$(PATH="$stubborn_bin:$PATH" bash "$WRAPPER" -p "$plan_prompt" 2>/dev/null)
+    exit_code=$?
+    set -e
+    elapsed=$((SECONDS - start))
+
+    if [[ $exit_code -eq 0 && $elapsed -lt 20 ]] &&
+        echo "$output" | grep -q '<<<RALPHEX:PLAN_READY>>>'; then
+        pass "$label"
+    else
+        fail "$label" "exit: $exit_code elapsed: ${elapsed}s output: $output"
+    fi
+
+    pid=$(cat "$pid_file" 2>/dev/null || echo "")
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        fail "$label (bob left running)" "pid: $pid"
+        kill -9 "$pid" 2>/dev/null || true
+    else
+        pass "$label (bob no longer running)"
+    fi
+    rm -rf "$stubborn_bin"
+}
+
+assert_stubborn_bob_stops "wrapper escalates to a second TERM when the first only aborts" \
+    'term_count=0
+handle_term() { term_count=$((term_count + 1)); [[ $term_count -ge 2 ]] && exit 1; }
+trap handle_term TERM'
+assert_stubborn_bob_stops "wrapper escalates to KILL when bob ignores TERM entirely" \
+    "trap '' TERM"
 
 # the intentional stop must also override a non-zero status from the terminated
 # bob, otherwise every successful plan iteration would look like a failure.
@@ -2044,13 +2115,16 @@ fi
 
 # ---------------------------------------------------------------------------
 # test: a non-message event arriving mid-line flushes the partial remainder under
-# the kind it was buffered as, so a half-written signal is never spliced into the
-# text that follows and reasoning text is never promoted to a live signal.
+# the kind it was buffered as, so reasoning text is never promoted to a live
+# signal — EXCEPT when the answer remainder may hold half a signal token, which
+# is kept buffered so the token is emitted whole.
 # ---------------------------------------------------------------------------
 echo "test: partial line flushed on kind change"
 
-# a tool_result error between two halves of a signal line: the halves must not
-# join across it, so no live signal may appear anywhere in the output.
+# a tool_result error between two halves of a signal line. ralphex matches
+# signals per content_block_delta, so flushing the first half here would make the
+# token undetectable and the finished iteration would be re-run: the halves must
+# rejoin and the signal must arrive live, in exactly one block.
 cat > "$TMPDIR_TEST/partial_line_tool_error.jsonl" << 'EOF'
 {"type":"message","timestamp":"t","role":"assistant","content":"<<<RALPHEX:ALL","isReasoning":false}
 {"type":"tool_result","timestamp":"t","tool_id":"tool-1","status":"error","error":{"type":"execution","message":"command failed"}}
@@ -2060,11 +2134,74 @@ EOF
 partial_tool_output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/partial_line_tool_error.jsonl" \
     PATH="$TMPDIR_TEST:$PATH" \
     bash "$WRAPPER" -p "test prompt" 2>/dev/null)
+partial_tool_blocks=$(echo "$partial_tool_output" |
+    jq -r 'select(.type=="content_block_delta" and (.delta.text | contains("<<<RALPHEX:ALL_TASKS_DONE>>>"))) | .delta.text' |
+    grep -c . || true)
 if echo "$partial_tool_output" | grep -q "\[tool_error\] command failed" &&
-    ! echo "$partial_tool_output" | grep -q '<<<RALPHEX:ALL_TASKS_DONE>>>'; then
-    pass "tool_result error between signal halves does not splice them together"
+    [[ "$partial_tool_blocks" -eq 1 ]]; then
+    pass "signal halves split by a tool_result error rejoin into one block"
 else
-    fail "partial signal line survived a tool_result error" "got: $partial_tool_output"
+    fail "partial signal line was split by a tool_result error" \
+        "blocks: $partial_tool_blocks output: $partial_tool_output"
+fi
+
+# the hold-back is narrow: an answer remainder that cannot be a partial signal
+# token still flushes ahead of the diagnostic, so ordinary prose is never logged
+# out of order behind a tool error that came after it.
+cat > "$TMPDIR_TEST/partial_line_prose.jsonl" << 'EOF'
+{"type":"message","timestamp":"t","role":"assistant","content":"checking the build","isReasoning":false}
+{"type":"tool_result","timestamp":"t","tool_id":"tool-1","status":"error","error":{"type":"execution","message":"command failed"}}
+{"type":"message","timestamp":"t","role":"assistant","content":" done\n","isReasoning":false}
+{"type":"result","timestamp":"t","status":"success","stats":{}}
+EOF
+partial_prose_text=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/partial_line_prose.jsonl" \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "test prompt" 2>/dev/null |
+    jq -r 'select(.type=="content_block_delta" and .delta.text != "") | .delta.text' |
+    tr -d '\n')
+if [[ "$partial_prose_text" == "checking the build[tool_error] command failed done" ]]; then
+    pass "prose remainder still flushes ahead of a tool_result error"
+else
+    fail "prose remainder ordering changed" "text: $partial_prose_text"
+fi
+
+# a bare opening-marker prefix with no colon yet must also be held: bob splits
+# message text at arbitrary offsets, so the prefix check cannot assume the buffer
+# already contains the full `<<<RALPHEX:` lead-in.
+cat > "$TMPDIR_TEST/partial_line_marker_prefix.jsonl" << 'EOF'
+{"type":"message","timestamp":"t","role":"assistant","content":"done <<<RALP","isReasoning":false}
+{"type":"tool_result","timestamp":"t","tool_id":"tool-1","status":"error","error":{"type":"execution","message":"command failed"}}
+{"type":"message","timestamp":"t","role":"assistant","content":"HEX:REVIEW_DONE>>>\n","isReasoning":false}
+{"type":"result","timestamp":"t","status":"success","stats":{}}
+EOF
+marker_prefix_blocks=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/partial_line_marker_prefix.jsonl" \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "test prompt" 2>/dev/null |
+    jq -r 'select(.type=="content_block_delta" and (.delta.text | contains("<<<RALPHEX:REVIEW_DONE>>>"))) | .delta.text' |
+    grep -c . || true)
+if [[ "$marker_prefix_blocks" -eq 1 ]]; then
+    pass "partial opening-marker prefix is held across a tool_result error"
+else
+    fail "partial opening-marker prefix was flushed mid-token" \
+        "blocks: $marker_prefix_blocks"
+fi
+
+# a held remainder must still be emitted when the line never completes, otherwise
+# the model's last words would be dropped instead of merely re-ordered.
+cat > "$TMPDIR_TEST/partial_line_never_completed.jsonl" << 'EOF'
+{"type":"message","timestamp":"t","role":"assistant","content":"almost <<<RALPHEX:ALL","isReasoning":false}
+{"type":"tool_result","timestamp":"t","tool_id":"tool-1","status":"error","error":{"type":"execution","message":"command failed"}}
+{"type":"result","timestamp":"t","status":"success","stats":{}}
+EOF
+never_completed_text=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/partial_line_never_completed.jsonl" \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "test prompt" 2>/dev/null |
+    jq -r 'select(.type=="content_block_delta" and .delta.text != "") | .delta.text' |
+    tr -d '\n')
+if [[ "$never_completed_text" == "[tool_error] command failedalmost <<<RALPHEX:ALL" ]]; then
+    pass "held remainder is force-flushed at stream end"
+else
+    fail "held remainder lost at stream end" "text: $never_completed_text"
 fi
 
 # with BOB_VERBOSE=1 reasoning shares the line buffer with answer text. A signal
@@ -3480,6 +3617,45 @@ else
     fail "approval merge accepted an unexpected settings shape" \
         "output: $shape_output"
 fi
+
+# a refused grant must leave the MODES uninstalled too. Validating after the mode
+# document was written makes the nonzero exit a lie: nothing appears to have
+# happened, and the re-run then reports the modes as already installed.
+for refusal_case in unparseable shape missing-jq; do
+    order_dir="$approval_root/order-$refusal_case"
+    mkdir -p "$order_dir/home"
+    case "$refusal_case" in
+        unparseable) printf '%s\n' '{not json' > "$order_dir/settings.json" ;;
+        shape) printf '%s\n' '{"approval": {"allowed_permissions": "read"}}' \
+            > "$order_dir/settings.json" ;;
+        missing-jq) printf '%s\n' '{}' > "$order_dir/settings.json" ;;
+    esac
+    set +e
+    if [[ "$refusal_case" == "missing-jq" ]]; then
+        # only the installer's own jq lookup may fail, so the stub PATH keeps the
+        # rest of its tools available.
+        order_bin="$order_dir/bin"
+        mkdir -p "$order_bin"
+        for tool in bash awk sed cat cp mv mkdir dirname rm printf tail; do
+            tool_path=$(command -v "$tool" 2>/dev/null) &&
+                ln -sf "$tool_path" "$order_bin/$tool"
+        done
+        HOME="$order_dir/home" \
+            BOB_CUSTOM_MODES_FILE="$order_dir/custom_modes.yaml" \
+            BOB_SETTINGS_FILE="$order_dir/settings.json" \
+            PATH="$order_bin" bash "$INSTALLER" --grant-approvals >/dev/null 2>&1
+    else
+        run_installer_approval "$order_dir" --grant-approvals >/dev/null 2>&1
+    fi
+    order_exit=$?
+    set -e
+    if [[ $order_exit -ne 0 && ! -e "$order_dir/custom_modes.yaml" ]]; then
+        pass "refused grant ($refusal_case) installs no modes"
+    else
+        fail "refused grant ($refusal_case) left modes installed" \
+            "exit: $order_exit modes: $(cat "$order_dir/custom_modes.yaml" 2>/dev/null || echo none)"
+    fi
+done
 
 # the shape guard has to reach INSIDE each allowedExecutors record: a string-valued
 # approvedCommands passes an array-of-objects check and then makes the merge query
