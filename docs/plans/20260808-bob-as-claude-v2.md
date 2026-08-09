@@ -147,11 +147,11 @@ Scope note: this task owns the shared mock helper and the task-phase tests only.
 
 Scope note: reuse the v2 mock helper from Task 4; do not reshape it again.
 
-- [ ] Replace the review-phase `attempt_completion` fixtures with v2 assistant `message` fixtures and verify the review phase forwards that text
-- [ ] Add a test that a `{type:"error", severity:"error", message}` event produces an error line and a non-zero exit code
-- [ ] Update the `tool_result` error test to supply `error.message` with `output` absent, and confirm the message still reaches the translated stream
-- [ ] Update the `result` fixture to the v2 shape including `stats`, and confirm the wrapper still emits exactly one terminating result event
-- [ ] Run `bash scripts/bob-as-claude/bob-as-claude_test.sh` and confirm the review-phase and event-schema tests pass
+- [x] Replace the review-phase `attempt_completion` fixtures with v2 assistant `message` fixtures and verify the review phase forwards that text
+- [x] Add a test that a `{type:"error", severity:"error", message}` event produces an error line and a non-zero exit code
+- [x] Update the `tool_result` error test to supply `error.message` with `output` absent, and confirm the message still reaches the translated stream
+- [x] Update the `result` fixture to the v2 shape including `stats`, and confirm the wrapper still emits exactly one terminating result event
+- [x] Run `bash scripts/bob-as-claude/bob-as-claude_test.sh` and confirm the review-phase and event-schema tests pass (remaining 16 failures are owned by Tasks 6-8: 9 plan-mode, 4 model note, 3 YAML group validation)
 
 ### Task 6: Rewrite signal-reassembly and plan-mode boundary tests
 

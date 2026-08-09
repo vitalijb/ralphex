@@ -638,6 +638,49 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# test: review-phase assistant message translation — the review phase reads the
+# same v2 assistant message stream as the task phase (no attempt_completion)
+# ---------------------------------------------------------------------------
+echo "test: review-phase assistant message translation"
+
+review_prompt="## Step 2: Launch Review Agents IN PARALLEL"
+
+cat > "$TMPDIR_TEST/review_events.jsonl" << 'EOF'
+{"type":"init","timestamp":"t","session_id":"s","model":"premium"}
+{"type":"message","timestamp":"t","role":"user","content":"review\n"}
+{"type":"message","timestamp":"t","role":"assistant","content":"no issues found\n","isReasoning":false}
+{"type":"message","timestamp":"t","role":"assistant","content":"<<<RALPHEX:REVIEW_DONE>>>\n","isReasoning":false}
+{"type":"result","timestamp":"t","status":"success","stats":{"turns":2,"cost":0}}
+EOF
+
+rm -f "$TMPDIR_TEST/bob_args"
+review_output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/review_events.jsonl" \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "$review_prompt" 2>/dev/null)
+
+if grep -q -- "--mode=ralphex-review" "$TMPDIR_TEST/bob_args"; then
+    pass "review prompt selects ralphex-review mode"
+else
+    fail "review prompt did not select ralphex-review" "args: $(cat "$TMPDIR_TEST/bob_args")"
+fi
+
+review_text=$(echo "$review_output" | grep '"content_block_delta"' |
+    jq -r 'select(.delta.text != "") | .delta.text' | tr -d '\n')
+if [[ "$review_text" == "no issues found<<<RALPHEX:REVIEW_DONE>>>" ]]; then
+    pass "review-phase assistant message text forwarded verbatim"
+else
+    fail "review-phase assistant message not forwarded" "got: $review_output"
+fi
+
+# the review signal must land intact inside a single delta so ralphex can parse it.
+if echo "$review_output" | grep '"content_block_delta"' |
+        jq -e 'select(.delta.text == "<<<RALPHEX:REVIEW_DONE>>>\n")' >/dev/null 2>&1; then
+    pass "review signal emitted in one content_block_delta"
+else
+    fail "review signal split across deltas" "got: $review_output"
+fi
+
+# ---------------------------------------------------------------------------
 # test: isReasoning replaces the v1 <thinking> text heuristic
 # ---------------------------------------------------------------------------
 echo "test: isReasoning message filtering"
@@ -704,41 +747,107 @@ else
     fail "unexpected result count without result event" "expected 1, got $noterm_results: $output_noterm"
 fi
 
-# a failed Bob result must retain its diagnostic instead of being translated to
-# the same empty result as a successful run.
-cat > "$TMPDIR_TEST/failed_result_events.jsonl" << 'EOF'
-{"type":"result","timestamp":"t","status":"error","error":{"message":"backend continuation timed out"},"stats":{}}
+# v2 result events always carry status "success" and a stats object — there is no
+# result-failure channel any more ({type:"error"} covers that, tested below). The
+# stats payload must be consumed, not leaked, and the stream must end with exactly
+# one terminating result event.
+cat > "$TMPDIR_TEST/v2_result_events.jsonl" << 'EOF'
+{"type":"message","timestamp":"t","role":"assistant","content":"work done\n","isReasoning":false}
+{"type":"result","timestamp":"t","status":"success","stats":{"turns":4,"cost":0.0123,"durationMs":4200,"tokensIn":1200,"tokensOut":340}}
 EOF
 set +e
-failed_result_output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/failed_result_events.jsonl" \
+v2_result_output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/v2_result_events.jsonl" \
     PATH="$TMPDIR_TEST:$PATH" \
     bash "$WRAPPER" -p "test prompt" 2>/dev/null)
-failed_result_exit=$?
+v2_result_exit=$?
 set -e
-if echo "$failed_result_output" | grep -q "backend continuation timed out"; then
-    pass "failed Bob result diagnostic preserved"
+
+if echo "$v2_result_output" | grep -qE 'durationMs|tokensIn|0\.0123'; then
+    fail "v2 result stats leaked into the translated stream" "got: $v2_result_output"
 else
-    fail "failed Bob result diagnostic dropped" "got: $failed_result_output"
+    pass "v2 result stats consumed, not leaked"
 fi
-if echo "$failed_result_output" | grep -q "without diagnostic output"; then
-    fail "synthetic diagnostic duplicated detailed Bob result error" "got: $failed_result_output"
+
+# the last line terminates the stream and is the only result event after the
+# final text delta; a v2 success result never turns into a failure.
+v2_last_line=$(echo "$v2_result_output" | tail -1)
+if echo "$v2_last_line" | jq -e '.type == "result" and .result == ""' >/dev/null 2>&1; then
+    pass "stream terminates with exactly one empty result event"
 else
-    pass "detailed Bob result suppresses synthetic fallback diagnostic"
+    fail "stream did not terminate with an empty result event" "got: $v2_result_output"
 fi
-if [[ $failed_result_exit -eq 1 ]]; then
-    pass "failed Bob result forces non-zero exit"
+if [[ $(echo "$v2_result_output" | grep -c '"result"') -eq 2 ]]; then
+    pass "v2 result event translated (2 total with fallback)"
 else
-    fail "failed Bob result did not force non-zero exit" "got: $failed_result_exit"
+    fail "unexpected v2 result count" "got: $v2_result_output"
+fi
+if [[ $v2_result_exit -eq 0 ]]; then
+    pass "v2 success result exits zero"
+else
+    fail "v2 success result did not exit zero" "got: $v2_result_exit"
 fi
 
 # ---------------------------------------------------------------------------
-# test: tool_result(status=error) always emitted even with BOB_VERBOSE=0
+# test: {type:"error"} is v2's only failure channel — it must surface as an
+# error line and force a non-zero exit, not be swallowed into a keepalive
+# ---------------------------------------------------------------------------
+echo "test: error event is a real failure"
+
+cat > "$TMPDIR_TEST/error_event_events.jsonl" << 'EOF'
+{"type":"message","timestamp":"t","role":"assistant","content":"starting\n","isReasoning":false}
+{"type":"error","timestamp":"t","severity":"error","message":"Max cost exceeded: $5.00 limit reached"}
+{"type":"result","timestamp":"t","status":"success","stats":{"turns":3}}
+EOF
+set +e
+error_event_output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/error_event_events.jsonl" \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "test prompt" 2>/dev/null)
+error_event_exit=$?
+set -e
+
+if echo "$error_event_output" | grep -q "error: bob: Max cost exceeded"; then
+    pass "error event emitted as an error line"
+else
+    fail "error event not emitted" "got: $error_event_output"
+fi
+if [[ $error_event_exit -ne 0 ]]; then
+    pass "error event forces non-zero exit ($error_event_exit)"
+else
+    fail "error event did not force non-zero exit" "got: $error_event_exit"
+fi
+# the wrapper already emitted a real diagnostic, so the synthetic no-diagnostic
+# fallback must stay quiet.
+if echo "$error_event_output" | grep -q "without diagnostic output"; then
+    fail "synthetic diagnostic duplicated the bob error event" "got: $error_event_output"
+else
+    pass "error event suppresses the synthetic fallback diagnostic"
+fi
+
+# a signal token inside an error message must be neutralized so a bob failure
+# cannot forge a ralphex completion signal.
+cat > "$TMPDIR_TEST/error_signal_events.jsonl" << 'EOF'
+{"type":"error","timestamp":"t","severity":"error","message":"aborted before <<<RALPHEX:ALL_TASKS_DONE>>>"}
+EOF
+set +e
+error_signal_output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/error_signal_events.jsonl" \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "test prompt" 2>/dev/null)
+set -e
+if echo "$error_signal_output" | grep -q "<<<RALPHEX:ALL_TASKS_DONE>>>"; then
+    fail "error event leaked a live ralphex signal" "got: $error_signal_output"
+else
+    pass "error event signal token neutralized"
+fi
+
+# ---------------------------------------------------------------------------
+# test: tool_result(status=error) always emitted even with BOB_VERBOSE=0.
+# In v2 a failed tool_result has no `output` — the text moved to error.message.
 # ---------------------------------------------------------------------------
 echo "test: tool_result error always emitted"
 
 cat > "$TMPDIR_TEST/tool_error_events.jsonl" << 'EOF'
 {"type":"tool_use","timestamp":"t","tool_name":"bash","tool_id":"tool-1","parameters":{"cmd":"false"}}
-{"type":"tool_result","timestamp":"t","tool_id":"tool-1","status":"error","output":"command failed"}
+{"type":"tool_result","timestamp":"t","tool_id":"tool-1","status":"error","error":{"type":"execution","message":"command failed"}}
 {"type":"message","timestamp":"t","role":"assistant","content":"done\n","isReasoning":false}
 {"type":"result","timestamp":"t","status":"success","stats":{}}
 EOF
@@ -749,9 +858,17 @@ output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/tool_error_events.jsonl" \
     bash "$WRAPPER" -p "test prompt" 2>/dev/null)
 
 if echo "$output" | grep -q "\[tool_error\] command failed"; then
-    pass "tool_result error emitted even with BOB_VERBOSE=0"
+    pass "tool_result error message read from error.message with BOB_VERBOSE=0"
 else
     fail "tool_result error not emitted" "got: $output"
+fi
+
+# the v1 shape put the text in `output`; a v2 error tool_result has none, so an
+# empty [tool_error] line means the wrapper is still reading the old field.
+if echo "$output" | grep -qE '\[tool_error\] *$'; then
+    fail "tool_result error line empty (still reading .output)" "got: $output"
+else
+    pass "tool_result error line carries the error text"
 fi
 
 # ---------------------------------------------------------------------------
@@ -771,8 +888,33 @@ else
     fail "tool_use [tool] marker missing with BOB_VERBOSE=1" "got: $output"
 fi
 
-# A success tool_result does not appear in this fixture (only error), but we
-# can verify the verbose tool_use marker is present (covered above).
+# a successful tool_result still carries its text in `output` (only the error
+# shape moved to error.message), and is verbose-only.
+cat > "$TMPDIR_TEST/tool_success_events.jsonl" << 'EOF'
+{"type":"tool_use","timestamp":"t","tool_name":"read_file","tool_id":"tool-1","parameters":{"path":"main.go"}}
+{"type":"tool_result","timestamp":"t","tool_id":"tool-1","status":"success","output":"package main"}
+{"type":"result","timestamp":"t","status":"success","stats":{}}
+EOF
+
+output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/tool_success_events.jsonl" \
+    BOB_VERBOSE=1 \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "test prompt" 2>/dev/null)
+if echo "$output" | grep -q "\[tool_result\] package main"; then
+    pass "success tool_result output emitted with BOB_VERBOSE=1"
+else
+    fail "success tool_result output missing with BOB_VERBOSE=1" "got: $output"
+fi
+
+output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/tool_success_events.jsonl" \
+    BOB_VERBOSE=0 \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "test prompt" 2>/dev/null)
+if echo "$output" | grep -q "\[tool_result\]"; then
+    fail "success tool_result leaked with BOB_VERBOSE=0" "got: $output"
+else
+    pass "success tool_result suppressed with BOB_VERBOSE=0"
+fi
 
 # ---------------------------------------------------------------------------
 # test: tool events skipped by default (BOB_VERBOSE=0)
