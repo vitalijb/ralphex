@@ -1864,6 +1864,17 @@ else
         "text: $quoted_marker_text"
 fi
 
+# the still-open-boundary guard above must only arm on a marker that starts a
+# line. An unterminated marker never clears, so arming on a mid-sentence mention
+# would suppress every later terminal boundary and fail the whole plan run on
+# narration the model is entitled to produce.
+assert_bare_plan_boundary "narrated mid-sentence marker does not suppress PLAN_READY" \
+    $'I considered asking via <<<RALPHEX:QUESTION>>> but had enough context.\n<<<RALPHEX:PLAN_READY>>>\n' \
+    '<<<RALPHEX:PLAN_READY>>>'
+assert_bare_plan_boundary "narrated mid-sentence marker does not suppress TASK_FAILED" \
+    $'A <<<RALPHEX:PLAN_DRAFT>>> was never viable here.\n<<<RALPHEX:TASK_FAILED>>>\n' \
+    '<<<RALPHEX:TASK_FAILED>>>'
+
 # ---------------------------------------------------------------------------
 # test: after a valid plan boundary the wrapper terminates bob and normalizes the
 # exit status. Bob keeps working autonomously otherwise, so a slow-exiting bob
@@ -2096,6 +2107,86 @@ if echo "$reasoning_remainder_output" | grep -q '<<< RALPHEX:REVIEW_DONE>>>' &&
 else
     fail "reasoning remainder handling changed the answer signal" \
         "got: $reasoning_remainder_output"
+fi
+
+# the reverse direction: a reasoning message arriving BETWEEN two halves of an
+# answer line must not split the answer. Answer and reasoning keep independent
+# buffers precisely so the signal the buffering exists to re-assemble survives a
+# verbose run — a shared buffer emitted "done. <<<RALPHEX:COM" on its own and the
+# phase looped on a task that had actually finished.
+cat > "$TMPDIR_TEST/reasoning_between_answer_halves.jsonl" << 'EOF'
+{"type":"message","timestamp":"t","role":"assistant","content":"done. <<<RALPHEX:COM","isReasoning":false}
+{"type":"message","timestamp":"t","role":"assistant","content":"let me double check\n","isReasoning":true}
+{"type":"message","timestamp":"t","role":"assistant","content":"PLETED>>>\n","isReasoning":false}
+{"type":"result","timestamp":"t","status":"success","stats":{}}
+EOF
+for verbose_setting in 0 1; do
+    interleaved_output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/reasoning_between_answer_halves.jsonl" \
+        BOB_VERBOSE="$verbose_setting" \
+        PATH="$TMPDIR_TEST:$PATH" \
+        bash "$WRAPPER" -p "test prompt" 2>/dev/null |
+        jq -r 'select(.type=="content_block_delta") | .delta.text')
+    if echo "$interleaved_output" | grep -qF 'done. <<<RALPHEX:COMPLETED>>>'; then
+        pass "answer signal survives an interleaved reasoning message (BOB_VERBOSE=$verbose_setting)"
+    else
+        fail "interleaved reasoning message split the answer signal (BOB_VERBOSE=$verbose_setting)" \
+            "got: $interleaved_output"
+    fi
+done
+
+# a message delta with no newline emits no line, so it has to emit a keepalive
+# like every other suppressed path — otherwise a long newline-less stretch reads
+# as a dead session to ralphex's idle_timeout.
+cat > "$TMPDIR_TEST/newlineless_answer_chunk.jsonl" << 'EOF'
+{"type":"message","timestamp":"t","role":"assistant","content":"a long line still being written","isReasoning":false}
+{"type":"result","timestamp":"t","status":"success","stats":{}}
+EOF
+newlineless_keepalives=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/newlineless_answer_chunk.jsonl" \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "test prompt" 2>/dev/null |
+    jq -r 'select(.type=="content_block_delta" and .delta.text == "") | .delta.text' | wc -l)
+if [[ "$newlineless_keepalives" -ge 1 ]]; then
+    pass "newline-less answer chunk still emits a keepalive"
+else
+    fail "newline-less answer chunk emitted no stream event" \
+        "keepalives: $newlineless_keepalives"
+fi
+
+# a non-JSON diagnostic must not be logged ahead of assistant text buffered
+# before it, or the progress log misorders cause and effect around a failure.
+cat > "$TMPDIR_TEST/diagnostic_ordering.jsonl" << 'EOF'
+{"type":"message","timestamp":"t","role":"assistant","content":"partial answer without newline","isReasoning":false}
+plain diagnostic line from bob
+{"type":"result","timestamp":"t","status":"success","stats":{}}
+EOF
+diagnostic_order=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/diagnostic_ordering.jsonl" \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "test prompt" 2>/dev/null |
+    jq -r 'select(.type=="content_block_delta" and .delta.text != "") | .delta.text' |
+    grep -n 'partial answer\|plain diagnostic')
+if [[ "$(echo "$diagnostic_order" | head -1)" == *"partial answer"* ]]; then
+    pass "buffered answer text is flushed before a non-JSON diagnostic"
+else
+    fail "non-JSON diagnostic was emitted ahead of buffered answer text" \
+        "order: $diagnostic_order"
+fi
+
+# defensive: v2 puts the failure text in the top-level message, but a nested
+# error.message must not be dropped — ralphex's limit/error pattern matching
+# reads this line, so losing the cause also loses --wait retry.
+cat > "$TMPDIR_TEST/nested_error_message.jsonl" << 'EOF'
+{"type":"error","timestamp":"t","error":{"message":"rate limit exceeded"},"severity":"fatal"}
+EOF
+nested_error_rc=0
+nested_error_output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/nested_error_message.jsonl" \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "test prompt" 2>/dev/null) || nested_error_rc=$?
+if echo "$nested_error_output" | grep -qF 'error: bob: rate limit exceeded' &&
+    [[ "$nested_error_rc" -ne 0 ]]; then
+    pass "nested error.message is surfaced instead of the unspecified placeholder"
+else
+    fail "nested error.message was discarded" \
+        "rc: $nested_error_rc got: $nested_error_output"
 fi
 
 # ---------------------------------------------------------------------------
@@ -2720,6 +2811,23 @@ else
         "stderr: $preflight_err"
 fi
 assert_preflight_silent "task mode without subagent permission" "$subagent_settings"
+
+# the missing-file warning names the permissions it could not verify, so a review
+# run is not told to look at edit/execute when subagent is the one it needs.
+run_preflight "MISSING" '## Step 2: Launch ALL 5 Review Agents IN PARALLEL'
+if echo "$preflight_err" | grep -qF "subagent"; then
+    pass "missing-settings warning names subagent for a review prompt"
+else
+    fail "missing-settings warning omits subagent in review mode" \
+        "stderr: $preflight_err"
+fi
+run_preflight "MISSING"
+if ! echo "$preflight_err" | grep -qF "subagent"; then
+    pass "missing-settings warning omits subagent for a task prompt"
+else
+    fail "missing-settings warning names subagent in task mode" \
+        "stderr: $preflight_err"
+fi
 
 # the default settings path is derived from HOME, which a sanitized parent env may
 # not set. The preflight is a warning, so an unset HOME must degrade to "cannot
@@ -3372,6 +3480,35 @@ else
     fail "approval merge accepted an unexpected settings shape" \
         "output: $shape_output"
 fi
+
+# the shape guard has to reach INSIDE each allowedExecutors record: a string-valued
+# approvedCommands passes an array-of-objects check and then makes the merge query
+# abort with a raw "string and array cannot be added" jq error, leaving no stray
+# temp file but also no usable diagnostic.
+for bad_field in approvedCommands deniedCommands; do
+    executor_dir="$approval_root/executor-$bad_field"
+    mkdir -p "$executor_dir/home"
+    printf '{"approval":{"allowedExecutors":[{"toolId":"execute_command","%s":"git"}]}}\n' \
+        "$bad_field" > "$executor_dir/settings.json"
+    cp "$executor_dir/settings.json" "$executor_dir/settings-before"
+    set +e
+    executor_output=$(run_installer_approval "$executor_dir" --grant-approvals 2>&1)
+    executor_exit=$?
+    set -e
+    if [[ $executor_exit -ne 0 ]] &&
+        [[ "$executor_output" == *"cannot safely merge existing approval-settings document"* ]] &&
+        cmp -s "$executor_dir/settings.json" "$executor_dir/settings-before"; then
+        pass "approval merge rejects a non-array $bad_field unchanged"
+    else
+        fail "approval merge mishandled a non-array $bad_field" \
+            "exit: $executor_exit output: $executor_output"
+    fi
+    if [[ -z "$(find "$executor_dir" -name '.settings.json.tmp.*' -print -quit)" ]]; then
+        pass "rejected non-array $bad_field leaves no temp file behind"
+    else
+        fail "rejected non-array $bad_field left a temp file behind"
+    fi
+done
 
 # the backup must not be written through a symlink either.
 bak_sentinel="$approval_root/bak-sentinel"

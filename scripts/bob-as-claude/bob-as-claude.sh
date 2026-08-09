@@ -128,18 +128,23 @@ fi
 approval_preflight() {
     # review mode drives native subagents, so it needs the subagent permission on
     # top of edit/execute. warning about it in task mode would be a false alarm.
+    # needed_list mirrors needed_json for the messages below: naming only
+    # edit/execute in a review run would point at the wrong permissions when
+    # subagent is the one actually missing.
     local needed_json='["edit","execute"]'
+    local needed_list="'edit' and 'execute'"
     if [[ "$selected_chat_mode" == "ralphex-review" ]]; then
         needed_json='["edit","execute","subagent"]'
+        needed_list="'edit', 'execute', and 'subagent'"
     fi
 
     if [[ -z "$BOB_SETTINGS_FILE" ]]; then
-        echo "warning: cannot locate bob v2 approval settings: HOME is unset and BOB_SETTINGS_FILE is not set, so the settings bob v2 needs for 'edit' and 'execute' work cannot be checked. Set BOB_SETTINGS_FILE to bob's settings.json path." >&2
+        echo "warning: cannot locate bob v2 approval settings: HOME is unset and BOB_SETTINGS_FILE is not set, so the settings bob v2 needs for $needed_list work cannot be checked. Set BOB_SETTINGS_FILE to bob's settings.json path." >&2
         return 0
     fi
 
     if [[ ! -f "$BOB_SETTINGS_FILE" ]]; then
-        echo "warning: bob v2 approval settings not found at $BOB_SETTINGS_FILE; 'edit' and 'execute' actions require approvals bob does not grant by default. Run scripts/bob-as-claude/install-modes.sh --grant-approvals to grant them." >&2
+        echo "warning: bob v2 approval settings not found at $BOB_SETTINGS_FILE; $needed_list actions require approvals bob does not grant by default. Run scripts/bob-as-claude/install-modes.sh --grant-approvals to grant them." >&2
         return 0
     fi
 
@@ -160,7 +165,7 @@ approval_preflight() {
             ""
         end
     ' "$BOB_SETTINGS_FILE" 2>/dev/null); then
-        echo "warning: cannot read bob v2 approval settings at $BOB_SETTINGS_FILE; bob will fall back to its read-only defaults, which cannot approve 'edit' or 'execute'. Fix the file, or run scripts/bob-as-claude/install-modes.sh --grant-approvals" >&2
+        echo "warning: cannot read bob v2 approval settings at $BOB_SETTINGS_FILE; bob will fall back to its read-only defaults, which cannot approve $needed_list. Fix the file, or run scripts/bob-as-claude/install-modes.sh --grant-approvals" >&2
         return 0
     fi
 
@@ -233,11 +238,18 @@ extract_plan_boundary() {
         pos=${#prefix}
         rest=${text#*"$marker"}
         if [[ "$rest" != *'<<<RALPHEX:END>>>'* ]]; then
-            # this boundary is still streaming. Remember where it opened so a
+            # this boundary may still be streaming. Remember where it opened so a
             # bare marker quoted inside its unterminated body cannot be mistaken
             # for a real terminal boundary below and discard the whole draft.
-            if [[ $open_pos -lt 0 || $pos -lt $open_pos ]]; then
-                open_pos=$pos
+            # Only a marker that starts a line can be a real boundary opening: an
+            # unterminated marker never clears, so arming on a mid-sentence
+            # mention ("I considered asking via <<<RALPHEX:QUESTION>>> but ...")
+            # would suppress every later PLAN_READY for the rest of the run and
+            # fail the plan on benign narration.
+            if [[ -z "$prefix" || "$prefix" == *$'\n' ]]; then
+                if [[ $open_pos -lt 0 || $pos -lt $open_pos ]]; then
+                    open_pos=$pos
+                fi
             fi
             continue
         fi
@@ -335,41 +347,61 @@ bob_result_failed=0
 
 # Line-buffers assistant message text so a signal token split across several
 # streaming deltas is re-assembled and emitted intact in one content_block_delta.
-# Answer and reasoning text share one buffer but are tracked by kind: switching
-# kinds flushes the partial remainder so a newline-less reasoning chunk cannot
-# splice itself into the next real answer line.
-task_stream_buffer=""
-task_stream_kind=""
+# Answer and reasoning text get INDEPENDENT buffers: with one shared buffer, a
+# reasoning message landing between two halves of an answer line had to flush the
+# answer remainder to keep reasoning text out of it, which split the very signal
+# token the buffering exists to re-assemble (BOB_VERBOSE=1 only, but that made the
+# phase loop on a finished task). Separate buffers cannot splice across kinds, so
+# no cross-kind flush is needed.
+task_answer_buffer=""
+task_reasoning_buffer=""
 # Emits one buffered chunk, neutralizing signal tokens when the buffered text is
 # reasoning rather than the model's own answer. Neutralization belongs here, on
 # flush, and not on the incoming chunk: bob splits message text mid-token, so a
 # token straddling two reasoning chunks matches neither per-chunk substitution and
 # the buffer would re-assemble it into a live signal.
 emit_task_chunk() {
-    if [[ "$task_stream_kind" == "reasoning" ]]; then
-        emit_text_delta "${1//<<<RALPHEX:/<<< RALPHEX:}"
+    if [[ "$1" == "reasoning" ]]; then
+        emit_text_delta "${2//<<<RALPHEX:/<<< RALPHEX:}"
     else
-        emit_text_delta "$1"
+        emit_text_delta "$2"
     fi
 }
 flush_task_buffer_remainder() {
-    if [[ -n "$task_stream_buffer" ]]; then
-        emit_task_chunk "$task_stream_buffer"
-        task_stream_buffer=""
+    if [[ -n "$task_answer_buffer" ]]; then
+        emit_task_chunk text "$task_answer_buffer"
+        task_answer_buffer=""
+    fi
+    if [[ -n "$task_reasoning_buffer" ]]; then
+        emit_task_chunk reasoning "$task_reasoning_buffer"
+        task_reasoning_buffer=""
     fi
 }
 flush_task_buffer_lines() {
     local kind="$1"
-    # flush before adopting the new kind so the remainder is neutralized (or not)
-    # according to the kind it was actually buffered as.
-    [[ "$task_stream_kind" == "$kind" ]] || flush_task_buffer_remainder
-    task_stream_kind="$kind"
-    task_stream_buffer+="$2"
-    while [[ "$task_stream_buffer" == *$'\n'* ]]; do
-        local line="${task_stream_buffer%%$'\n'*}"
-        task_stream_buffer="${task_stream_buffer#*$'\n'}"
-        emit_task_chunk "$line"$'\n'
+    local buffer=""
+    local line=""
+    local emitted=0
+    if [[ "$kind" == "reasoning" ]]; then
+        buffer="$task_reasoning_buffer$2"
+    else
+        buffer="$task_answer_buffer$2"
+    fi
+    while [[ "$buffer" == *$'\n'* ]]; do
+        line="${buffer%%$'\n'*}"
+        buffer="${buffer#*$'\n'}"
+        emit_task_chunk "$kind" "$line"$'\n'
+        emitted=1
     done
+    if [[ "$kind" == "reasoning" ]]; then
+        task_reasoning_buffer="$buffer"
+    else
+        task_answer_buffer="$buffer"
+    fi
+    # a chunk with no newline yet emits nothing, so ralphex's idle_timeout would
+    # see silence while a long line accumulates. Keep the keepalive contract every
+    # other suppressed path honors.
+    [[ "$emitted" -eq 1 ]] || emit_keepalive
 }
 
 bob_start_seconds=$SECONDS
@@ -388,6 +420,9 @@ while IFS= read -r line || [[ -n "$line" ]]; do
     fi
 
     if ! parse_bob_event "$line" || [[ -z "$event_type" ]]; then
+        # flush first, like every other non-answer branch, so a diagnostic cannot
+        # be logged ahead of assistant text that was buffered before it.
+        flush_task_buffer_remainder
         emit_text_delta "${line//<<<RALPHEX:/<<< RALPHEX:}"$'\n'
         case "${line,,}" in
             *error*|*failed*|*failure*|*limit*|*auth*|*required*|*timeout*|*exception*)
@@ -405,7 +440,11 @@ while IFS= read -r line || [[ -n "$line" ]]; do
     # plan mode, which never fills the task buffer.
     if [[ "$event_type" == "error" ]]; then
         flush_task_buffer_remainder
-        error_detail="${event_message//<<<RALPHEX:/<<< RALPHEX:}"
+        # v2 puts the text in the top-level message, but fall back to a nested
+        # error.message rather than discarding a cause that was already parsed:
+        # losing it would also keep ralphex's limit/error patterns from matching.
+        error_detail="${event_message:-$event_error_message}"
+        error_detail="${error_detail//<<<RALPHEX:/<<< RALPHEX:}"
         # bob may report an error with no message at all; an empty "error: bob:"
         # line names no cause, so give the user something to search for.
         [[ -n "${error_detail//[[:space:]]/}" ]] || error_detail="unspecified bob error"

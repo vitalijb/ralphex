@@ -44,6 +44,22 @@ error() {
     exit 1
 }
 
+# both temp files are tracked from here, before any of them exists, so the trap
+# covers every exit path — including --grant-approvals on the "modes already
+# installed" branch, which returns before the mode temp file is ever created.
+tmp_file=""
+approval_tmp_file=""
+cleanup() {
+    if [[ -n "$tmp_file" && -e "$tmp_file" ]]; then
+        rm -f "$tmp_file"
+    fi
+    if [[ -n "$approval_tmp_file" && -e "$approval_tmp_file" ]]; then
+        rm -f "$approval_tmp_file"
+    fi
+    return 0
+}
+trap cleanup EXIT
+
 # merge the approval settings headless bob v2 needs into settings.json.
 # union-only: never removes existing entries, never touches deniedCommands,
 # and is a no-op on a second run against the same input.
@@ -79,7 +95,10 @@ grant_approval_settings() {
             (((.approval // {}).allowed_permissions // []) | type == "array") and
             (((.approval // {}).forbiddenApprovalGroups // []) | type == "array") and
             (((.approval // {}).allowedExecutors // []) |
-                type == "array" and all(type == "object"))
+                type == "array" and
+                all(type == "object" and
+                    ((.approvedCommands // []) | type == "array") and
+                    ((.deniedCommands // []) | type == "array")))
         ' "$approval_target" >/dev/null 2>&1 ||
             error "cannot safely merge existing approval-settings document: $approval_target"
         existing_json="$(cat "$approval_target")"
@@ -182,12 +201,17 @@ grant_approval_settings() {
         cp -p "$approval_target" "$approval_target.bak"
     fi
 
-    # the document came out of jq, so it is valid JSON by construction — and a jq
-    # failure would already have aborted the assignment above under `set -e`.
+    # the document came out of jq, but the file about to replace the user's real
+    # settings is what matters: a short write (full disk, interrupted printf) would
+    # install a truncated document. Validate the temp file, not the string.
     local approval_tmp
     approval_tmp=$(mktemp "$approval_dir/.settings.json.tmp.XXXXXX")
+    approval_tmp_file="$approval_tmp"
     printf '%s\n' "$updated_json" > "$approval_tmp"
+    jq -e . "$approval_tmp" >/dev/null 2>&1 ||
+        error "generated approval-settings document failed validation: $approval_target"
     mv -f "$approval_tmp" "$approval_target"
+    approval_tmp_file=""
 
     echo "granted approval settings in $approval_target:"
     [[ -n "$added_permissions" ]] && echo "  added permissions: $added_permissions"
@@ -524,12 +548,6 @@ fi
 
 mkdir -p "$target_dir"
 tmp_file=$(mktemp "$target_dir/.custom_modes.yaml.tmp.XXXXXX")
-cleanup() {
-    if [[ -n "${tmp_file:-}" && -e "$tmp_file" ]]; then
-        rm -f "$tmp_file"
-    fi
-}
-trap cleanup EXIT
 
 if [[ ! -e "$target" || ! -s "$target" ]]; then
     printf '%s\n' 'customModes:' > "$tmp_file"
