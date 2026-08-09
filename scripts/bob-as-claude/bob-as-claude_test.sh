@@ -1894,6 +1894,66 @@ assert_bare_plan_boundary "inlined marker with no line-leading occurrence still 
     $'Here it is: <<<RALPHEX:PLAN_DRAFT>>>\n# Draft\nBody.\n<<<RALPHEX:END>>>\n' \
     $'<<<RALPHEX:PLAN_DRAFT>>>\n# Draft\nBody.\n<<<RALPHEX:END>>>'
 
+# the narration preference applies to the TERMINAL markers too, not just the
+# opening ones. A prose mention of PLAN_READY before a real, complete draft used
+# to win on "leftmost occurrence" alone, ending the run with a PLAN_READY signal
+# and nothing for the user to review; the TASK_FAILED variant aborted the run.
+assert_bare_plan_boundary "narrated PLAN_READY does not outrank a later real draft" \
+    $'I will emit <<<RALPHEX:PLAN_READY>>> once you accept.\n<<<RALPHEX:PLAN_DRAFT>>>\n# Draft\nBody.\n<<<RALPHEX:END>>>\n' \
+    $'<<<RALPHEX:PLAN_DRAFT>>>\n# Draft\nBody.\n<<<RALPHEX:END>>>'
+assert_bare_plan_boundary "narrated TASK_FAILED does not outrank a later real QUESTION" \
+    $'If blocked I would emit <<<RALPHEX:TASK_FAILED>>>.\n<<<RALPHEX:QUESTION>>>\n{"question":"Which store?","options":["postgres","sqlite"]}\n<<<RALPHEX:END>>>\n' \
+    $'<<<RALPHEX:QUESTION>>>\n{"question":"Which store?","options":["postgres","sqlite"]}\n<<<RALPHEX:END>>>'
+# narration must not make the wrapper fail closed either: a real line-leading
+# terminal marker after a prose mention of itself is still a boundary.
+assert_bare_plan_boundary "narrated PLAN_READY does not block a later real PLAN_READY" \
+    $'I will emit <<<RALPHEX:PLAN_READY>>> now that the file exists.\n<<<RALPHEX:PLAN_READY>>>\n' \
+    '<<<RALPHEX:PLAN_READY>>>'
+
+# same hole on the streaming path, for a draft the model opened INLINE: the
+# still-open guard used to arm only on a line-leading opening, so a marker quoted
+# inside an inline-opened body killed bob mid-draft.
+cat > "$TMPDIR_TEST/plan_inline_open_quoted.jsonl" << 'EOF'
+{"type":"message","timestamp":"t","role":"assistant","content":"Here is the draft: <<<RALPHEX:PLAN_DRAFT>>>\n# Draft\n","isReasoning":false}
+{"type":"message","timestamp":"t","role":"assistant","content":"Later I will send <<<RALPHEX:PLAN_READY>>>.\n","isReasoning":false}
+{"type":"message","timestamp":"t","role":"assistant","content":"## Overview\nBody.\n<<<RALPHEX:END>>>\n","isReasoning":false}
+{"type":"result","timestamp":"t","status":"success","stats":{}}
+EOF
+inline_open_text=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/plan_inline_open_quoted.jsonl" \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "$plan_prompt" 2>/dev/null |
+    jq -r 'select(.type=="content_block_delta" and .delta.text != "") | .delta.text')
+if [[ "$inline_open_text" == '<<<RALPHEX:PLAN_DRAFT>>>'* ]] &&
+    echo "$inline_open_text" | grep -q 'Body.' &&
+    echo "$inline_open_text" | grep -q '<<<RALPHEX:END>>>'; then
+    pass "inline-opened streamed draft survives a quoted bare marker"
+else
+    fail "inline-opened streamed draft discarded for a quoted bare marker" \
+        "text: $inline_open_text"
+fi
+
+# conversely, a LINE-LEADING opening still suppresses a line-leading terminal
+# marker inside its unterminated body. A plan about ralphex's own signal protocol
+# can legitimately put one of these tokens on its own line, and discarding the
+# draft for it would be the same silent no-plan failure.
+cat > "$TMPDIR_TEST/plan_leading_quoted_marker.jsonl" << 'EOF'
+{"type":"message","timestamp":"t","role":"assistant","content":"<<<RALPHEX:PLAN_DRAFT>>>\n# Draft\nThe wrapper emits:\n<<<RALPHEX:PLAN_READY>>>\n","isReasoning":false}
+{"type":"message","timestamp":"t","role":"assistant","content":"## Overview\nBody.\n<<<RALPHEX:END>>>\n","isReasoning":false}
+{"type":"result","timestamp":"t","status":"success","stats":{}}
+EOF
+leading_quoted_text=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/plan_leading_quoted_marker.jsonl" \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "$plan_prompt" 2>/dev/null |
+    jq -r 'select(.type=="content_block_delta" and .delta.text != "") | .delta.text')
+if [[ "$leading_quoted_text" == '<<<RALPHEX:PLAN_DRAFT>>>'* ]] &&
+    echo "$leading_quoted_text" | grep -q 'Body.' &&
+    echo "$leading_quoted_text" | grep -q '<<<RALPHEX:END>>>'; then
+    pass "streamed draft survives a line-leading marker quoted before its END"
+else
+    fail "streamed draft discarded for a line-leading quoted marker" \
+        "text: $leading_quoted_text"
+fi
+
 # ---------------------------------------------------------------------------
 # test: after a valid plan boundary the wrapper terminates bob and normalizes the
 # exit status. Bob keeps working autonomously otherwise, so a slow-exiting bob

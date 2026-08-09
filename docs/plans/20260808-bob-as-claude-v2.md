@@ -49,13 +49,20 @@ Event schema (from the v2 stream-json renderer):
 
 Nested bob is now blocked natively by bob itself via a `BOB_SESSION` env var check.
 
-### Approval model (the hard constraint)
+### Approval model (revised during implementation — there is no constraint)
 
-Headless `bob run` registers no interactive approval handler. Its only input is `approval` from `~/.bob/settings/settings.json`. Defaults are `allowed_permissions: ["read"]` and a 15-entry read-only `approvedCommands` list, so `edit` and real commands (`go test`, `git commit`, `make lint`) are not auto-approved. Untrusted workspaces force `autoApprovalEnabled=false`, so `--trust` is still required.
+**This section originally claimed that headless `bob run` reads `approval` from `~/.bob/settings/settings.json`, and Task 3 plus parts of Tasks 1, 7, 8, and 9 were designed on that premise. Reading bob 2.0.0's own source disproved it, so that work was deliberately not implemented. The record below is the corrected finding; the affected task items are struck through in place.**
 
-Command matching is longest-prefix (`findLongestMatchingCommandPattern`; allow and deny compared by word count). There is no wildcard — approvals must enumerate command prefixes.
+`bob run` does not read the `approval` section at all. `ApprovalEngine` is reachable only through `ToolApprovalHandler.handleToolApproval`, whose single caller is the interactive TUI's pending-tool reducer, and the handler is constructed only in the interactive session controller's `initialize()`. The headless broadcaster registers just the outside-workspace blocker and the renderer. This is also why `--auto-approve` exists on `bob chat` but not on `bob run`.
 
-The global bob dir is `os.homedir()/.bob` with no env override (`XDG_CONFIG_HOME` is only consumed by bob's bundled git library), so ralphex cannot scope approval per run. Following the existing precedent that ralphex never writes to a foreign tool's home unprompted (the `~/.codex/` rule), the grant belongs in the explicit, user-run installer, with a wrapper-side preflight that warns instead of hanging.
+Headless tool access is therefore governed only by the active mode's `groups` list (`getToolsForMode()` → `getToolsForGroups(groups)`) plus the always-passed `--trust` and bob's unconditional outside-workspace block. A stock bob install (`allowed_permissions: ["read"]`, `autoApprovalEnabled: false`) runs ralphex task and review phases fine.
+
+Consequences for this plan:
+- No wrapper-side approval preflight. It would warn on every stock install for no headless benefit.
+- No settings-writing installer flag. Granting `autoApprovalEnabled: true` machine-wide would silently disable the user's interactive `bob chat` confirmations — a real regression bought for nothing.
+- Installing the shipped modes is the whole setup step. To narrow what a phase may do, drop a group from the corresponding `modes/*.yaml`.
+
+This reversal is recorded in `CLAUDE.md` as "Do not reintroduce an approval preflight or a settings-writing installer flag", and the tests actively enforce it (`bob-as-claude_test.sh`: no preflight runs, `--grant-approvals` is rejected as an unknown argument).
 
 ### Custom mode groups
 
@@ -92,7 +99,7 @@ Per bob's own bundled mode-schema documentation, the only valid group names are 
 - [x] Simplify the `result` branch: `status` is always `"success"` in v2, so drop the result-failure detection and keep emitting the terminating `{"type":"result","result":""}` after flushing the line buffer
 - [x] Delete the plan-mode `attempt_completion` protocol adapter text and the `tool_use`/`attempt_completion` boundary branch; extract plan boundaries from the assistant delta buffer only, keeping the existing QUESTION JSON validation, empty-PLAN_DRAFT rejection, earliest-marker selection, terminate-on-boundary, and fail-closed behavior
 - [x] Delete the `ralphex-review` PATH guard-shim block (the `bob claude codex` `exit 64` stub loop and its `export PATH`), and update the surrounding comment to record that bob v2 blocks nested bob natively via `BOB_SESSION`
-- [x] Add an approval preflight that reads `~/.bob/settings/settings.json` (honoring an override variable for tests) and prints one actionable stderr warning naming `install-modes.sh` when `approval.allowed_permissions` lacks `edit` or `execute`, or when `approval.autoApprovalEnabled` is false, or when `approval.forbiddenApprovalGroups` contains a needed permission; warn only, never abort
+- [x] ~~Add an approval preflight that reads `~/.bob/settings/settings.json` ... and prints one actionable stderr warning naming `install-modes.sh`~~ — **not implemented, superseded.** `bob run` never reads `approval.*` (see the revised Approval model section), so the preflight would warn on every stock install for no headless benefit. Implemented instead as a comment at the corresponding point in the wrapper recording why there is nothing to preflight
 - [x] Update the script header comment block to document the v2 invocation and the current `BOB_*` variables
 - [x] Preserve unchanged: the fence-aware awk mode classifier and its markers, `BOB_CHAT_MODE` override, `BOB_VERBOSE` validation, `emit_keepalive`, `neutralize_signal_text`, non-JSON diagnostic passthrough, `mktemp -d` plus FIFO stream merge, SIGTERM forwarding, exit-code preservation, and the no-diagnostic fallback message
 - [x] Verify with `bash -n scripts/bob-as-claude/bob-as-claude.sh` and `shellcheck scripts/bob-as-claude/bob-as-claude.sh` if available (shellcheck not installed in this environment; `bash -n` passed)
@@ -112,19 +119,13 @@ Per bob's own bundled mode-schema documentation, the only valid group names are 
 - [x] Do not add an `allowedSubagents` key to any mode
 - [x] Verify each file is plain ASCII with no duplicate group entries and no duplicate slugs, and that all three parse as valid YAML
 
-### Task 3: Extend install-modes.sh to grant the approval settings bob v2 requires
+### Task 3: ~~Extend install-modes.sh to grant the approval settings bob v2 requires~~ — DROPPED
 
-**Files:**
-- Modify: `scripts/bob-as-claude/install-modes.sh`
+**Superseded by the revised Approval model section: `bob run` never reads `approval.*`, so there is nothing to grant.** Every bullet below was designed on the disproved premise and is deliberately not implemented. Writing `autoApprovalEnabled: true` into `~/.bob/settings/settings.json` would only disable the user's interactive `bob chat` confirmations machine-wide, buying no headless benefit.
 
-- [x] Add approval merging targeting `~/.bob/settings/settings.json`, overridable through an env var for tests, alongside the existing `custom_modes.yaml` merge
-- [x] Make the approval step opt-in via an explicit flag so the default installer run keeps its current modes-only behavior
-- [x] Union `approval.allowed_permissions` with `read`, `edit`, `execute`, `subagent`, and `todo` without removing existing entries, and set `approval.autoApprovalEnabled` to true only when the key is absent
-- [x] Union `approvedCommands` for the `execute_command` entry of `approval.allowedExecutors` with a minimal documented prefix list (`git`, `go`, `make`, `npm`, `npx`, `gofmt`, `golangci-lint`, `python3`), creating the executor entry when missing and never touching `deniedCommands`
-- [x] Detect and warn when `approval.forbiddenApprovalGroups` contains any permission being granted, since that silently overrides the grant
-- [x] Reuse the existing safety pattern: back up the original file, validate JSON before and after, write atomically, preserve all unrelated keys and sections, and stay idempotent across repeated runs
-- [x] Print a summary of exactly what was changed, including an explicit warning that broadening `approvedCommands` affects all bob usage on the machine, not just ralphex
-- [x] Verify with `bash -n scripts/bob-as-claude/install-modes.sh` and by running the installer twice against a temporary settings file, confirming the second run is a no-op
+**Files:** none — `scripts/bob-as-claude/install-modes.sh` keeps its modes-only behavior and rejects any argument.
+
+- [x] Verify the installer writes nothing to `~/.bob/settings/settings.json`, takes no arguments, and retains no `--grant-approvals` handling (asserted by `bob-as-claude_test.sh`, section "installer leaves approval settings alone")
 
 ### Task 4: Rewrite the test mock harness and task-phase fixtures for v2
 
@@ -162,23 +163,23 @@ Scope note: reuse the v2 mock helper from Task 4; do not reshape it again.
 - [x] Update plan-mode tests: boundaries are recognized from assistant deltas only, the `attempt_completion` protocol-adapter assertions are removed, malformed and missing boundaries still fail closed, and QUESTION payload validation is unchanged
 - [x] Run `bash scripts/bob-as-claude/bob-as-claude_test.sh` and confirm the signal-reassembly and plan-mode tests pass (remaining 7 failures are owned by Tasks 7-8: 4 model note, 3 YAML group validation)
 
-### Task 7: Add tests for the model note, approval preflight, and guard-shim removal
+### Task 7: Add tests for the model note, absent approval preflight, and guard-shim removal
 
 **Files:**
 - Modify: `scripts/bob-as-claude/bob-as-claude_test.sh`
 
 - [x] Add a test asserting no guard-shim directory is prepended to `PATH` for `ralphex-review`
 - [x] Add a test for the model note: both `--model` and `BOB_MODEL` are ignored, with a one-time stderr note and no model argument forwarded to bob
-- [x] Add tests for the approval preflight warning: it fires on a minimal settings file and stays silent on a compliant one, using a temporary HOME so no real `~/.bob/` is read or written
+- [x] ~~Add tests for the approval preflight warning~~ — **replaced by the inverse assertions** (Task 3 dropped): under a temporary HOME with a minimal read-only settings file, task and review prompts run successfully, emit no approval warning, and never point at `install-modes.sh --grant-approvals`
 - [x] Run `bash scripts/bob-as-claude/bob-as-claude_test.sh` and confirm these tests pass (remaining 3 failures are the YAML group validation tests owned by Task 8)
 
-### Task 8: Extend YAML group validation and add installer approval-merge tests
+### Task 8: Extend YAML group validation and add installer approval-inaction tests
 
 **Files:**
 - Modify: `scripts/bob-as-claude/bob-as-claude_test.sh`
 
 - [x] Extend the vendored YAML validation section to assert every group name in `scripts/bob-as-claude/modes/*.yaml` is one of `read`, `edit`, `execute`, `mcp`, `skill`, `todo`, `subagent`, `mode`, and that `ralphex-review.yaml` includes `subagent`
-- [x] Add installer tests for the approval merge against a temporary settings file: fresh creation, union with pre-existing values, unrelated keys preserved, and idempotence
+- [x] ~~Add installer tests for the approval merge against a temporary settings file~~ — **replaced by the inverse assertions** (Task 3 dropped): `--grant-approvals` is rejected as an unknown argument and installs no modes, a default run installs the modes while leaving a pre-existing `settings.json` byte-identical and writing no settings backup, and the installer source retains no approval handling
 - [x] Verify the full suite passes with `bash scripts/bob-as-claude/bob-as-claude_test.sh` — this is the green gate for Tasks 4-8 (309 passed, 0 failed)
 - [x] Confirm no test writes outside its temporary directories, and that no test touches a real `~/.bob/`, `~/.claude/`, or `~/.config/ralphex/` (verified by running the suite under a sentinel HOME: only the Go toolchain's own telemetry counters appear there, and real `~/.bob/`, `~/.claude/`, `~/.config/ralphex/` checksums are unchanged)
 
@@ -191,10 +192,10 @@ Scope note: reuse the v2 mock helper from Task 4; do not reshape it again.
 - Modify: `scripts/bob-as-claude/bob-as-claude_docs_test.sh`
 
 - [x] Rewrite the bob wrapper section of `docs/custom-providers.md`: the `bob run -f stream-json --mode= --trust` invocation, the v2 event table (`message` with `isReasoning`, `tool_use`, `tool_result` with `error.message`, `result` with `stats`, `error`), the valid tool-group list, and the removal of `attempt_completion`, `--yolo`, and model selection
-- [x] Document the approval prerequisite in `docs/custom-providers.md`: why headless bob cannot prompt, what `~/.bob/settings/settings.json` must contain, how to grant it with the installer flag, and that broadening `approvedCommands` affects all bob usage
+- [x] Document in `docs/custom-providers.md` why there is **no** approval prerequisite (Task 3 dropped): headless `bob run` cannot prompt and does not read `approval.*` because the approval engine is only reachable from the interactive TUI's tool handler, so tool access comes from the mode's `groups` plus `--trust`, installing the modes is the whole setup step, and narrowing a phase means editing its mode file
 - [x] Document that review runs use native `spawn_subagent` in parallel, that subagent activity produces no stream events, and that a generous or disabled `idle_timeout` is therefore recommended for bob review phases
 - [x] Add a short caveat that bob v2 auto-loads skills from `~/.claude/skills`, so a conflicting skill can compete with the ralphex prompt
-- [x] Update `scripts/bob-as-claude/README.md` with the v2 invocation, the two-step setup (install modes, then grant approvals), the `BOB_*` variables, and the removal of model selection
+- [x] Update `scripts/bob-as-claude/README.md` with the v2 invocation, the one-step setup (install the modes — no approval grant is needed; Task 3 dropped), the `BOB_*` variables, and the removal of model selection
 - [x] Update the bob wrapper description in `CLAUDE.md`, `llms.txt`, and `README.md` so no mention of `--chat-mode`, `--yolo`, `--output-format=stream-json`, `--hide-intermediary-output`, `attempt_completion`, or `-m`/`BOB_MODEL` model forwarding remains
 - [x] State the minimum supported version as bob 2.0.0 in `llms.txt` requirements and in `docs/custom-providers.md`, noting that bob 1.0.x is not supported by this wrapper
 - [x] Update `scripts/bob-as-claude/bob-as-claude_docs_test.sh` assertions to match the new documentation, replacing v1 term assertions with v2 ones and adding `assert_not_contains` checks for the removed v1 flags
@@ -216,7 +217,7 @@ Scope note: reuse the v2 mock helper from Task 4; do not reshape it again.
 - Plan mode detects QUESTION, PLAN_DRAFT, PLAN_READY, and TASK_FAILED boundaries from assistant messages alone, validates QUESTION JSON, terminates bob on the first valid boundary, and fails closed otherwise
 - No `attempt_completion` handling, no `<thinking>` heuristic, no guard shims, and no v1 flags remain anywhere in the wrapper, modes, tests, or docs
 - All three mode files declare only valid v2 group names, and `ralphex-review.yaml` grants `subagent` and instructs native parallel `spawn_subagent` use
-- `install-modes.sh` can grant the required approval settings opt-in, safely, idempotently, and non-destructively, and reports exactly what it changed
+- `install-modes.sh` stays modes-only: it writes nothing to `~/.bob/settings/settings.json`, takes no arguments, and installing the modes is the complete setup step (revised — see the Approval model section)
 - `bash scripts/bob-as-claude/bob-as-claude_test.sh` and `bash scripts/bob-as-claude/bob-as-claude_docs_test.sh` both pass, with no test touching a real user config directory
 - No version-detection branch and no v1 compatibility layer exists in the wrapper
 - `make test` and `make lint` still pass, since no Go code changes

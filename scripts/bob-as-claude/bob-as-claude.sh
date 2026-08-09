@@ -162,6 +162,26 @@ emit_keepalive() {
     printf '%s\n' '{"type":"content_block_delta","delta":{"type":"text_delta","text":""}}'
 }
 
+# selection rule shared by the opening- and terminal-marker loops below: a marker
+# that starts its own line is the real boundary and a mid-sentence one is narration,
+# so any line-leading candidate outranks any non-leading one; within the same class
+# the earliest occurrence wins (ralphex itself extracts leftmost-marker-to-nearest-END).
+# Written as plain ifs rather than `[[ ]] && return 0` so it is safe under `set -e`
+# regardless of call context. Args: pos leading best_pos best_leading.
+plan_boundary_outranks() {
+    local pos=$1 leading=$2 best_pos=$3 best_leading=$4
+    if [[ $best_pos -lt 0 ]]; then
+        return 0
+    fi
+    if [[ $best_leading -eq 0 && $leading -eq 1 ]]; then
+        return 0
+    fi
+    if [[ $best_leading -eq $leading && $pos -lt $best_pos ]]; then
+        return 0
+    fi
+    return 1
+}
+
 plan_boundary_text=""
 plan_boundary_error=""
 extract_plan_boundary() {
@@ -171,7 +191,9 @@ extract_plan_boundary() {
     local body=""
     local candidate=""
     local candidate_pos=-1
+    local candidate_leading=0
     local open_pos=-1
+    local open_inline_pos=-1
     local pos=-1
     local current=""
     local prefix=""
@@ -218,18 +240,26 @@ extract_plan_boundary() {
                 # this boundary may still be streaming. Remember where it opened
                 # so a bare marker quoted inside its unterminated body cannot be
                 # mistaken for a real terminal boundary below and discard the
-                # whole draft. Only a marker that starts a line can be a real
-                # boundary opening: an unterminated marker never clears, so
-                # arming on a mid-sentence mention ("I considered asking via
-                # <<<RALPHEX:QUESTION>>> but ...") would suppress every later
-                # PLAN_READY for the rest of the run and fail the plan on benign
-                # narration.
+                # whole draft. Tracked in two classes because an unterminated
+                # marker never clears: a line-leading opening is certainly a real
+                # boundary, so it suppresses any later terminal marker, while a
+                # mid-sentence mention ("I considered asking via
+                # <<<RALPHEX:QUESTION>>> but ...") may be pure narration and so
+                # only suppresses an equally mid-sentence terminal marker. That
+                # keeps benign narration from sinking every later PLAN_READY while
+                # still protecting a draft the model opened inline.
                 if [[ $leading -eq 1 ]] && [[ $open_pos -lt 0 || $pos -lt $open_pos ]]; then
                     open_pos=$pos
                 fi
+                if [[ $open_inline_pos -lt 0 || $pos -lt $open_inline_pos ]]; then
+                    open_inline_pos=$pos
+                fi
                 continue
             fi
-            if [[ $chosen_pos -lt 0 ]] || [[ $chosen_leading -eq 0 && $leading -eq 1 ]]; then
+            # same rule as the cross-marker choice below. The walk runs left to
+            # right, so the earliest-within-class half never fires here; sharing the
+            # helper keeps the two selections from drifting apart.
+            if plan_boundary_outranks "$pos" "$leading" "$chosen_pos" "$chosen_leading"; then
                 chosen_pos=$pos
                 chosen_rest="$rest"
                 chosen_leading=$leading
@@ -238,6 +268,7 @@ extract_plan_boundary() {
         [[ $chosen_pos -ge 0 ]] || continue
         pos=$chosen_pos
         rest="$chosen_rest"
+        leading=$chosen_leading
         body=${rest%%'<<<RALPHEX:END>>>'*}
         current="$marker$body<<<RALPHEX:END>>>"
 
@@ -256,25 +287,48 @@ extract_plan_boundary() {
             continue
         fi
 
-        if [[ $candidate_pos -lt 0 || $pos -lt $candidate_pos ]]; then
+        if plan_boundary_outranks "$pos" "$leading" "$candidate_pos" "$candidate_leading"; then
             candidate="$current"
             candidate_pos=$pos
+            candidate_leading=$leading
         fi
     done
 
     for marker in '<<<RALPHEX:PLAN_READY>>>' '<<<RALPHEX:TASK_FAILED>>>'; do
         [[ "$text" == *"$marker"* ]] || continue
-        prefix=${text%%"$marker"*}
-        pos=${#prefix}
-        # a terminal marker inside a still-open QUESTION/PLAN_DRAFT body is the
-        # model narrating its own protocol, not a boundary. Keep buffering.
-        if [[ $open_pos -ge 0 && $pos -gt $open_pos ]]; then
-            continue
-        fi
-        if [[ $candidate_pos -lt 0 || $pos -lt $candidate_pos ]]; then
-            candidate="$marker"
-            candidate_pos=$pos
-        fi
+        # walk EVERY occurrence and classify each, for the same reason the opening
+        # markers do: the plan prompt teaches the model these exact tokens, so it
+        # may name one in prose before emitting the real boundary. Binding to the
+        # first occurrence let that narration outrank a real, complete PLAN_DRAFT,
+        # ending the run with a PLAN_READY signal and no plan for the user to
+        # review (or aborting it outright on a narrated TASK_FAILED).
+        scan="$text"
+        consumed=0
+        while [[ "$scan" == *"$marker"* ]]; do
+            prefix=${scan%%"$marker"*}
+            pos=$((consumed + ${#prefix}))
+            rest=${scan#*"$marker"}
+            consumed=$((pos + ${#marker}))
+            scan="$rest"
+            if [[ $pos -eq 0 || "${text:pos-1:1}" == $'\n' ]]; then
+                leading=1
+            else
+                leading=0
+            fi
+            # a terminal marker inside a still-open QUESTION/PLAN_DRAFT body is the
+            # model narrating its own protocol, not a boundary. Keep buffering.
+            if [[ $open_pos -ge 0 && $pos -gt $open_pos ]]; then
+                continue
+            fi
+            if [[ $leading -eq 0 && $open_inline_pos -ge 0 && $pos -gt $open_inline_pos ]]; then
+                continue
+            fi
+            if plan_boundary_outranks "$pos" "$leading" "$candidate_pos" "$candidate_leading"; then
+                candidate="$marker"
+                candidate_pos=$pos
+                candidate_leading=$leading
+            fi
+        done
     done
 
     [[ $candidate_pos -ge 0 ]] || return 1
