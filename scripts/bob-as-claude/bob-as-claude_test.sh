@@ -1678,6 +1678,47 @@ else
         "exit: $invalid_payload_exit output: $output"
 fi
 
+# the failure diagnostic above is the only error line: the status is synthesized by
+# the wrapper, so the silent-failure fallback must not also claim bob exited without
+# diagnostic output at a code bob never reported.
+if echo "$output" | grep -q "without diagnostic output"; then
+    fail "plan boundary failure also reported as a silent failure" "output: $output"
+else
+    pass "plan boundary failure suppresses the synthetic fallback diagnostic"
+fi
+
+# a malformed occurrence must only lose candidacy, not abandon the marker type:
+# plan_stream_buffer only grows, so a model that self-corrects and re-emits a
+# well-formed payload would otherwise keep losing to the same bad occurrence forever.
+cat > "$TMPDIR_TEST/plan_question_selfcorrect.jsonl" << 'EOF'
+{"type":"message","timestamp":"t","role":"assistant","content":"<<<RALPHEX:QUESTION>>>\n{\"question\":\"Choose stack?\",\"options\":[]}\n<<<RALPHEX:END>>>\nThat payload was malformed, asking again:\n<<<RALPHEX:QUESTION>>>\n{\"question\":\"Choose stack?\",\"options\":[\"JS\",\"TS\"]}\n<<<RALPHEX:END>>>","isReasoning":false}
+{"type":"result","timestamp":"t","status":"success","stats":{}}
+EOF
+set +e
+output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/plan_question_selfcorrect.jsonl" \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "$plan_prompt" 2>/dev/null)
+selfcorrect_exit=$?
+set -e
+if [[ $selfcorrect_exit -eq 0 ]] &&
+    echo "$output" | jq -e 'select(.type=="content_block_delta" and (.delta.text | contains("\"options\":[\"JS\",\"TS\"]")))' >/dev/null 2>&1; then
+    pass "a valid QUESTION after an invalid one is still emitted"
+else
+    fail "self-corrected QUESTION was discarded with the invalid occurrence" \
+        "exit: $selfcorrect_exit output: $output"
+fi
+if echo "$output" | jq -e 'select(.type=="content_block_delta" and (.delta.text | contains("invalid QUESTION payload from Bob")))' >/dev/null 2>&1; then
+    fail "self-corrected QUESTION still reported the earlier payload error" "output: $output"
+else
+    pass "recovered QUESTION reports no payload error"
+fi
+if echo "$output" | jq -e 'select(.type=="content_block_delta" and (.delta.text | contains("was malformed, asking again")))' >/dev/null 2>&1; then
+    fail "narration between the two QUESTION occurrences leaked into the boundary" \
+        "output: $output"
+else
+    pass "narration before the recovered QUESTION is not forwarded"
+fi
+
 # ---------------------------------------------------------------------------
 # test: malformed terminal QUESTION fails closed instead of starting iteration 2
 # ---------------------------------------------------------------------------

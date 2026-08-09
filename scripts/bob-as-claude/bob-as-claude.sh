@@ -203,6 +203,7 @@ extract_plan_boundary() {
     local chosen_pos=-1
     local chosen_rest=""
     local chosen_leading=0
+    local pending_error=""
 
     plan_boundary_text=""
     plan_boundary_error=""
@@ -221,6 +222,7 @@ extract_plan_boundary() {
         chosen_pos=-1
         chosen_rest=""
         chosen_leading=0
+        pending_error=""
         while [[ "$scan" == *"$marker"* ]]; do
             prefix=${scan%%"$marker"*}
             pos=$((consumed + ${#prefix}))
@@ -256,6 +258,28 @@ extract_plan_boundary() {
                 fi
                 continue
             fi
+            body=${rest%%'<<<RALPHEX:END>>>'*}
+            # validate here, inside the walk, rather than on the ranking winner
+            # below: a malformed occurrence must only lose candidacy, not abandon
+            # the whole marker type. plan_stream_buffer only grows, so the same bad
+            # occurrence would keep winning the ranking on every later call and a
+            # self-correcting model that re-emits a well-formed payload could never
+            # recover. Remember the cause and keep walking; it is only reported if
+            # no valid occurrence of this marker exists.
+            if [[ "$marker" == '<<<RALPHEX:QUESTION>>>' ]]; then
+                if ! printf '%s' "$body" | jq -e '
+                    type == "object" and
+                    (.question | type == "string" and length > 0) and
+                    (.options | type == "array" and length > 0) and
+                    all(.options[]; type == "string" and length > 0)
+                ' >/dev/null 2>&1; then
+                    pending_error="invalid QUESTION payload from Bob"
+                    continue
+                fi
+            elif [[ -z "${body//[[:space:]]/}" ]]; then
+                pending_error="empty PLAN_DRAFT payload from Bob"
+                continue
+            fi
             # same rule as the cross-marker choice below. The walk runs left to
             # right, so the earliest-within-class half never fires here; sharing the
             # helper keeps the two selections from drifting apart.
@@ -265,27 +289,15 @@ extract_plan_boundary() {
                 chosen_leading=$leading
             fi
         done
-        [[ $chosen_pos -ge 0 ]] || continue
+        if [[ $chosen_pos -lt 0 ]]; then
+            [[ -z "$pending_error" ]] || plan_boundary_error="$pending_error"
+            continue
+        fi
         pos=$chosen_pos
         rest="$chosen_rest"
         leading=$chosen_leading
         body=${rest%%'<<<RALPHEX:END>>>'*}
         current="$marker$body<<<RALPHEX:END>>>"
-
-        if [[ "$marker" == '<<<RALPHEX:QUESTION>>>' ]]; then
-            if ! printf '%s' "$body" | jq -e '
-                type == "object" and
-                (.question | type == "string" and length > 0) and
-                (.options | type == "array" and length > 0) and
-                all(.options[]; type == "string" and length > 0)
-            ' >/dev/null 2>&1; then
-                plan_boundary_error="invalid QUESTION payload from Bob"
-                continue
-            fi
-        elif [[ -z "${body//[[:space:]]/}" ]]; then
-            plan_boundary_error="empty PLAN_DRAFT payload from Bob"
-            continue
-        fi
 
         if plan_boundary_outranks "$pos" "$leading" "$candidate_pos" "$candidate_leading"; then
             candidate="$current"
@@ -617,6 +629,10 @@ if [[ "$selected_chat_mode" == "ralphex-plan" && "$plan_boundary_emitted" == "0"
     [[ -n "$plan_boundary_error" ]] || plan_boundary_error="Bob exited without a complete ralphex plan boundary"
     emit_text_delta "error: $plan_boundary_error"$'\n'
     bob_exit=1
+    # this line IS the diagnostic, and the status is synthesized here rather than
+    # returned by bob, so the silent-failure fallback below must not also claim the
+    # run ended "without diagnostic output" at a status bob never reported.
+    bob_failure_detail_emitted=1
 fi
 
 # Bob occasionally exits non-zero after going silent without emitting any diagnostic.
