@@ -73,9 +73,22 @@ type mode struct {
 }
 
 var ralphexGroups = map[string][]string{
-	"ralphex-task":   {"read", "edit", "command", "browser"},
-	"ralphex-review": {"read", "edit", "command", "browser"},
-	"ralphex-plan":   {"read", "edit", "command", "browser"},
+	"ralphex-task":   {"read", "edit", "execute"},
+	"ralphex-review": {"read", "edit", "execute", "subagent"},
+	"ralphex-plan":   {"read", "edit", "execute"},
+}
+
+// the only group names bob v2 recognizes, per its bundled mode-schema docs.
+// an invalid name silently grants nothing, so it must fail the suite loudly.
+var validGroupNames = map[string]bool{
+	"read":     true,
+	"edit":     true,
+	"execute":  true,
+	"mcp":      true,
+	"skill":    true,
+	"todo":     true,
+	"subagent": true,
+	"mode":     true,
 }
 
 var requiredInstructions = map[string][]string{
@@ -86,10 +99,10 @@ var requiredInstructions = map[string][]string{
 		"<<<RALPHEX:TASK_FAILED>>>",
 	},
 	"ralphex-review": {
-		"sequentially",
-		"Never launch `bob`, `claude`, `codex`",
-		"Never use background commands",
-		"current Bob session",
+		"spawn_subagent",
+		"single turn",
+		"in parallel",
+		"Consolidate the subagent findings",
 		"temporary files",
 		"verify every finding",
 		"Fix every confirmed issue",
@@ -101,12 +114,19 @@ var requiredInstructions = map[string][]string{
 	"ralphex-plan": {
 		"Do not edit source files",
 		"use the edit tool to write only the requested plan file under docs/plans",
-		"attempt_completion",
+		"ordinary assistant text",
 		"ralphex alone owns that log",
 		"<<<RALPHEX:QUESTION>>>",
 		"<<<RALPHEX:PLAN_DRAFT>>>",
 		"<<<RALPHEX:PLAN_READY>>>",
 	},
+}
+
+// v1 contracts that must not survive anywhere in the shipped modes.
+var forbiddenInstructions = map[string][]string{
+	"ralphex-task":   {"attempt_completion"},
+	"ralphex-plan":   {"attempt_completion"},
+	"ralphex-review": {"attempt_completion", "Never launch", "sequentially"},
 }
 
 func invalid(format string, args ...interface{}) {
@@ -164,7 +184,24 @@ func validate(path string, strict bool) {
 			if !ok {
 				invalid("mode %s has a non-scalar group", current.Slug)
 			}
+			if !validGroupNames[name] {
+				invalid(
+					"mode %s declares group %q, which bob v2 does not recognize",
+					current.Slug,
+					name,
+				)
+			}
 			actualGroups = append(actualGroups, name)
+		}
+		seenGroups := make(map[string]bool, len(actualGroups))
+		for _, name := range actualGroups {
+			if seenGroups[name] {
+				invalid("mode %s declares duplicate group %q", current.Slug, name)
+			}
+			seenGroups[name] = true
+		}
+		if current.Slug == "ralphex-review" && !seenGroups["subagent"] {
+			invalid("mode %s must grant the subagent group", current.Slug)
 		}
 		if !reflect.DeepEqual(actualGroups, expectedGroups) {
 			invalid(
@@ -180,6 +217,15 @@ func validate(path string, strict bool) {
 					"mode %s is missing custom instruction %q",
 					current.Slug,
 					requirement,
+				)
+			}
+		}
+		for _, banned := range forbiddenInstructions[current.Slug] {
+			if strings.Contains(current.CustomInstructions, banned) {
+				invalid(
+					"mode %s still carries the v1 instruction %q",
+					current.Slug,
+					banned,
 				)
 			}
 		}
@@ -232,6 +278,22 @@ assert_yaml_valid() {
     fi
 }
 
+# the group and instruction assertions are only meaningful if they can fail, so
+# every negative shape is exercised against a mutated copy of a shipped mode.
+assert_yaml_invalid() {
+    local label="$1"
+    local expected="$2"
+    shift 2
+    local output
+    if output=$(validate_yaml "$@" 2>&1); then
+        fail "$label" "validator accepted the mutated document"
+    elif [[ "$output" == *"$expected"* ]]; then
+        pass "$label"
+    else
+        fail "$label" "unexpected diagnostic: $output"
+    fi
+}
+
 # create a mock bob script that records its arguments and emits predefined stdout.
 # MOCK_STDOUT_FILE: file containing text to emit on stdout
 # MOCK_STDERR_FILE: file containing text to emit on stderr
@@ -281,12 +343,71 @@ cat > "$TMPDIR_TEST/bob_settings.json" << 'SETTINGS_EOF'
 SETTINGS_EOF
 export BOB_SETTINGS_FILE="$TMPDIR_TEST/bob_settings.json"
 
-# validate every shipped mode against bob's yaml shape and tool allow-list.
-for mode in ralphex-task ralphex-review ralphex-plan; do
+# validate every shipped mode against bob's yaml shape, its v2 group allow-list,
+# and its v2 instruction contract. the glob (rather than a fixed slug list) makes
+# a newly added mode file fail until the validator knows about it.
+shipped_mode_count=0
+for mode_path in "$SCRIPT_DIR"/modes/*.yaml; do
+    shipped_mode_count=$((shipped_mode_count + 1))
     assert_yaml_valid \
-        "$mode mode parses with the vendored YAML validator" \
-        --strict "$SCRIPT_DIR/modes/$mode.yaml"
+        "$(basename "$mode_path" .yaml) mode parses with the vendored YAML validator" \
+        --strict "$mode_path"
 done
+if [[ "$shipped_mode_count" -eq 3 ]]; then
+    pass "all three shipped mode files were validated"
+else
+    fail "unexpected shipped mode file count" "count: $shipped_mode_count"
+fi
+
+# every shipped mode file declares only names from bob v2's group allow-list.
+invalid_group_names=$(
+    awk '
+        /^    groups:/ { in_groups = 1; next }
+        in_groups && /^      - [a-z]+$/ { print $2; next }
+        in_groups && !/^      / { in_groups = 0 }
+    ' "$SCRIPT_DIR"/modes/*.yaml |
+        grep -vxE 'read|edit|execute|mcp|skill|todo|subagent|mode' || true
+)
+if [[ -z "$invalid_group_names" ]]; then
+    pass "shipped modes declare only valid bob v2 group names"
+else
+    fail "shipped modes declare unknown group names" "$invalid_group_names"
+fi
+
+mutant_dir="$TMPDIR_TEST/mode-mutants"
+mkdir -p "$mutant_dir"
+
+# an invalid group name silently grants nothing in bob, so it must be rejected.
+sed 's/^      - execute$/      - command/' \
+    "$SCRIPT_DIR/modes/ralphex-task.yaml" > "$mutant_dir/invalid-group.yaml"
+assert_yaml_invalid \
+    "validator rejects a v1 group name" \
+    "bob v2 does not recognize" \
+    --strict "$mutant_dir/invalid-group.yaml"
+
+# the review mode cannot spawn native subagents without the subagent group.
+grep -v '^      - subagent$' "$SCRIPT_DIR/modes/ralphex-review.yaml" \
+    > "$mutant_dir/no-subagent.yaml"
+assert_yaml_invalid \
+    "validator rejects a review mode without the subagent group" \
+    "must grant the subagent group" \
+    --strict "$mutant_dir/no-subagent.yaml"
+
+# bob drops a whole mode document that repeats a group entry.
+sed 's/^      - edit$/      - read/' \
+    "$SCRIPT_DIR/modes/ralphex-task.yaml" > "$mutant_dir/duplicate-group.yaml"
+assert_yaml_invalid \
+    "validator rejects a duplicate group entry" \
+    "duplicate group" \
+    --strict "$mutant_dir/duplicate-group.yaml"
+
+# v2 removed attempt_completion, so no mode may still instruct bob to call it.
+sed 's/Work on one task at a time/Call attempt_completion when done. Work on one task at a time/' \
+    "$SCRIPT_DIR/modes/ralphex-task.yaml" > "$mutant_dir/attempt-completion.yaml"
+assert_yaml_invalid \
+    "validator rejects a surviving attempt_completion instruction" \
+    "v1 instruction" \
+    --strict "$mutant_dir/attempt-completion.yaml"
 
 # minimal valid bob v2 event stream: assistant message text produces the output.
 # v2 has no attempt_completion tool, so every phase reads the assistant messages.
@@ -2570,6 +2691,219 @@ if [[ $fifo_exit -ne 0 && -p "$fifo_target" ]]; then
     pass "installer refuses a fifo target"
 else
     fail "installer accepted or replaced a fifo target"
+fi
+
+# ---------------------------------------------------------------------------
+# test: installer approval merge (--grant-approvals) is opt-in, union-only,
+# non-destructive, and idempotent. every run targets a temporary settings file,
+# so no real ~/.bob/settings/settings.json is read or written.
+# ---------------------------------------------------------------------------
+echo "test: installer approval merge"
+
+approval_root="$TMPDIR_TEST/approval-installer"
+mkdir -p "$approval_root"
+
+# run the installer against isolated modes and settings targets. HOME points at
+# a temporary directory too, so a bug in the override handling cannot escape.
+run_installer_approval() {
+    local case_dir="$1"
+    shift
+    HOME="$case_dir/home" \
+        BOB_CUSTOM_MODES_FILE="$case_dir/custom_modes.yaml" \
+        BOB_SETTINGS_FILE="$case_dir/settings.json" \
+        bash "$INSTALLER" "$@"
+}
+
+# the default run stays modes-only: no settings file is created.
+optout_dir="$approval_root/opt-out"
+mkdir -p "$optout_dir/home"
+run_installer_approval "$optout_dir" >/dev/null
+if [[ -f "$optout_dir/custom_modes.yaml" && ! -e "$optout_dir/settings.json" ]]; then
+    pass "installer without --grant-approvals leaves settings untouched"
+else
+    fail "default installer run created or removed an approval settings file"
+fi
+
+# an absent settings file is created with every needed permission and command.
+fresh_dir="$approval_root/fresh"
+mkdir -p "$fresh_dir/home"
+run_installer_approval "$fresh_dir" --grant-approvals > "$fresh_dir/output" 2>&1
+fresh_settings="$fresh_dir/settings.json"
+if [[ -f "$fresh_settings" ]] && jq empty "$fresh_settings" 2>/dev/null; then
+    pass "installer creates a valid approval settings document"
+else
+    fail "installer did not create a valid approval settings document"
+fi
+missing_permissions=""
+for permission in read edit execute subagent todo; do
+    if [[ "$(jq --arg p "$permission" \
+        '(.approval.allowed_permissions // []) | index($p) != null' \
+        "$fresh_settings")" != "true" ]]; then
+        missing_permissions="$missing_permissions $permission"
+    fi
+done
+if [[ -z "$missing_permissions" ]]; then
+    pass "granted approval settings include every needed permission"
+else
+    fail "granted approval settings miss permissions" "missing:$missing_permissions"
+fi
+missing_commands=""
+for command_prefix in git go make npm npx gofmt golangci-lint python3; do
+    if [[ "$(jq --arg c "$command_prefix" \
+        '(.approval.allowedExecutors.execute_command.approvedCommands // []) | index($c) != null' \
+        "$fresh_settings")" != "true" ]]; then
+        missing_commands="$missing_commands $command_prefix"
+    fi
+done
+if [[ -z "$missing_commands" ]]; then
+    pass "granted approval settings include every documented command prefix"
+else
+    fail "granted approval settings miss command prefixes" "missing:$missing_commands"
+fi
+if [[ "$(jq -r '.approval.autoApprovalEnabled' "$fresh_settings")" == "true" ]]; then
+    pass "absent autoApprovalEnabled is set to true"
+else
+    fail "installer did not enable autoApprovalEnabled on a fresh document"
+fi
+if grep -q "affects all bob usage on this machine" "$fresh_dir/output"; then
+    pass "installer reports the machine-wide approvedCommands warning"
+else
+    fail "installer omitted the machine-wide approvedCommands warning" \
+        "output: $(cat "$fresh_dir/output")"
+fi
+if grep -q "added permissions:" "$fresh_dir/output" &&
+    grep -q "added command prefixes:" "$fresh_dir/output"; then
+    pass "installer summarizes what the approval merge changed"
+else
+    fail "installer did not summarize the approval merge" \
+        "output: $(cat "$fresh_dir/output")"
+fi
+
+# a pre-existing document is unioned, never replaced: user permissions, user
+# commands, deniedCommands, a false autoApprovalEnabled, and unrelated keys all
+# survive.
+union_dir="$approval_root/union"
+mkdir -p "$union_dir/home"
+union_settings="$union_dir/settings.json"
+cat > "$union_settings" << 'EOF'
+{
+  "theme": "dark",
+  "mcpServers": {"example": {"command": "example-server"}},
+  "approval": {
+    "allowed_permissions": ["read", "user-permission"],
+    "autoApprovalEnabled": false,
+    "allowedExecutors": {
+      "execute_command": {
+        "approvedCommands": ["git", "ls"],
+        "deniedCommands": ["rm"]
+      },
+      "user_executor": {"approvedCommands": ["cargo"]}
+    }
+  }
+}
+EOF
+run_installer_approval "$union_dir" --grant-approvals >/dev/null 2>&1
+union_checks=$(jq -r '
+    [ ((.approval.allowed_permissions | index("user-permission")) != null),
+      ((.approval.allowed_permissions | index("execute")) != null),
+      (.approval.autoApprovalEnabled == false),
+      ((.approval.allowedExecutors.execute_command.approvedCommands | index("ls")) != null),
+      ([.approval.allowedExecutors.execute_command.approvedCommands[] | select(. == "git")] | length == 1),
+      (.approval.allowedExecutors.execute_command.deniedCommands == ["rm"]),
+      (.approval.allowedExecutors.user_executor.approvedCommands == ["cargo"]),
+      (.theme == "dark"),
+      (.mcpServers.example.command == "example-server")
+    ] | all' "$union_settings")
+if [[ "$union_checks" == "true" ]]; then
+    pass "approval merge unions values and preserves unrelated keys"
+else
+    fail "approval merge lost or overwrote existing settings" \
+        "document: $(cat "$union_settings")"
+fi
+if [[ -f "$union_settings.bak" ]]; then
+    pass "approval merge backs up the original settings document"
+else
+    fail "approval merge did not back up the original settings document"
+fi
+
+# a second run against an already-granted document is a byte-for-byte no-op.
+cp "$union_settings" "$union_dir/settings-before-second-run"
+run_installer_approval "$union_dir" --grant-approvals \
+    > "$union_dir/second-output" 2>&1
+if cmp -s "$union_settings" "$union_dir/settings-before-second-run"; then
+    pass "repeated approval merge is idempotent"
+else
+    fail "repeated approval merge changed the document" \
+        "document: $(cat "$union_settings")"
+fi
+if grep -q "already granted" "$union_dir/second-output"; then
+    pass "repeated approval merge reports the document as already granted"
+else
+    fail "repeated approval merge did not report an unchanged document" \
+        "output: $(cat "$union_dir/second-output")"
+fi
+
+# forbiddenApprovalGroups silently overrides a grant, so it must be reported.
+forbidden_dir="$approval_root/forbidden"
+mkdir -p "$forbidden_dir/home"
+cat > "$forbidden_dir/settings.json" << 'EOF'
+{
+  "approval": {
+    "forbiddenApprovalGroups": ["edit"]
+  }
+}
+EOF
+run_installer_approval "$forbidden_dir" --grant-approvals \
+    > "$forbidden_dir/output" 2>&1
+if grep -q "forbiddenApprovalGroups already contains: edit" "$forbidden_dir/output"; then
+    pass "approval merge warns about a conflicting forbiddenApprovalGroups entry"
+else
+    fail "approval merge did not warn about forbiddenApprovalGroups" \
+        "output: $(cat "$forbidden_dir/output")"
+fi
+
+# an unparseable settings document must fail before it is replaced.
+broken_dir="$approval_root/broken"
+mkdir -p "$broken_dir/home"
+printf '%s\n' '{not json' > "$broken_dir/settings.json"
+cp "$broken_dir/settings.json" "$broken_dir/settings-before"
+set +e
+run_installer_approval "$broken_dir" --grant-approvals >/dev/null 2>&1
+broken_exit=$?
+set -e
+if [[ $broken_exit -ne 0 ]] &&
+    cmp -s "$broken_dir/settings.json" "$broken_dir/settings-before"; then
+    pass "approval merge rejects an unparseable settings document unchanged"
+else
+    fail "approval merge changed or accepted an unparseable settings document"
+fi
+
+# the approval merge must refuse a symlink rather than follow it.
+approval_sentinel="$approval_root/approval-sentinel"
+symlink_dir="$approval_root/symlink"
+mkdir -p "$symlink_dir/home"
+printf '%s\n' '{"approval":{"allowed_permissions":["read"]}}' > "$approval_sentinel"
+ln -s "$approval_sentinel" "$symlink_dir/settings.json"
+set +e
+run_installer_approval "$symlink_dir" --grant-approvals >/dev/null 2>&1
+symlink_approval_exit=$?
+set -e
+if [[ $symlink_approval_exit -ne 0 ]] &&
+    [[ "$(cat "$approval_sentinel")" == '{"approval":{"allowed_permissions":["read"]}}' ]]; then
+    pass "approval merge refuses a symlinked settings target"
+else
+    fail "approval merge followed or accepted a symlinked settings target"
+fi
+
+# an unknown installer argument is rejected instead of silently ignored.
+set +e
+unknown_output=$(run_installer_approval "$optout_dir" --grant-approval 2>&1)
+unknown_exit=$?
+set -e
+if [[ $unknown_exit -ne 0 && "$unknown_output" == *"unknown argument"* ]]; then
+    pass "installer rejects an unknown argument"
+else
+    fail "installer accepted an unknown argument" "output: $unknown_output"
 fi
 
 # ---------------------------------------------------------------------------

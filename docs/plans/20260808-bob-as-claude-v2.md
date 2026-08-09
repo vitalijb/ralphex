@@ -177,10 +177,10 @@ Scope note: reuse the v2 mock helper from Task 4; do not reshape it again.
 **Files:**
 - Modify: `scripts/bob-as-claude/bob-as-claude_test.sh`
 
-- [ ] Extend the vendored YAML validation section to assert every group name in `scripts/bob-as-claude/modes/*.yaml` is one of `read`, `edit`, `execute`, `mcp`, `skill`, `todo`, `subagent`, `mode`, and that `ralphex-review.yaml` includes `subagent`
-- [ ] Add installer tests for the approval merge against a temporary settings file: fresh creation, union with pre-existing values, unrelated keys preserved, and idempotence
-- [ ] Verify the full suite passes with `bash scripts/bob-as-claude/bob-as-claude_test.sh` — this is the green gate for Tasks 4-8
-- [ ] Confirm no test writes outside its temporary directories, and that no test touches a real `~/.bob/`, `~/.claude/`, or `~/.config/ralphex/`
+- [x] Extend the vendored YAML validation section to assert every group name in `scripts/bob-as-claude/modes/*.yaml` is one of `read`, `edit`, `execute`, `mcp`, `skill`, `todo`, `subagent`, `mode`, and that `ralphex-review.yaml` includes `subagent`
+- [x] Add installer tests for the approval merge against a temporary settings file: fresh creation, union with pre-existing values, unrelated keys preserved, and idempotence
+- [x] Verify the full suite passes with `bash scripts/bob-as-claude/bob-as-claude_test.sh` — this is the green gate for Tasks 4-8 (290 passed, 0 failed)
+- [x] Confirm no test writes outside its temporary directories, and that no test touches a real `~/.bob/`, `~/.claude/`, or `~/.config/ralphex/` (verified by running the suite under a sentinel HOME: only the Go toolchain's own telemetry counters appear there, and real `~/.bob/`, `~/.claude/`, `~/.config/ralphex/` checksums are unchanged)
 
 ### Task 9: Update all bob documentation for v2
 
