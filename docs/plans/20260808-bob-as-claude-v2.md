@@ -133,12 +133,12 @@ Per bob's own bundled mode-schema documentation, the only valid group names are 
 
 Scope note: this task owns the shared mock helper and the task-phase tests only. Review-phase, plan-mode, and installer tests keep their v1 fixtures until Tasks 5-8 and are expected to fail in the meantime — do not fix them here.
 
-- [ ] Update `create_mock_bob` to assert the v2 invocation: `run` subcommand present, `-f stream-json`, `--mode=<slug>`, `--trust`
-- [ ] Add assertions that `--yolo`, `--auto-approve`, `--output-format`, `--chat-mode`, `--hide-intermediary-output`, `-m`, and `--disable-subagents` are never passed
-- [ ] Replace the task-phase `attempt_completion` fixtures with v2 assistant `message` fixtures and verify the task phase forwards that text
-- [ ] Add a test that an assistant `message` with `isReasoning: true` is suppressed by default and shown under `BOB_VERBOSE=1`
-- [ ] Keep the existing provider-agnostic tests passing against the new mock helper: stderr emission and signal neutralization, rate-limit phrase preserved verbatim, exit-code preservation, large prompt over 128KB, missing prompt error, unknown flags ignored, bob not found, jq not found, SIGTERM forwarding, `BOB_EXTRA_ARGS` literal passthrough, invalid `BOB_VERBOSE`, arbitrary `BOB_CHAT_MODE` override
-- [ ] Run `bash scripts/bob-as-claude/bob-as-claude_test.sh` and confirm the invocation, task-phase, and provider-agnostic tests pass; record which remaining failures are owned by Tasks 5-8
+- [x] Update `create_mock_bob` to assert the v2 invocation: `run` subcommand present, `-f stream-json`, `--mode=<slug>`, `--trust`
+- [x] Add assertions that `--yolo`, `--auto-approve`, `--output-format`, `--chat-mode`, `--hide-intermediary-output`, `-m`, and `--disable-subagents` are never passed
+- [x] Replace the task-phase `attempt_completion` fixtures with v2 assistant `message` fixtures and verify the task phase forwards that text
+- [x] Add a test that an assistant `message` with `isReasoning: true` is suppressed by default and shown under `BOB_VERBOSE=1`
+- [x] Keep the existing provider-agnostic tests passing against the new mock helper: stderr emission and signal neutralization, rate-limit phrase preserved verbatim, exit-code preservation, large prompt over 128KB, missing prompt error, unknown flags ignored, bob not found, jq not found, SIGTERM forwarding, `BOB_EXTRA_ARGS` literal passthrough, invalid `BOB_VERBOSE`, arbitrary `BOB_CHAT_MODE` override
+- [x] Run `bash scripts/bob-as-claude/bob-as-claude_test.sh` and confirm the invocation, task-phase, and provider-agnostic tests pass; record which remaining failures are owned by Tasks 5-8
 
 ### Task 5: Convert review-phase and event-schema tests to the v2 fixtures
 
