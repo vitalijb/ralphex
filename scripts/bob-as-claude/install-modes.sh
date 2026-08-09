@@ -6,9 +6,9 @@
 #   install-modes.sh                    # install modes only (default)
 #   install-modes.sh --grant-approvals  # also merge ~/.bob/settings/settings.json
 #
-# --grant-approvals broadens approval.allowed_permissions and
-# approval.allowedExecutors.execute_command.approvedCommands for ALL bob usage
-# on this machine, not just ralphex-invoked runs. It is opt-in on purpose.
+# --grant-approvals broadens approval.allowed_permissions and the
+# execute_command entry of approval.allowedExecutors for ALL bob usage on this
+# machine, not just ralphex-invoked runs. It is opt-in on purpose.
 
 set -euo pipefail
 
@@ -69,29 +69,48 @@ grant_approval_settings() {
 
     local existing_json
     if [[ -e "$approval_target" && -s "$approval_target" ]]; then
-        jq empty "$approval_target" 2>/dev/null ||
+        # a document that is not an object, or whose approval block does not match
+        # bob v2's schema, cannot be merged without guessing. Refuse up front
+        # rather than letting the queries below abort with a raw jq type error
+        # after the modes have already been installed.
+        jq -e '
+            type == "object" and
+            ((.approval // {}) | type == "object") and
+            (((.approval // {}).allowed_permissions // []) | type == "array") and
+            (((.approval // {}).forbiddenApprovalGroups // []) | type == "array") and
+            (((.approval // {}).allowedExecutors // []) |
+                type == "array" and all(type == "object"))
+        ' "$approval_target" >/dev/null 2>&1 ||
             error "cannot safely merge existing approval-settings document: $approval_target"
         existing_json="$(cat "$approval_target")"
     else
         existing_json='{}'
     fi
 
-    local wanted_permissions=(read edit execute subagent todo)
-    local wanted_commands=(git go make npm npx gofmt golangci-lint python3)
-    local wanted_permissions_json wanted_commands_json
-    wanted_permissions_json=$(printf '%s\n' "${wanted_permissions[@]}" | jq -R . | jq -sc .)
-    wanted_commands_json=$(printf '%s\n' "${wanted_commands[@]}" | jq -R . | jq -sc .)
+    # bob v2 stores allowedExecutors as an ARRAY of {toolId, approvedCommands,
+    # deniedCommands} records and looks the executor up with Array.prototype.find,
+    # so an object-shaped value makes every approval throw a TypeError. bob's
+    # settings merge also does not recurse into arrays, which means a user-supplied
+    # array REPLACES its read-only defaults wholesale — hence the trailing
+    # read-only prefixes below, which restate the defaults the bare `git` prefix
+    # does not already subsume.
+    local wanted_permissions_json='["read","edit","execute","subagent","todo"]'
+    local wanted_commands_json='["git","go","make","npm","npx","gofmt","golangci-lint","python3","cat","grep","head","tail","ls","sort","wc","which","du","df"]'
 
-    local added_permissions added_commands auto_approval_was_absent forbidden_conflicts
+    local added_permissions added_commands auto_approval_was_absent
+    local auto_approval_disabled forbidden_conflicts
     added_permissions=$(jq -r --argjson wanted "$wanted_permissions_json" \
         '(.approval.allowed_permissions // []) as $existing
          | [$wanted[] | select(. as $p | ($existing | index($p)) == null)]
          | join(", ")' <<<"$existing_json")
     added_commands=$(jq -r --argjson wanted "$wanted_commands_json" \
-        '(.approval.allowedExecutors.execute_command.approvedCommands // []) as $existing
+        '((.approval.allowedExecutors // [])
+            | map(select(.toolId == "execute_command"))
+            | first | .approvedCommands // []) as $existing
          | [$wanted[] | select(. as $c | ($existing | index($c)) == null)]
          | join(", ")' <<<"$existing_json")
-    auto_approval_was_absent=$(jq -r '(.approval.autoApprovalEnabled? | not) and ((.approval | has("autoApprovalEnabled")) | not)' <<<"$existing_json")
+    auto_approval_was_absent=$(jq -r '((.approval // {}) | has("autoApprovalEnabled")) | not' <<<"$existing_json")
+    auto_approval_disabled=$(jq -r '((.approval // {}).autoApprovalEnabled) == false' <<<"$existing_json")
     forbidden_conflicts=$(jq -r --argjson wanted "$wanted_permissions_json" \
         '(.approval.forbiddenApprovalGroups // []) as $forbidden
          | [$forbidden[] | select(. as $f | ($wanted | index($f)) != null)]
@@ -107,19 +126,33 @@ grant_approval_settings() {
             (if (.approval | has("autoApprovalEnabled"))
              then .approval.autoApprovalEnabled
              else true end)
-        | .approval.allowedExecutors = (.approval.allowedExecutors // {})
-        | .approval.allowedExecutors.execute_command =
-            (.approval.allowedExecutors.execute_command // {})
-        | .approval.allowedExecutors.execute_command.approvedCommands =
-            (((.approval.allowedExecutors.execute_command.approvedCommands // []) + $wanted_commands) | unique)
+        | .approval.allowedExecutors = (
+            (.approval.allowedExecutors // []) as $executors
+            | ($executors | map(.toolId) | index("execute_command")) as $idx
+            | if $idx == null then
+                  $executors + [{
+                      toolId: "execute_command",
+                      approvedCommands: ($wanted_commands | unique),
+                      deniedCommands: []
+                  }]
+              else
+                  $executors
+                  | .[$idx] = (.[$idx]
+                      | .approvedCommands =
+                          (((.approvedCommands // []) + $wanted_commands) | unique)
+                      | .deniedCommands = (.deniedCommands // []))
+              end
+          )
     ' <<<"$existing_json")
-
-    jq empty <<<"$updated_json" ||
-        error "generated approval-settings document failed validation"
 
     if [[ -n "$forbidden_conflicts" ]]; then
         echo "warning: approval.forbiddenApprovalGroups already contains: $forbidden_conflicts" \
              "— those groups override the corresponding grant even after this change" >&2
+    fi
+    if [[ "$auto_approval_disabled" == "true" ]]; then
+        echo "warning: approval.autoApprovalEnabled is false in $approval_target" \
+             "— bob refuses every auto-approval while it stays false, so this grant" \
+             "has no effect until you set it to true" >&2
     fi
 
     if diff <(jq -S . <<<"$existing_json") <(jq -S . <<<"$updated_json") >/dev/null; then
@@ -129,16 +162,17 @@ grant_approval_settings() {
 
     mkdir -p "$approval_dir"
     if [[ -e "$approval_target" ]]; then
+        if [[ -L "$approval_target.bak" ]]; then
+            error "refusing to write backup through symlink: $approval_target.bak"
+        fi
         cp -p "$approval_target" "$approval_target.bak"
     fi
 
+    # the document came out of jq, so it is valid JSON by construction — and a jq
+    # failure would already have aborted the assignment above under `set -e`.
     local approval_tmp
     approval_tmp=$(mktemp "$approval_dir/.settings.json.tmp.XXXXXX")
-    jq . <<<"$updated_json" > "$approval_tmp"
-    jq empty "$approval_tmp" 2>/dev/null || {
-        rm -f "$approval_tmp"
-        error "generated approval-settings document failed validation: $approval_target"
-    }
+    printf '%s\n' "$updated_json" > "$approval_tmp"
     mv -f "$approval_tmp" "$approval_target"
 
     echo "granted approval settings in $approval_target:"

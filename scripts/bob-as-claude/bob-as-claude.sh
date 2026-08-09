@@ -122,28 +122,40 @@ fi
 # ~/.bob/settings/settings.json. Warn (never abort) when the settings bob v2 requires
 # for edit/execute work are missing, so a hang or silent no-op has an explained cause.
 approval_preflight() {
+    # review mode drives native subagents, so it needs the subagent permission on
+    # top of edit/execute. warning about it in task mode would be a false alarm.
+    local needed_json='["edit","execute"]'
+    if [[ "$selected_chat_mode" == "ralphex-review" ]]; then
+        needed_json='["edit","execute","subagent"]'
+    fi
+
     if [[ ! -f "$BOB_SETTINGS_FILE" ]]; then
-        echo "warning: bob v2 approval settings not found at $BOB_SETTINGS_FILE; 'edit' and 'execute' actions require approvals bob does not grant by default. Run scripts/bob-as-claude/install-modes.sh with its approval flag to grant them." >&2
-        return
+        echo "warning: bob v2 approval settings not found at $BOB_SETTINGS_FILE; 'edit' and 'execute' actions require approvals bob does not grant by default. Run scripts/bob-as-claude/install-modes.sh --grant-approvals to grant them." >&2
+        return 0
     fi
 
     local reason=""
-    reason=$(jq -r '
+    if ! reason=$(jq -r --argjson needed "$needed_json" '
         (.approval.allowed_permissions // []) as $perms |
         (.approval.forbiddenApprovalGroups // []) as $forbidden |
         (.approval.autoApprovalEnabled) as $auto |
-        if ($perms | index("edit")) == null or ($perms | index("execute")) == null then
-            "allowed_permissions is missing edit and/or execute"
+        [$needed[] | select(. as $n | ($perms | index($n)) == null)] as $missing |
+        [$needed[] | select(. as $n | ($forbidden | index($n)) != null)] as $blocked |
+        if ($missing | length) > 0 then
+            "allowed_permissions is missing " + ($missing | join(", "))
         elif ($auto == false) then
             "autoApprovalEnabled is false"
-        elif ([$forbidden[] | select(. == "edit" or . == "execute")] | length) > 0 then
-            "forbiddenApprovalGroups blocks a needed permission"
+        elif ($blocked | length) > 0 then
+            "forbiddenApprovalGroups blocks " + ($blocked | join(", "))
         else
             ""
         end
-    ' "$BOB_SETTINGS_FILE" 2>/dev/null) || reason=""
+    ' "$BOB_SETTINGS_FILE" 2>/dev/null); then
+        echo "warning: cannot read bob v2 approval settings at $BOB_SETTINGS_FILE; bob will fall back to its read-only defaults, which cannot approve 'edit' or 'execute'. Fix the file, or run scripts/bob-as-claude/install-modes.sh --grant-approvals" >&2
+        return 0
+    fi
 
-    [[ -n "$reason" ]] && echo "warning: bob v2 approval settings may block task/review work ($reason); run scripts/bob-as-claude/install-modes.sh with its approval flag to grant edit/execute approvals" >&2
+    [[ -n "$reason" ]] && echo "warning: bob v2 approval settings may block task/review work ($reason); run scripts/bob-as-claude/install-modes.sh --grant-approvals to grant the needed approvals" >&2
     return 0
 }
 approval_preflight
@@ -260,7 +272,6 @@ parse_bob_event() {
     event_status=""
     event_output=""
     event_error_message=""
-    event_severity=""
     event_message=""
 
     {
@@ -272,7 +283,6 @@ parse_bob_event() {
             IFS= read -r -d '' event_status &&
             IFS= read -r -d '' event_output &&
             IFS= read -r -d '' event_error_message &&
-            IFS= read -r -d '' event_severity &&
             IFS= read -r -d '' event_message
     } < <(
         printf '%s\n' "$line" | jq -j '
@@ -283,8 +293,7 @@ parse_bob_event() {
             (.tool_name // ""), "\u0000",
             ((.status // "") | tostring), "\u0000",
             ((.output // "") | tostring), "\u0000",
-            ((.error.message // "") | tostring), "\u0000",
-            ((.severity // "") | tostring), "\u0000",
+            ((.error.message? // .error? // "") | tostring), "\u0000",
             ((.message // "") | tostring), "\u0000"
         ' 2>/dev/null
     )
@@ -295,15 +304,30 @@ plan_boundary_emitted=0
 bob_failure_detail_emitted=0
 bob_result_failed=0
 
-neutralize_signal_text() {
-    printf '%s' "${1//<<<RALPHEX:/<<< RALPHEX:}"
-}
+# Text that did not come from the model's own answer is neutralized before it is
+# forwarded, so a tool error or diagnostic that quotes a ralphex signal token cannot
+# forge a real signal (ralphex matches signals as a plain substring). This is done
+# with inline ${var//...} expansion rather than a helper, because routing buffered
+# text through $(...) would strip the trailing newlines line buffering depends on.
 
 # Line-buffers assistant message text so a signal token split across several
 # streaming deltas is re-assembled and emitted intact in one content_block_delta.
+# Answer and reasoning text share one buffer but are tracked by kind: switching
+# kinds flushes the partial remainder so a newline-less reasoning chunk cannot
+# splice itself into the next real answer line.
 task_stream_buffer=""
+task_stream_kind=""
+flush_task_buffer_remainder() {
+    if [[ -n "$task_stream_buffer" ]]; then
+        emit_text_delta "$task_stream_buffer"
+        task_stream_buffer=""
+    fi
+}
 flush_task_buffer_lines() {
-    task_stream_buffer+="$1"
+    local kind="$1"
+    [[ "$task_stream_kind" == "$kind" ]] || flush_task_buffer_remainder
+    task_stream_kind="$kind"
+    task_stream_buffer+="$2"
     while [[ "$task_stream_buffer" == *$'\n'* ]]; do
         local line="${task_stream_buffer%%$'\n'*}"
         task_stream_buffer="${task_stream_buffer#*$'\n'}"
@@ -319,11 +343,15 @@ bob_pid=$!
 
 plan_stream_buffer=""
 while IFS= read -r line || [[ -n "$line" ]]; do
-    [[ -z "$line" ]] && continue
+    # a blank stream line still proves bob is alive; emit a keepalive so a long
+    # quiet stretch does not look like an idle session to ralphex.
+    if [[ -z "$line" ]]; then
+        emit_keepalive
+        continue
+    fi
 
     if ! parse_bob_event "$line" || [[ -z "$event_type" ]]; then
-        sanitized_line=$(neutralize_signal_text "$line")
-        emit_text_delta "$sanitized_line"$'\n'
+        emit_text_delta "${line//<<<RALPHEX:/<<< RALPHEX:}"$'\n'
         case "${line,,}" in
             *error*|*failed*|*failure*|*limit*|*auth*|*required*|*timeout*|*exception*)
                 bob_failure_detail_emitted=1
@@ -342,6 +370,15 @@ while IFS= read -r line || [[ -n "$line" ]]; do
                 kill -TERM "$bob_pid" 2>/dev/null || true
                 break
             fi
+        elif [[ "$event_type" == "error" ]]; then
+            # {type:"error"} is bob v2's only failure channel (result.status is
+            # always "success"), so plan runs must surface it too — a swallowed
+            # rate-limit or auth message would otherwise be reported as a
+            # missing plan boundary with no diagnostic.
+            emit_text_delta "error: bob: ${event_message//<<<RALPHEX:/<<< RALPHEX:}"$'\n'
+            bob_failure_detail_emitted=1
+            bob_result_failed=1
+            continue
         fi
         emit_keepalive
         continue
@@ -352,25 +389,26 @@ while IFS= read -r line || [[ -n "$line" ]]; do
     if [[ "$event_type" == "message" && "$event_role" == "assistant" ]]; then
         if [[ "$event_is_reasoning" == "true" ]]; then
             if [[ "$BOB_VERBOSE" == "1" ]]; then
-                flush_task_buffer_lines "$event_content"
+                flush_task_buffer_lines reasoning "${event_content//<<<RALPHEX:/<<< RALPHEX:}"
             else
                 emit_keepalive
             fi
         else
-            flush_task_buffer_lines "$event_content"
+            flush_task_buffer_lines text "$event_content"
         fi
-    elif [[ "$event_type" == "result" ]]; then
-        printf '%s\n' '{"type":"result","result":""}'
     elif [[ "$event_type" == "tool_result" && "$event_status" == "error" ]]; then
-        emit_text_delta "[tool_error] $event_error_message"$'\n'
+        flush_task_buffer_remainder
+        emit_text_delta "[tool_error] ${event_error_message//<<<RALPHEX:/<<< RALPHEX:}"$'\n'
         bob_failure_detail_emitted=1
     elif [[ "$BOB_VERBOSE" == "1" && "$event_type" == "tool_result" && "$event_status" == "success" ]]; then
-        emit_text_delta "[tool_result] $event_output"$'\n'
+        flush_task_buffer_remainder
+        emit_text_delta "[tool_result] ${event_output//<<<RALPHEX:/<<< RALPHEX:}"$'\n'
     elif [[ "$BOB_VERBOSE" == "1" && "$event_type" == "tool_use" ]]; then
-        emit_text_delta "[tool] $event_tool"$'\n'
+        flush_task_buffer_remainder
+        emit_text_delta "[tool] ${event_tool//<<<RALPHEX:/<<< RALPHEX:}"$'\n'
     elif [[ "$event_type" == "error" ]]; then
-        error_detail=$(neutralize_signal_text "$event_message")
-        emit_text_delta "error: bob: $error_detail"$'\n'
+        flush_task_buffer_remainder
+        emit_text_delta "error: bob: ${event_message//<<<RALPHEX:/<<< RALPHEX:}"$'\n'
         bob_failure_detail_emitted=1
         bob_result_failed=1
     else
@@ -378,11 +416,9 @@ while IFS= read -r line || [[ -n "$line" ]]; do
     fi
 done < "$stream_pipe"
 
-# flush any partial trailing line left in the task/review buffer.
-if [[ -n "$task_stream_buffer" ]]; then
-    emit_text_delta "$task_stream_buffer"
-    task_stream_buffer=""
-fi
+# flush any partial trailing line left in the task/review buffer. this runs before
+# the single terminating result event below, so no buffered text lands after it.
+flush_task_buffer_remainder
 
 # preserve bob's exit status after the translation process has drained.
 bob_exit=0
