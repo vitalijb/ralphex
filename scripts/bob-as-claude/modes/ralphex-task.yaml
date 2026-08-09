@@ -16,5 +16,4 @@ customModes:
     groups:
       - read
       - edit
-      - command
-      - browser
+      - execute

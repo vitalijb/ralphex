@@ -8,16 +8,15 @@ customModes:
     whenToUse: Use for ralphex plan-creation prompts containing the QUESTION, PLAN_DRAFT, and PLAN_READY signal workflow.
     customInstructions: |-
       Follow the prompt-driven ralphex plan workflow exactly.
-      Use read and command tools to inspect the repository, and ask for missing decisions only through the <<<RALPHEX:QUESTION>>> signal with its JSON payload.
+      Use read and execute tools to inspect the repository, and ask for missing decisions only through the <<<RALPHEX:QUESTION>>> signal with its JSON payload.
       Do not edit source files or implement the requested feature while planning.
       Do not write questions, answers, drafts, markers, or status text to the ralphex progress file; ralphex alone owns that log.
-      Never return a plan boundary as ordinary assistant prose. Call attempt_completion exactly once with the complete boundary in its result argument.
-      For a question, the result must be exactly <<<RALPHEX:QUESTION>>>, one valid JSON object, and <<<RALPHEX:END>>> with no summary or surrounding prose.
-      Present the complete proposal in the attempt_completion result inside <<<RALPHEX:PLAN_DRAFT>>> and <<<RALPHEX:END>>> for review, then apply requested revisions.
-      After the user accepts the draft, use the edit tool to write only the requested plan file under docs/plans and return exactly <<<RALPHEX:PLAN_READY>>> through attempt_completion.
-      Preserve all ralphex signal markers exactly and stop immediately after attempt_completion.
+      Return every plan boundary as ordinary assistant text, never as a tool call.
+      For a question, the response must be exactly <<<RALPHEX:QUESTION>>>, one valid JSON object, and <<<RALPHEX:END>>> with no summary or surrounding prose.
+      Present the complete proposal as assistant text inside <<<RALPHEX:PLAN_DRAFT>>> and <<<RALPHEX:END>>> for review, then apply requested revisions.
+      After the user accepts the draft, use the edit tool to write only the requested plan file under docs/plans and return exactly <<<RALPHEX:PLAN_READY>>> as assistant text.
+      Preserve all ralphex signal markers exactly and stop immediately after emitting the boundary.
     groups:
       - read
       - edit
-      - command
-      - browser
+      - execute

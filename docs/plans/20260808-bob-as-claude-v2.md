@@ -103,13 +103,13 @@ Per bob's own bundled mode-schema documentation, the only valid group names are 
 - Modify: `scripts/bob-as-claude/modes/ralphex-plan.yaml`
 - Modify: `scripts/bob-as-claude/modes/ralphex-review.yaml`
 
-- [ ] In `ralphex-task.yaml` and `ralphex-plan.yaml`, replace `groups: [read, edit, command, browser]` with `read`, `edit`, `execute`
-- [ ] In `ralphex-review.yaml`, set groups to `read`, `edit`, `execute`, `subagent`
-- [ ] Remove every `attempt_completion` reference from all three `customInstructions` blocks, including the plan mode's terminal-tool contract, and replace them with instructions to emit the required output as ordinary assistant text
-- [ ] In `ralphex-review.yaml`, delete the sequential-execution instruction, the "Never launch bob, claude, codex" instruction, the "Perform all review assignments yourself" instruction, and the "never invoke Task, spawn_agent, or wait_agent" instruction
-- [ ] In `ralphex-review.yaml`, add instructions to launch each review-agent assignment as a native `spawn_subagent` call, issuing them in a single turn so they run in parallel, and to consolidate the subagent findings into the final response
-- [ ] Do not add an `allowedSubagents` key to any mode
-- [ ] Verify each file is plain ASCII with no duplicate group entries and no duplicate slugs, and that all three parse as valid YAML
+- [x] In `ralphex-task.yaml` and `ralphex-plan.yaml`, replace `groups: [read, edit, command, browser]` with `read`, `edit`, `execute`
+- [x] In `ralphex-review.yaml`, set groups to `read`, `edit`, `execute`, `subagent`
+- [x] Remove every `attempt_completion` reference from all three `customInstructions` blocks, including the plan mode's terminal-tool contract, and replace them with instructions to emit the required output as ordinary assistant text
+- [x] In `ralphex-review.yaml`, delete the sequential-execution instruction, the "Never launch bob, claude, codex" instruction, the "Perform all review assignments yourself" instruction, and the "never invoke Task, spawn_agent, or wait_agent" instruction
+- [x] In `ralphex-review.yaml`, add instructions to launch each review-agent assignment as a native `spawn_subagent` call, issuing them in a single turn so they run in parallel, and to consolidate the subagent findings into the final response
+- [x] Do not add an `allowedSubagents` key to any mode
+- [x] Verify each file is plain ASCII with no duplicate group entries and no duplicate slugs, and that all three parse as valid YAML
 
 ### Task 3: Extend install-modes.sh to grant the approval settings bob v2 requires
 
