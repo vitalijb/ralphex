@@ -67,11 +67,12 @@ Per bob's own bundled mode-schema documentation, the only valid group names are 
 
 ## Development Approach
 
-- **Testing approach**: Regular (code first, then tests) for the wrapper and installer; the test suite rewrite is its own task because the fixtures change shape wholesale
+- **Testing approach**: Regular (code first, then tests) for the wrapper and installer; the test suite rewrite is split across Tasks 4-8 because the fixtures change shape wholesale
 - Complete each task fully before moving to the next
 - Shell-only change set — no Go code is touched, so `make test` / `make lint` should remain green throughout
+- **CRITICAL: `scripts/bob-as-claude/bob-as-claude_test.sh` is ~2000 lines. Modify it with targeted, incremental edits, one area at a time — never regenerate the whole file in a single write. A write that large cannot finish before the streaming cutoff and the iteration dies with `API Error: Response stalled mid-stream`.**
 - **CRITICAL: every task MUST include new/updated tests**
-- **CRITICAL: all tests must pass before starting next task**
+- **CRITICAL: all tests must pass before starting next task — with one explicit exception: the test suite is expected to be partially red between Tasks 4 and 7, because each of those tasks converts one area of `bob-as-claude_test.sh` to the v2 fixtures. Each task must leave its own area green; Task 8 is the whole-suite green gate.**
 
 ## Implementation Steps
 
@@ -125,28 +126,63 @@ Per bob's own bundled mode-schema documentation, the only valid group names are 
 - [x] Print a summary of exactly what was changed, including an explicit warning that broadening `approvedCommands` affects all bob usage on the machine, not just ralphex
 - [x] Verify with `bash -n scripts/bob-as-claude/install-modes.sh` and by running the installer twice against a temporary settings file, confirming the second run is a no-op
 
-### Task 4: Rewrite the wrapper test suite against the v2 mock schema
+### Task 4: Rewrite the test mock harness and task-phase fixtures for v2
 
 **Files:**
 - Modify: `scripts/bob-as-claude/bob-as-claude_test.sh`
 
+Scope note: this task owns the shared mock helper and the task-phase tests only. Review-phase, plan-mode, and installer tests keep their v1 fixtures until Tasks 5-8 and are expected to fail in the meantime — do not fix them here.
+
 - [ ] Update `create_mock_bob` to assert the v2 invocation: `run` subcommand present, `-f stream-json`, `--mode=<slug>`, `--trust`
 - [ ] Add assertions that `--yolo`, `--auto-approve`, `--output-format`, `--chat-mode`, `--hide-intermediary-output`, `-m`, and `--disable-subagents` are never passed
-- [ ] Replace all `attempt_completion` fixtures with v2 assistant `message` fixtures and verify task and review phases forward that text
+- [ ] Replace the task-phase `attempt_completion` fixtures with v2 assistant `message` fixtures and verify the task phase forwards that text
 - [ ] Add a test that an assistant `message` with `isReasoning: true` is suppressed by default and shown under `BOB_VERBOSE=1`
-- [ ] Add a test that a `<<<RALPHEX:...>>>` signal split across several streaming `message` deltas is re-assembled and emitted intact in a single `content_block_delta`
+- [ ] Keep the existing provider-agnostic tests passing against the new mock helper: stderr emission and signal neutralization, rate-limit phrase preserved verbatim, exit-code preservation, large prompt over 128KB, missing prompt error, unknown flags ignored, bob not found, jq not found, SIGTERM forwarding, `BOB_EXTRA_ARGS` literal passthrough, invalid `BOB_VERBOSE`, arbitrary `BOB_CHAT_MODE` override
+- [ ] Run `bash scripts/bob-as-claude/bob-as-claude_test.sh` and confirm the invocation, task-phase, and provider-agnostic tests pass; record which remaining failures are owned by Tasks 5-8
+
+### Task 5: Convert review-phase and event-schema tests to the v2 fixtures
+
+**Files:**
+- Modify: `scripts/bob-as-claude/bob-as-claude_test.sh`
+
+Scope note: reuse the v2 mock helper from Task 4; do not reshape it again.
+
+- [ ] Replace the review-phase `attempt_completion` fixtures with v2 assistant `message` fixtures and verify the review phase forwards that text
 - [ ] Add a test that a `{type:"error", severity:"error", message}` event produces an error line and a non-zero exit code
 - [ ] Update the `tool_result` error test to supply `error.message` with `output` absent, and confirm the message still reaches the translated stream
 - [ ] Update the `result` fixture to the v2 shape including `stats`, and confirm the wrapper still emits exactly one terminating result event
+- [ ] Run `bash scripts/bob-as-claude/bob-as-claude_test.sh` and confirm the review-phase and event-schema tests pass
+
+### Task 6: Rewrite signal-reassembly and plan-mode boundary tests
+
+**Files:**
+- Modify: `scripts/bob-as-claude/bob-as-claude_test.sh`
+
+- [ ] Add a test that a `<<<RALPHEX:...>>>` signal split across several streaming `message` deltas is re-assembled and emitted intact in a single `content_block_delta`
 - [ ] Update plan-mode tests: boundaries are recognized from assistant deltas only, the `attempt_completion` protocol-adapter assertions are removed, malformed and missing boundaries still fail closed, and QUESTION payload validation is unchanged
+- [ ] Run `bash scripts/bob-as-claude/bob-as-claude_test.sh` and confirm the signal-reassembly and plan-mode tests pass
+
+### Task 7: Add tests for the model note, approval preflight, and guard-shim removal
+
+**Files:**
+- Modify: `scripts/bob-as-claude/bob-as-claude_test.sh`
+
 - [ ] Add a test asserting no guard-shim directory is prepended to `PATH` for `ralphex-review`
-- [ ] Add tests for the model note (both `--model` and `BOB_MODEL` ignored with a stderr note) and for the approval preflight warning firing on a minimal settings file and staying silent on a compliant one
+- [ ] Add a test for the model note: both `--model` and `BOB_MODEL` are ignored, with a one-time stderr note and no model argument forwarded to bob
+- [ ] Add tests for the approval preflight warning: it fires on a minimal settings file and stays silent on a compliant one, using a temporary HOME so no real `~/.bob/` is read or written
+- [ ] Run `bash scripts/bob-as-claude/bob-as-claude_test.sh` and confirm these tests pass
+
+### Task 8: Extend YAML group validation and add installer approval-merge tests
+
+**Files:**
+- Modify: `scripts/bob-as-claude/bob-as-claude_test.sh`
+
 - [ ] Extend the vendored YAML validation section to assert every group name in `scripts/bob-as-claude/modes/*.yaml` is one of `read`, `edit`, `execute`, `mcp`, `skill`, `todo`, `subagent`, `mode`, and that `ralphex-review.yaml` includes `subagent`
 - [ ] Add installer tests for the approval merge against a temporary settings file: fresh creation, union with pre-existing values, unrelated keys preserved, and idempotence
-- [ ] Keep the existing provider-agnostic tests passing: stderr emission and signal neutralization, rate-limit phrase preserved verbatim, exit-code preservation, large prompt over 128KB, missing prompt error, unknown flags ignored, bob not found, jq not found, SIGTERM forwarding, `BOB_EXTRA_ARGS` literal passthrough, invalid `BOB_VERBOSE`, arbitrary `BOB_CHAT_MODE` override
-- [ ] Verify the full suite passes with `bash scripts/bob-as-claude/bob-as-claude_test.sh` and that no test writes outside its temporary directories
+- [ ] Verify the full suite passes with `bash scripts/bob-as-claude/bob-as-claude_test.sh` — this is the green gate for Tasks 4-8
+- [ ] Confirm no test writes outside its temporary directories, and that no test touches a real `~/.bob/`, `~/.claude/`, or `~/.config/ralphex/`
 
-### Task 5: Update all bob documentation for v2
+### Task 9: Update all bob documentation for v2
 
 **Files:**
 - Modify: `docs/custom-providers.md`
@@ -164,7 +200,7 @@ Per bob's own bundled mode-schema documentation, the only valid group names are 
 - [ ] Update `scripts/bob-as-claude/bob-as-claude_docs_test.sh` assertions to match the new documentation, replacing v1 term assertions with v2 ones and adding `assert_not_contains` checks for the removed v1 flags
 - [ ] Verify with `bash scripts/bob-as-claude/bob-as-claude_docs_test.sh`
 
-### Task 6: Verify acceptance criteria
+### Task 10: Verify acceptance criteria
 
 - [ ] Run `bash scripts/bob-as-claude/bob-as-claude_test.sh` — all tests pass
 - [ ] Run `bash scripts/bob-as-claude/bob-as-claude_docs_test.sh` — all tests pass
