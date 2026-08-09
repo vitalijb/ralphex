@@ -202,11 +202,11 @@ Scope note: reuse the v2 mock helper from Task 4; do not reshape it again.
 
 ### Task 10: Verify acceptance criteria
 
-- [ ] Run `bash scripts/bob-as-claude/bob-as-claude_test.sh` — all tests pass
-- [ ] Run `bash scripts/bob-as-claude/bob-as-claude_docs_test.sh` — all tests pass
-- [ ] Run `make test` and `make lint` — still green, since no Go code changed
-- [ ] Grep the wrapper, modes, tests, and docs for `attempt_completion`, `--yolo`, `--chat-mode`, `--hide-intermediary-output`, `--output-format`, and `<thinking>` — no remaining occurrences
-- [ ] Confirm no version-detection branch and no v1 compatibility layer exists in the wrapper
+- [x] Run `bash scripts/bob-as-claude/bob-as-claude_test.sh` — all tests pass (290 passed, 0 failed)
+- [x] Run `bash scripts/bob-as-claude/bob-as-claude_docs_test.sh` — all tests pass (145 passed, 0 failed)
+- [x] Run `make test` and `make lint` — `make test` green (exit 0, 88.0% coverage). `make lint` could not run: `golangci-lint` is not installed in this environment (exit 127 on the missing binary, not a code failure). Verified the underlying premise instead: `git diff --name-only master...HEAD` shows no `.go`, `go.mod`, `go.sum`, or `vendor/` changes, and `go vet ./...` plus `gofmt -l ./cmd ./pkg` are clean
+- [x] Grep the wrapper, modes, tests, and docs for `attempt_completion`, `--yolo`, `--chat-mode`, `--hide-intermediary-output`, `--output-format`, and `<thinking>` — zero occurrences in `bob-as-claude.sh`, `modes/`, and `install-modes.sh`. Remaining hits are all intentional: prose documenting the v1 removals, `assert_not_contains` needle lists and forbidden-string loops in the two test suites, and non-bob contexts (Copilot's `--yolo`/`--output-format`, the Cursor CLI example, the `claude_args` default, and CLAUDE.md's claude-streaming debug note)
+- [x] Confirm no version-detection branch and no v1 compatibility layer exists in the wrapper — `bob_args=(run -f stream-json "--mode=$selected_chat_mode" --trust)` is built unconditionally, nothing invokes `bob --version`, and the only `version`/`v1`/`compat` mentions are header comments stating v1 is unsupported plus notes about accepting-and-ignoring ralphex's `--model`/`--effort` flags
 
 ## Success Criteria
 
