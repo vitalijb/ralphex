@@ -9,7 +9,7 @@
 
 set -euo pipefail
 
-unset BOB_CHAT_MODE BOB_MODEL BOB_VERBOSE BOB_EXTRA_ARGS
+unset BOB_CHAT_MODE BOB_MODEL BOB_VERBOSE BOB_EXTRA_ARGS BOB_SHELL
 unset BOB_CUSTOM_MODES_FILE BOB_SETTINGS_FILE
 unset MOCK_STDOUT_FILE MOCK_STDERR_FILE MOCK_EXIT_CODE
 
@@ -319,6 +319,7 @@ create_mock_bob() {
 printf '%s\n' "$*" > "$TMPDIR_TEST/bob_args"
 printf '%s\n' "$@" > "$TMPDIR_TEST/bob_args_lines"
 printf '%s\n' "$PATH" > "$TMPDIR_TEST/bob_path"
+printf '%s\n' "${SHELL:-}" > "$TMPDIR_TEST/bob_shell"
 # capture stdin (the prompt) separately for assertions
 cat > "$TMPDIR_TEST/bob_prompt"
 
@@ -495,6 +496,63 @@ fi
 # bob v2 blocks nested bob natively through its own BOB_SESSION check, so the
 # wrapper ships no guard shims. The PATH assertion for that lives with the
 # guard-shim removal tests.
+
+# ---------------------------------------------------------------------------
+# test: SHELL is pinned to bash for the bob child
+#
+# bob's execute_command runs commands through $SHELL verbatim (getShellPath()
+# returns process.env.SHELL) and reports it to the model as systemInfo. Under a
+# non-POSIX login shell like fish, every heredoc / `VAR=$(...)` / `[[ ]]` the
+# model writes dies with exit 127, and bob only falls back to /bin/sh when the
+# shell fails to launch — not when it rejects the script. So the wrapper must
+# pin a POSIX shell regardless of what the user's login shell is.
+# ---------------------------------------------------------------------------
+echo "test: SHELL pinning for execute_command"
+
+expected_bash=$(command -v bash)
+
+rm -f "$TMPDIR_TEST/bob_shell"
+SHELL=/usr/bin/fish run_wrapper -p "test prompt" >/dev/null 2>&1
+recorded_shell=$(cat "$TMPDIR_TEST/bob_shell")
+if [[ "$recorded_shell" == "$expected_bash" ]]; then
+    pass "bob child gets SHELL=bash even when the login shell is fish"
+else
+    fail "bob child did not get bash as SHELL" "got: $recorded_shell"
+fi
+
+rm -f "$TMPDIR_TEST/bob_shell"
+SHELL=/usr/bin/fish BOB_SHELL=sh run_wrapper -p "test prompt" >/dev/null 2>&1
+recorded_shell=$(cat "$TMPDIR_TEST/bob_shell")
+if [[ "$recorded_shell" == "$(command -v sh)" ]]; then
+    pass "BOB_SHELL overrides the pinned bash"
+else
+    fail "BOB_SHELL override not honored" "got: $recorded_shell"
+fi
+
+# a bare name must reach bob as an absolute path: bob spawns it with shell:false,
+# so an unresolvable name would fail at exec time inside bob instead of here.
+if [[ "$recorded_shell" == /* ]]; then
+    pass "BOB_SHELL is resolved to an absolute path"
+else
+    fail "BOB_SHELL not resolved to an absolute path" "got: $recorded_shell"
+fi
+
+# an unusable BOB_SHELL must fail loudly at startup rather than let bob run every
+# command through a missing binary.
+set +e
+err_out=$(BOB_SHELL=definitely-not-a-shell run_wrapper -p "test prompt" 2>&1 >/dev/null)
+status=$?
+set -e
+if [[ $status -ne 0 ]]; then
+    pass "unresolvable BOB_SHELL exits non-zero"
+else
+    fail "unresolvable BOB_SHELL did not fail" "status: $status"
+fi
+if [[ "$err_out" == *"BOB_SHELL 'definitely-not-a-shell' not found"* ]]; then
+    pass "unresolvable BOB_SHELL reports the offending value"
+else
+    fail "unresolvable BOB_SHELL error message unclear" "stderr: $err_out"
+fi
 
 # ---------------------------------------------------------------------------
 # test: no guard-shim directory is prepended to PATH for ralphex-review
@@ -1166,6 +1224,167 @@ elif [[ $error_no_signal_exit -ne 0 ]]; then
     pass "signal-less error stays signal-less and fails by exit code"
 else
     fail "signal-less error did not fail the run" "exit: $error_no_signal_exit"
+fi
+
+# ---------------------------------------------------------------------------
+# test: transient bob failures emit BOB_TRANSIENT_ERROR for claude_retry_patterns
+#
+# A bob backend 5xx killed a real run: the message matched no ralphex pattern, so a
+# recoverable hiccup became a hard failure mid-review. The wrapper classifies bob's
+# own diagnostics and emits an opaque marker the retry tier matches. The marker must
+# be a bare token — a <<<RALPHEX:...>>> form would set result.Signal, which SUPPRESSES
+# retry detection — and must only appear when bob actually failed.
+# ---------------------------------------------------------------------------
+echo "test: transient failure marker"
+
+# helper: run the wrapper over one event stream, return output and exit status
+run_transient_case() {
+    local events="$1"
+    printf '%s\n' "$events" > "$TMPDIR_TEST/transient_events.jsonl"
+    set +e
+    transient_output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/transient_events.jsonl" \
+        PATH="$TMPDIR_TEST:$PATH" \
+        bash "$WRAPPER" -p "test prompt" 2>/dev/null)
+    transient_exit=$?
+    set -e
+}
+
+# the exact failure from the observed run, as bob's non-JSON stderr diagnostic
+printf '%s\n' 'Error: Request Failed. Error while calling Bob'"'"'s backend service.' \
+    > "$TMPDIR_TEST/transient_stderr.txt"
+set +e
+transient_output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
+    MOCK_STDERR_FILE="$TMPDIR_TEST/transient_stderr.txt" \
+    MOCK_EXIT_CODE=1 \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "test prompt" 2>/dev/null)
+transient_exit=$?
+set -e
+if echo "$transient_output" | grep -q "BOB_TRANSIENT_ERROR"; then
+    pass "backend-service diagnostic emits BOB_TRANSIENT_ERROR"
+else
+    fail "backend-service diagnostic did not emit the marker" "got: $transient_output"
+fi
+if [[ $transient_exit -ne 0 ]]; then
+    pass "transient failure still exits non-zero"
+else
+    fail "transient failure did not exit non-zero" "exit: $transient_exit"
+fi
+# a <<<RALPHEX:...>>> form would make result.Signal non-empty and suppress the retry
+if echo "$transient_output" | grep -q "RALPHEX:BOB_TRANSIENT\|<<<RALPHEX:.*TRANSIENT"; then
+    fail "transient marker used a signal-shaped form" "got: $transient_output"
+else
+    pass "transient marker is a bare token, not a ralphex signal"
+fi
+
+# same cause arriving through the {type:"error"} channel
+run_transient_case '{"type":"error","timestamp":"t","severity":"error","message":"Request Failed. Error while calling Bob'"'"'s backend service."}'
+if echo "$transient_output" | grep -q "BOB_TRANSIENT_ERROR" && [[ $transient_exit -ne 0 ]]; then
+    pass "error-event backend failure emits BOB_TRANSIENT_ERROR"
+else
+    fail "error-event backend failure did not emit the marker" \
+        "exit: $transient_exit output: $transient_output"
+fi
+
+# network-level causes a re-run can clear
+for transient_cause in "socket hang up" "read ECONNRESET" "connect ETIMEDOUT" \
+    "502 Bad Gateway" "503 Service Unavailable" "504 Gateway Timeout" \
+    "Overloaded" "fetch failed"; do
+    run_transient_case '{"type":"error","timestamp":"t","severity":"error","message":"'"$transient_cause"'"}'
+    if echo "$transient_output" | grep -q "BOB_TRANSIENT_ERROR"; then
+        pass "transient cause '$transient_cause' emits the marker"
+    else
+        fail "transient cause '$transient_cause' missed the marker" "got: $transient_output"
+    fi
+done
+
+# deterministic failures must NOT be retried: a quota limit needs --wait (it is
+# claude_limit_patterns' job), and max-cost/max-turns aborts will recur identically.
+for permanent_cause in "Max cost exceeded: \$5.00 limit reached" \
+    "Maximum turns limit reached" "429 Too Many Requests" \
+    "quota exceeded" "Not logged in" "connect ECONNREFUSED 127.0.0.1:443" \
+    "getaddrinfo ENOTFOUND api.example.com" "Request Failed"; do
+    run_transient_case '{"type":"error","timestamp":"t","severity":"error","message":"'"$permanent_cause"'"}'
+    if echo "$transient_output" | grep -q "BOB_TRANSIENT_ERROR"; then
+        fail "deterministic cause '$permanent_cause' was marked transient" \
+            "got: $transient_output"
+    else
+        pass "deterministic cause '$permanent_cause' is not marked transient"
+    fi
+done
+
+# THE GATE: bob can log a transient hiccup on stderr, recover, and finish the work.
+# That run exits zero, and marking it transient would make ralphex discard completed
+# work and re-run it. A transient line alone must never be enough.
+printf '%s\n' 'warning: socket hang up, retrying' > "$TMPDIR_TEST/transient_recovered_stderr.txt"
+set +e
+recovered_output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/minimal_events.txt" \
+    MOCK_STDERR_FILE="$TMPDIR_TEST/transient_recovered_stderr.txt" \
+    MOCK_EXIT_CODE=0 \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "test prompt" 2>/dev/null)
+recovered_exit=$?
+set -e
+if [[ $recovered_exit -eq 0 ]] && ! echo "$recovered_output" | grep -q "BOB_TRANSIENT_ERROR"; then
+    pass "a recovered run (zero exit) emits no transient marker"
+else
+    fail "a recovered run was marked transient" \
+        "exit: $recovered_exit output: $recovered_output"
+fi
+# the diagnostic itself must still reach the log — suppressing the marker is not a
+# reason to hide why bob stumbled.
+if echo "$recovered_output" | grep -q "socket hang up"; then
+    pass "a recovered run still logs the transient diagnostic"
+else
+    fail "recovered run swallowed the diagnostic" "got: $recovered_output"
+fi
+
+# an error event carrying a transient cause still forces the contractual non-zero exit,
+# and there the marker DOES belong even though assistant text followed it.
+cat > "$TMPDIR_TEST/transient_then_signal.jsonl" << 'EOF'
+{"type":"error","timestamp":"t","severity":"warning","message":"socket hang up"}
+{"type":"message","timestamp":"t","role":"assistant","content":"recovered <<<RALPHEX:ALL_TASKS_DONE>>>\n","isReasoning":false}
+{"type":"result","timestamp":"t","status":"success","stats":{}}
+EOF
+set +e
+then_signal_output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/transient_then_signal.jsonl" \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "test prompt" 2>/dev/null)
+set -e
+# ralphex resolves this pair itself: a non-empty result.Signal suppresses the retry
+# tier, so the completion wins and the marker is inert. Assert both survive verbatim
+# rather than having the wrapper adjudicate ordering it cannot see the outcome of.
+if echo "$then_signal_output" | grep -q "<<<RALPHEX:ALL_TASKS_DONE>>>" &&
+    echo "$then_signal_output" | grep -q "BOB_TRANSIENT_ERROR"; then
+    pass "error-then-signal keeps both the signal and the marker for ralphex to resolve"
+else
+    fail "error-then-signal dropped the signal or the marker" "got: $then_signal_output"
+fi
+
+# tool_result errors carry arbitrary command output, so a build log or grep hit that
+# happens to contain a transient phrase must never forge a retry.
+cat > "$TMPDIR_TEST/transient_tool_result.jsonl" << 'EOF'
+{"type":"tool_result","timestamp":"t","status":"error","tool":"execute_command","error":{"message":"curl: the server said 503 Service Unavailable"}}
+{"type":"message","timestamp":"t","role":"assistant","content":"noted\n","isReasoning":false}
+{"type":"result","timestamp":"t","status":"success","stats":{}}
+EOF
+set +e
+tool_result_output=$(MOCK_VERBOSE=1 BOB_VERBOSE=1 \
+    MOCK_STDOUT_FILE="$TMPDIR_TEST/transient_tool_result.jsonl" \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "test prompt" 2>/dev/null)
+set -e
+if echo "$tool_result_output" | grep -q "BOB_TRANSIENT_ERROR"; then
+    fail "a tool_result error forged a transient retry" "got: $tool_result_output"
+else
+    pass "tool_result command output cannot forge a transient retry"
+fi
+
+# the marker only helps if the retry tier actually matches it
+if grep -q "BOB_TRANSIENT_ERROR" "$REPO_ROOT/pkg/config/defaults/config"; then
+    pass "BOB_TRANSIENT_ERROR is present in the shipped claude_retry_patterns"
+else
+    fail "BOB_TRANSIENT_ERROR missing from the shipped retry patterns"
 fi
 
 # result.status is always "success" in v2, but a hypothetical error status must not

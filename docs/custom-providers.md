@@ -481,6 +481,17 @@ The shipped mode tool groups are exact. bob v2 accepts only these group names �
 | `BOB_MODEL` | (unused) | Accepted for compatibility and **ignored** — bob v2 stable has no model selection. A non-empty value produces one stderr note. |
 | `BOB_VERBOSE` | `0` | Set to `1` to include task/review `tool_result` output, `[tool]` markers, and reasoning message text. Plan mode emits only its validated boundary. |
 | `BOB_EXTRA_ARGS` | (none) | Extra flags appended verbatim to the bob invocation (word-split on whitespace, **no quote preservation**); e.g. `--max-cost=5` to cap spend. |
+| `BOB_SHELL` | `bash` | Shell bob's `execute_command` runs commands through. Resolved with `command -v` (bare name or absolute path); an unresolvable value fails at startup. See [Shell pinning](#shell-pinning). |
+
+### Shell pinning
+
+The wrapper sets `SHELL` to bash for the bob child, overriding the inherited login shell.
+
+bob's `execute_command` runs every command through `$SHELL` verbatim — `getShellPath()` is `process.platform === "win32" ? "powershell.exe" : process.env.SHELL` — and reports that shell to the model as `systemInfo.shell`. Under a non-POSIX login shell such as `fish`, routine bash constructs the model emits (heredocs, `VAR=$(...)`, `[[ ]]`, `$'...'`, `"^$"`) all die with exit 127. bob's `/bin/sh` fallback does not cover it: that path fires only when the shell binary fails to *launch*, not when it launches and rejects the script.
+
+This matters beyond one failed command — a review phase that cannot write a heredoc abandons parallel sub-agent review and silently degrades to a sequential one. Pinning bash also keeps execution identical across machines instead of varying with each user's `/etc/passwd` entry. `SHELL` is scoped to the bob invocation, so the wrapper's own subshells keep the caller's value; use `BOB_SHELL` to select a different POSIX shell.
+
+If you write your own wrapper for a tool that shells out, check whether it reads `$SHELL` and pin it the same way.
 
 ### Model and effort mapping
 

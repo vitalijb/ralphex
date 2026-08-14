@@ -11,6 +11,8 @@
 #   BOB_VERBOSE       - set to 1 to include tool_result output, tool markers, and
 #                        reasoning message text (default: 0)
 #   BOB_EXTRA_ARGS    - extra bob arguments, word-split on whitespace
+#   BOB_SHELL         - shell bob's execute_command runs commands through
+#                        (default: bash; see the SHELL pinning note below)
 
 set -euo pipefail
 
@@ -53,6 +55,27 @@ if [[ "$BOB_VERBOSE" != "0" && "$BOB_VERBOSE" != "1" ]]; then
     BOB_VERBOSE=0
 fi
 BOB_EXTRA_ARGS="${BOB_EXTRA_ARGS:-}"
+
+# bob's execute_command tool runs every command through $SHELL verbatim — bob 2.x's
+# getShellPath() is `process.platform==="win32" ? "powershell.exe" : process.env.SHELL`
+# — so a non-POSIX login shell (fish, csh, nu) rejects the ordinary bash the model
+# writes: heredocs, `VAR=$(...)`, `[[ ]]`, `$'...'` all fail with exit 127. bob does
+# not recover from that: it only retries under /bin/sh when the shell binary fails to
+# *launch* (exitCode undefined), not when the shell launches and rejects the script.
+#
+# Pinning bash is not us overriding a user preference — it makes the runtime match
+# bob's own contract. bob's execute_command tool description hardcodes "The shell uses
+# bash syntax." for every non-win32 host (bashGuidelines()), and its interactive
+# `!command` path hardcodes bash too; only this one code path leaks $SHELL, while
+# environment_info separately reports the login shell. So the model is always told
+# bash regardless of $SHELL. That also rules out a "only override non-POSIX shells"
+# allowlist: dash and sh users would still break on `[[ ]]` and `$'...'` that the
+# prompt promised them. BOB_SHELL overrides this for a deliberate choice.
+BOB_SHELL="${BOB_SHELL:-bash}"
+if ! bob_shell=$(command -v "$BOB_SHELL"); then
+    echo "error: BOB_SHELL '$BOB_SHELL' not found or not executable" >&2
+    exit 1
+fi
 
 # bob v2 stable has no model selection (gated behind an internal dev gateway key), and
 # has no --effort flag either. Accept both for compatibility with ralphex's per-phase
@@ -389,6 +412,38 @@ intentional_stop=0
 plan_boundary_emitted=0
 bob_failure_detail_emitted=0
 bob_result_failed=0
+# Set when a failure diagnostic looks like a transient backend/network hiccup rather
+# than a deterministic failure. Consumed once at exit to emit BOB_TRANSIENT_ERROR.
+bob_transient_detected=0
+
+# Classifies one of BOB'S OWN failure diagnostics as transient or not. Deliberately
+# NOT applied to tool_result errors: those carry arbitrary command output, so a build
+# log or a grep hit containing "service unavailable" would forge a retry. Only bob's
+# non-JSON CLI diagnostics and its {type:"error"} events reach this, and neither can
+# contain model prose (assistant text arrives as parsed `message` events), which is
+# why matching plain English here is safe where a claude_retry_patterns entry over
+# RecentText would not be.
+#
+# Kept to causes that a re-run can plausibly clear. Notably absent: a bare
+# "request failed" (bob wraps deterministic 4xx in it too, so retrying burns three
+# iterations before failing anyway), 429/"too many requests" (a quota limit, which is
+# claude_limit_patterns' job and needs --wait, not an immediate retry), and
+# ECONNREFUSED/ENOTFOUND (near-always a wrong endpoint or absent network).
+classify_bob_transient() {
+    case "${1,,}" in
+        *"error while calling bob's backend service"*|\
+        *"bad gateway"*|\
+        *"service unavailable"*|\
+        *"gateway timeout"*|\
+        *overloaded*|\
+        *"socket hang up"*|\
+        *econnreset*|\
+        *etimedout*|\
+        *"fetch failed"*)
+            bob_transient_detected=1
+            ;;
+    esac
+}
 # Set once the model's own answer text has carried a terminal ralphex signal
 # downstream. ClaudeExecutor ignores a non-zero provider exit as soon as any
 # signal was detected (pkg/executor/executor.go), so the forced non-zero exit
@@ -501,8 +556,9 @@ flush_task_buffer_lines() {
 
 bob_start_seconds=$SECONDS
 # Merge Bob's descriptors before translation so one reader preserves live ordering
-# without concurrent JSON writers. Non-JSON lines are treated as diagnostics.
-"$bob_executable" "${bob_args[@]}" < "$prompt_file" > "$stream_pipe" 2>&1 &
+# without concurrent JSON writers. Non-JSON lines are treated as diagnostics. SHELL is
+# scoped to this one command so the wrapper's own subshells keep the caller's value.
+SHELL="$bob_shell" "$bob_executable" "${bob_args[@]}" < "$prompt_file" > "$stream_pipe" 2>&1 &
 bob_pid=$!
 
 plan_stream_buffer=""
@@ -522,6 +578,7 @@ while IFS= read -r line || [[ -n "$line" ]]; do
         case "${line,,}" in
             *error*|*failed*|*failure*|*limit*|*auth*|*required*|*timeout*|*exception*)
                 bob_failure_detail_emitted=1
+                classify_bob_transient "$line"
                 ;;
         esac
         continue
@@ -546,6 +603,7 @@ while IFS= read -r line || [[ -n "$line" ]]; do
         emit_text_delta "error: bob: $error_detail"$'\n'
         bob_failure_detail_emitted=1
         bob_result_failed=1
+        classify_bob_transient "$error_detail"
         # bob emits max-turns/max-cost aborts AFTER assistant text, so the stream
         # can hold a terminal signal followed by this failure. ClaudeExecutor then
         # ignores the non-zero exit ("if there IS a signal, work was done") and the
@@ -671,6 +729,22 @@ fi
 if [[ "$bob_exit" -ne 0 && "$bob_failure_detail_emitted" == "0" ]]; then
     bob_elapsed_seconds=$((SECONDS - bob_start_seconds))
     emit_text_delta "error: bob exited with status $bob_exit after ${bob_elapsed_seconds}s without diagnostic output"$'\n'
+fi
+
+# An opaque marker for claude_retry_patterns, so a transient bob backend failure is
+# retried instead of failing the whole run. Deliberately a bare token, NOT a
+# <<<RALPHEX:...>>> form: signal-shaped text is neutralized on every non-answer path
+# here, and a real signal would make result.Signal non-empty, which SUPPRESSES retry
+# detection in ralphex (pkg/executor/executor.go patternError) — the exact opposite of
+# the intent. An opaque token also cannot collide with review prose the way an English
+# phrase in the shared claude_retry_patterns default could.
+#
+# Gated on a non-zero exit, not merely on having seen a transient line: bob can log a
+# backend hiccup, recover, and finish the work, and emitting the marker there would
+# throw away a successful run. Emitted last so it lands inside the window ralphex
+# scans (the final recentBlockCount text blocks).
+if [[ "$bob_exit" -ne 0 && "$bob_transient_detected" == "1" ]]; then
+    emit_text_delta 'BOB_TRANSIENT_ERROR'$'\n'
 fi
 
 echo '{"type":"result","result":""}'

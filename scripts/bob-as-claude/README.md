@@ -70,6 +70,28 @@ So there is nothing to grant: a stock bob install with `allowed_permissions: ["r
 - `BOB_MODEL` — accepted for compatibility and **ignored**; bob v2 stable has no model selection. A non-empty value produces one stderr note.
 - `BOB_VERBOSE` — set to `1` to include task/review `tool_result` output, `[tool]` markers, and reasoning message text (default: `0`; plan mode emits only the validated boundary)
 - `BOB_EXTRA_ARGS` — extra flags appended verbatim to the bob invocation (word-split on whitespace). The wrapper builds the bob command line itself and ignores unknown flags, so this is the only way to pass through arbitrary bob options. Example: `BOB_EXTRA_ARGS="--max-cost=5"`. **Limitation:** word-splitting does NOT preserve quotes; arguments containing spaces or quotes cannot be expressed via `BOB_EXTRA_ARGS`.
+- `BOB_SHELL` — shell bob's `execute_command` runs commands through (default: `bash`). Resolved with `command -v`, so a bare name or an absolute path both work; an unresolvable value fails the run at startup. See [Shell pinning](#shell-pinning) below.
+
+### Shell pinning
+
+The wrapper sets `SHELL` to bash for the bob child process, overriding the login shell it inherited.
+
+bob's `execute_command` tool runs every command through `$SHELL` verbatim — bob 2.x's `getShellPath()` is literally `process.platform === "win32" ? "powershell.exe" : process.env.SHELL` — and reports that same shell to the model as `systemInfo.shell`. If the user's login shell is not POSIX-compatible, the ordinary bash that models write does not parse. Under `fish` every one of these fails with exit 127:
+
+| Command the model wrote | fish diagnostic |
+|---|---|
+| `grep -v "^$"` | `Expected a variable name after this $.` |
+| `python3 - <<'EOF'` | `Expected a string, but found a redirection` |
+| `sz=$(wc -c < f)` | `Unsupported use of '='.` |
+| `re.match(r'...$', base)` | `$' is not a valid variable in fish.` |
+
+bob does not recover from this. Its fallback to `/bin/sh` fires only when the shell binary fails to *launch* (`exitCode === undefined`); a shell that starts and then rejects the script exits 127 with a defined code, so the fallback is skipped and the tool call just fails.
+
+**This aligns bob with itself rather than overriding your preference.** bob's own `execute_command` tool description hardcodes *"The shell uses bash syntax."* for every non-Windows host, and its interactive `!command` path hardcodes bash as well — only this one code path reads `$SHELL`. So the model is instructed to write bash no matter what your login shell is, and it is bob's `environment_info` that is inconsistent with its own tool contract. That is also why the pin is unconditional rather than an "override only non-POSIX shells" allowlist: `dash` and `sh` users would still break on the `[[ ]]` and `$'...'` the tool description promised them.
+
+The damage is not limited to a retried command. In an observed run the review phase tried to write its sub-agent prompts with a heredoc, failed, and gave up on parallel review entirely — "Given the complexity of running parallel agents, let me proceed with a sequential code review myself" — so a review that should have fanned out to five agents ran single-threaded because of a quoting error.
+
+Pinning bash also makes runs reproducible across machines: without it, identical prompts execute under whatever shell each user happens to have in `/etc/passwd`. `SHELL` is scoped to the bob invocation alone, so the wrapper's own subshells keep the caller's value. Set `BOB_SHELL` to choose a different POSIX shell.
 
 **Model and effort:** neither is forwarded to bob. ralphex supplies `--model` and `--effort` with each value in the following argv entry; the wrapper also accepts `--model=<m>` and `--effort=<e>` for direct invocations, plus `BOB_MODEL`. All are accepted and **ignored** — bob v2 stable removed `-m`/`--model` (it is gated behind an internal dev gateway key) and has never had an `--effort` flag — with one stderr note per non-empty value so ralphex's per-phase model flags cannot fail a bob run.
 
@@ -160,6 +182,24 @@ A review phase that goes quiet for a long stretch is expected: subagents emit no
 ### Files not written to disk
 
 Ensure `--trust` is present (it is by default). Do NOT pass `--sandbox` via `BOB_EXTRA_ARGS`; it would redirect bob's writes to a sandbox that doesn't persist. If files are still unwritten, check that `edit` is in the selected mode's `groups` list and that the target is inside the workspace.
+
+### Transient backend failures are retried
+
+When bob fails from a cause a re-run can plausibly clear — a backend 5xx, `socket hang up`, `ECONNRESET`, `ETIMEDOUT`, `fetch failed` — the wrapper emits a bare `BOB_TRANSIENT_ERROR` line as its last output. That token is in ralphex's default `claude_retry_patterns`, so the phase retries the iteration after a short backoff instead of failing the run. Without it a single backend hiccup aborts the whole run mid-review, since bob's message matches none of ralphex's stock patterns.
+
+Three deliberate boundaries:
+
+- **Only bob's own diagnostics are classified** — its non-JSON CLI output and its `{type:"error"}` message. `tool_result` errors are excluded on purpose: they carry arbitrary command output, so a build log or grep hit containing "service unavailable" would otherwise forge a retry.
+- **Only on an actual failure.** bob can log a hiccup, recover, and finish; the marker requires a non-zero exit, so a completed run is never discarded and re-run.
+- **Deterministic failures are excluded**: a bare `Request Failed` (bob wraps 4xx in it too), `429`/`quota exceeded` (a quota limit — that is `claude_limit_patterns`' job and wants `--wait`, not an instant retry), and `ECONNREFUSED`/`ENOTFOUND` (almost always a wrong endpoint or no network).
+
+The marker is intentionally a bare token rather than a `<<<RALPHEX:...>>>` signal: signal-shaped text is neutralized on every non-answer path here, and a real signal would make ralphex's `result.Signal` non-empty, which *suppresses* retry detection — the opposite of the intent.
+
+### Commands fail with `Exit code: 127` and a shell syntax complaint
+
+Progress-log lines like `[tool_error] Error from tool execute_command: Exit code: 127` followed by `fish: Expected a string, but found a redirection` mean bob ran the command through a non-POSIX shell. The wrapper pins bash for exactly this reason (see [Shell pinning](#shell-pinning)), so check whether `BOB_SHELL` is set to something non-POSIX, and confirm the wrapper — not bob directly — is what `claude_command` points at.
+
+Worth watching for even when a run ultimately succeeds: these failures make the agent retry blindly or abandon work. In one run the review phase could not write its sub-agent prompts with a heredoc and silently downgraded a five-agent parallel review to a single sequential pass.
 
 ### Model selection not working
 

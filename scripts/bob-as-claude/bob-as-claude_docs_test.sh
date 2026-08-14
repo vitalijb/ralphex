@@ -228,6 +228,51 @@ assert_contains \
     "wrapper README documents BOB_EXTRA_ARGS env var"
 assert_contains \
     "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "BOB_SHELL" \
+    "wrapper README documents BOB_SHELL env var"
+# the marker is only useful if the shipped retry patterns still match it; a rename on
+# one side alone silently turns transient bob failures back into hard run failures.
+assert_contains \
+    "$REPO_ROOT/pkg/config/defaults/config" \
+    "BOB_TRANSIENT_ERROR" \
+    "shipped claude_retry_patterns includes BOB_TRANSIENT_ERROR"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/bob-as-claude.sh" \
+    "BOB_TRANSIENT_ERROR" \
+    "wrapper emits BOB_TRANSIENT_ERROR"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "BOB_TRANSIENT_ERROR" \
+    "wrapper README documents the transient failure marker"
+# the reason for pinning must survive, not just the knob: without it a future reader
+# sees a redundant-looking SHELL assignment and drops it.
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "Shell pinning" \
+    "wrapper README explains why SHELL is pinned"
+assert_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "BOB_SHELL" \
+    "custom-providers documents BOB_SHELL env var"
+assert_contains \
+    "$REPO_ROOT/README.md" \
+    "BOB_SHELL" \
+    "README documents BOB_SHELL env var"
+assert_contains \
+    "$REPO_ROOT/CLAUDE.md" \
+    "BOB_SHELL" \
+    "CLAUDE documents BOB_SHELL env var"
+assert_contains \
+    "$REPO_ROOT/llms.txt" \
+    "BOB_SHELL" \
+    "llms.txt documents BOB_SHELL env var"
+# the wrapper must pin SHELL on the bob command itself, not export it process-wide
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/bob-as-claude.sh" \
+    'SHELL="$bob_shell" "$bob_executable"' \
+    "wrapper scopes SHELL to the bob invocation"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
     "bash scripts/bob-as-claude/install-modes.sh" \
     "wrapper README documents custom-mode installation"
 assert_contains \
