@@ -370,7 +370,9 @@ if [[ ${#missing[@]} -eq 0 ]]; then
     exit 0
 fi
 
-mkdir -p "$target_dir"
+# -m applies only to directories this call creates, so an existing bob-owned
+# directory keeps its permissions; a fresh one under $HOME is not world-readable.
+mkdir -p -m 700 "$target_dir"
 tmp_file=$(mktemp "$target_dir/.custom_modes.yaml.tmp.XXXXXX")
 
 if [[ ! -e "$target" || ! -s "$target" ]]; then

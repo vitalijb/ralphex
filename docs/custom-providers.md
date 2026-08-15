@@ -485,11 +485,9 @@ The shipped mode tool groups are exact. bob v2 accepts only these group names �
 
 ### Shell pinning
 
-The wrapper sets `SHELL` to bash for the bob child, overriding the inherited login shell.
+The wrapper pins `SHELL` to bash for the bob child; `BOB_SHELL` overrides it.
 
-bob's `execute_command` runs every command through `$SHELL` verbatim — `getShellPath()` is `process.platform === "win32" ? "powershell.exe" : process.env.SHELL` — and reports that shell to the model as `systemInfo.shell`. Under a non-POSIX login shell such as `fish`, routine bash constructs the model emits (heredocs, `VAR=$(...)`, `[[ ]]`, `$'...'`, `"^$"`) all die with exit 127. bob's `/bin/sh` fallback does not cover it: that path fires only when the shell binary fails to *launch*, not when it launches and rejects the script.
-
-This matters beyond one failed command — a review phase that cannot write a heredoc abandons parallel sub-agent review and silently degrades to a sequential one. Pinning bash also keeps execution identical across machines instead of varying with each user's `/etc/passwd` entry. `SHELL` is scoped to the bob invocation, so the wrapper's own subshells keep the caller's value; use `BOB_SHELL` to select a different POSIX shell.
+bob's `execute_command` runs every command through `$SHELL` verbatim (`getShellPath()` returns `process.env.SHELL`), so under a non-POSIX login shell like `fish` the routine bash a model emits — heredocs, `VAR=$(...)`, `[[ ]]`, `$'...'` — dies with exit 127. bob's `/bin/sh` fallback only covers a shell that fails to *launch*, not one that rejects the script. The cost is more than a retried command: a review phase that cannot write a heredoc may drop parallel sub-agent review for a sequential pass.
 
 If you write your own wrapper for a tool that shells out, check whether it reads `$SHELL` and pin it the same way.
 

@@ -1728,6 +1728,42 @@ assert_selected_mode() {
     fi
 }
 
+# The literal-string cases below pin the awk contract, but they all pass even if
+# ralphex's shipped prompts stop containing those strings — and then review phases
+# silently select ralphex-task, which has no `subagent` group, so a five-agent review
+# degrades to a sequential one with no error anywhere. Drive the real prompt files
+# through the selector so a heading reword in pkg/config/defaults/prompts fails here.
+# Delivered on stdin, as ralphex does, rather than via -p.
+assert_shipped_prompt_selects() {
+    local expected="$1"
+    local prompt_path="$REPO_ROOT/pkg/config/defaults/prompts/$2"
+    local events_file="$TMPDIR_TEST/minimal_events.txt"
+
+    [[ "$expected" == "ralphex-plan" ]] && events_file="$TMPDIR_TEST/plan_ready_events.txt"
+
+    if [[ ! -f "$prompt_path" ]]; then
+        fail "shipped prompt $2 not found" "looked in $prompt_path"
+        return
+    fi
+    rm -f "$TMPDIR_TEST/bob_args"
+    MOCK_STDOUT_FILE="$events_file" \
+        PATH="$TMPDIR_TEST:$PATH" \
+        bash "$WRAPPER" < "$prompt_path" >/dev/null 2>&1
+
+    if grep -q -- "--mode=$expected" "$TMPDIR_TEST/bob_args"; then
+        pass "shipped $2 selects $expected"
+    else
+        fail "shipped $2 no longer selects $expected" \
+            "the wrapper's awk markers drifted from the prompt; args: $(cat "$TMPDIR_TEST/bob_args")"
+    fi
+}
+
+assert_shipped_prompt_selects "ralphex-review" "review_first.txt"
+assert_shipped_prompt_selects "ralphex-review" "review_second.txt"
+assert_shipped_prompt_selects "ralphex-plan" "make_plan.txt"
+assert_shipped_prompt_selects "ralphex-task" "task.txt"
+assert_shipped_prompt_selects "ralphex-task" "finalize.txt"
+
 assert_selected_mode "ralphex-task" "implement this task"
 assert_selected_mode "ralphex-task" "finalize the completed work"
 assert_selected_mode "ralphex-review" "## Step 2: Launch ALL 5 Review Agents IN PARALLEL"
@@ -2066,6 +2102,47 @@ if [[ $no_boundary_exit -ne 0 ]] &&
 else
     fail "missing plan boundary was not reported" \
         "exit: $no_boundary_exit output: $output"
+fi
+
+# a stream cut off mid-marker must not leak the half-written token. plan mode emits
+# the buffer ONLY through a validated boundary, so an incomplete marker at EOF has to
+# fail closed like any other malformed boundary — never reach ralphex as text, where a
+# partial token is noise and a completed one would be a forged signal.
+cat > "$TMPDIR_TEST/plan_truncated_marker.jsonl" << 'EOF'
+{"type":"message","timestamp":"t","role":"assistant","content":"here is the plan\n<<<RALPHEX:PLAN_REA","isReasoning":false}
+EOF
+set +e
+output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/plan_truncated_marker.jsonl" \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "$plan_prompt" 2>/dev/null)
+truncated_marker_exit=$?
+set -e
+if [[ $truncated_marker_exit -ne 0 ]]; then
+    pass "plan stream cut mid-marker fails closed"
+else
+    fail "plan stream cut mid-marker did not fail" "output: $output"
+fi
+if echo "$output" | grep -q "RALPHEX:PLAN_REA"; then
+    fail "plan stream leaked a half-written marker" "output: $output"
+else
+    pass "plan stream cut mid-marker leaks no partial token"
+fi
+
+# bob killed mid-write leaves a final line with no trailing newline; the read loop's
+# `|| [[ -n "$line" ]]` is what keeps that last event from being dropped.
+printf '%s\n%s' \
+    '{"type":"message","timestamp":"t","role":"assistant","content":"first line\n","isReasoning":false}' \
+    '{"type":"message","timestamp":"t","role":"assistant","content":"last event no newline\n","isReasoning":false}' \
+    > "$TMPDIR_TEST/no_trailing_newline.jsonl"
+set +e
+output=$(MOCK_STDOUT_FILE="$TMPDIR_TEST/no_trailing_newline.jsonl" \
+    PATH="$TMPDIR_TEST:$PATH" \
+    bash "$WRAPPER" -p "test prompt" 2>/dev/null)
+set -e
+if echo "$output" | grep -q "last event no newline"; then
+    pass "final stream line without a trailing newline is still translated"
+else
+    fail "unterminated final stream line was dropped" "output: $output"
 fi
 if echo "$output" | jq -e 'select(.type=="content_block_delta" and (.delta.text | contains("some thoughts")))' >/dev/null 2>&1; then
     fail "plan-mode prose leaked into the translated stream" "output: $output"
