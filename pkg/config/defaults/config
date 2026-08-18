@@ -267,8 +267,11 @@ codex_error_patterns = Rate limit exceeded,rate limit reached,429 Too Many Reque
 
 # claude_retry_patterns: transient claude/fya output markers to retry like timeouts
 # comma-separated list of substrings (case-insensitive matching)
-# default: FYA_TRANSIENT_TIMEOUT,API Error: 529,API Error: 502,API Error: 503,API Error: 504
-claude_retry_patterns = FYA_TRANSIENT_TIMEOUT,API Error: 529,API Error: 502,API Error: 503,API Error: 504
+# BOB_TRANSIENT_ERROR is an opaque marker the bob-as-claude wrapper emits when bob
+# fails with a transient backend/network cause; the wrapper does the classifying so
+# no English phrase here can collide with review prose
+# default: FYA_TRANSIENT_TIMEOUT,API Error: 529,API Error: 502,API Error: 503,API Error: 504,BOB_TRANSIENT_ERROR
+claude_retry_patterns = FYA_TRANSIENT_TIMEOUT,API Error: 529,API Error: 502,API Error: 503,API Error: 504,BOB_TRANSIENT_ERROR
 
 # ------------------------------------------------------------------------------
 # rate limit wait and retry

@@ -1,6 +1,6 @@
 plan_model = claude-opus-5:xhigh
-task_model = claude-sonnet-5[1m]:high
-review_model = claude-sonnet-5[1m]:high
+task_model = claude-opus-5:high
+review_model = claude-opus-5:high
 codex_model = gpt-5.5-gus
 codex_reasoning_effort = xhigh
 external_review_tool = codex

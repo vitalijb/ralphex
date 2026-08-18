@@ -49,6 +49,33 @@ assert_not_contains() {
     fi
 }
 
+# asserts a needle is absent from one section of a file, so a legitimate mention of a
+# removed v1 flag elsewhere (e.g. the Copilot `--yolo` guidance) does not fail the check.
+assert_section_not_contains() {
+    local file="$1"
+    local start_regex="$2"
+    local end_regex="$3"
+    local needle="$4"
+    local label="$5"
+
+    local section
+    section=$(awk -v start="$start_regex" -v end="$end_regex" '
+        !inside && $0 ~ start { inside = 1; print; next }
+        inside && $0 ~ end { inside = 0 }
+        inside { print }
+    ' "$file")
+
+    if [[ -z "$section" ]]; then
+        fail "$label" "section matching '$start_regex' not found in $file"
+        return
+    fi
+    if grep -Fq -- "$needle" <<< "$section"; then
+        fail "$label" "unexpected '$needle' in the '$start_regex' section of $file"
+    else
+        pass "$label"
+    fi
+}
+
 assert_matches() {
     local file="$1"
     local regex="$2"
@@ -110,40 +137,73 @@ assert_contains \
     "task mode allows edit"
 assert_contains \
     "$REPO_ROOT/scripts/bob-as-claude/modes/ralphex-task.yaml" \
-    "- command" \
-    "task mode allows command"
-assert_contains \
-    "$REPO_ROOT/scripts/bob-as-claude/modes/ralphex-task.yaml" \
-    "- browser" \
-    "task mode allows browser"
+    "- execute" \
+    "task mode allows execute"
 assert_contains \
     "$REPO_ROOT/scripts/bob-as-claude/modes/ralphex-review.yaml" \
     "customInstructions" \
     "review mode contains custom instructions"
 assert_contains \
     "$REPO_ROOT/scripts/bob-as-claude/modes/ralphex-review.yaml" \
-    'Never launch `bob`, `claude`, `codex`' \
-    "review mode forbids nested agent CLIs"
+    "- subagent" \
+    "review mode allows native subagents"
 assert_contains \
     "$REPO_ROOT/scripts/bob-as-claude/modes/ralphex-review.yaml" \
-    "Never use background commands" \
-    "review mode forbids background agent orchestration"
+    "spawn_subagent" \
+    "review mode delegates through native spawn_subagent"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/modes/ralphex-review.yaml" \
+    "single turn so they run in parallel" \
+    "review mode issues subagent assignments in parallel"
 assert_contains \
     "$REPO_ROOT/scripts/bob-as-claude/modes/ralphex-plan.yaml" \
     "- read" \
     "plan mode allows read"
 assert_contains \
     "$REPO_ROOT/scripts/bob-as-claude/modes/ralphex-plan.yaml" \
-    "- command" \
-    "plan mode allows command"
-assert_contains \
-    "$REPO_ROOT/scripts/bob-as-claude/modes/ralphex-plan.yaml" \
-    "- browser" \
-    "plan mode allows browser"
+    "- execute" \
+    "plan mode allows execute"
 assert_contains \
     "$REPO_ROOT/scripts/bob-as-claude/modes/ralphex-plan.yaml" \
     "- edit" \
     "plan mode allows accepted plan write"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/modes/ralphex-plan.yaml" \
+    "Return every plan boundary as ordinary assistant text" \
+    "plan mode returns boundaries as assistant text"
+
+# v1 tool groups and the removed terminal tool must not survive in any shipped mode
+for mode in ralphex-task ralphex-review ralphex-plan; do
+    assert_not_contains \
+        "$REPO_ROOT/scripts/bob-as-claude/modes/$mode.yaml" \
+        "- command" \
+        "$mode mode drops the invalid command group"
+    assert_not_contains \
+        "$REPO_ROOT/scripts/bob-as-claude/modes/$mode.yaml" \
+        "- browser" \
+        "$mode mode drops the invalid browser group"
+    assert_not_contains \
+        "$REPO_ROOT/scripts/bob-as-claude/modes/$mode.yaml" \
+        "attempt_completion" \
+        "$mode mode drops the removed attempt_completion tool"
+    assert_not_contains \
+        "$REPO_ROOT/scripts/bob-as-claude/modes/$mode.yaml" \
+        "allowedSubagents" \
+        "$mode mode declares no allowedSubagents key"
+done
+
+# the wrapper targets bob v2 only: no v1 flags, no version-detection branch
+for needle in "--chat-mode" "--yolo" "--hide-intermediary-output" "--output-format" \
+    "attempt_completion" "<thinking>"; do
+    assert_not_contains \
+        "$REPO_ROOT/scripts/bob-as-claude/bob-as-claude.sh" \
+        "$needle" \
+        "wrapper drops v1 artifact $needle"
+done
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/bob-as-claude.sh" \
+    "run -f stream-json" \
+    "wrapper uses the v2 run subcommand and stream format"
 
 # wrapper README
 assert_contains \
@@ -168,6 +228,51 @@ assert_contains \
     "wrapper README documents BOB_EXTRA_ARGS env var"
 assert_contains \
     "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "BOB_SHELL" \
+    "wrapper README documents BOB_SHELL env var"
+# the marker is only useful if the shipped retry patterns still match it; a rename on
+# one side alone silently turns transient bob failures back into hard run failures.
+assert_contains \
+    "$REPO_ROOT/pkg/config/defaults/config" \
+    "BOB_TRANSIENT_ERROR" \
+    "shipped claude_retry_patterns includes BOB_TRANSIENT_ERROR"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/bob-as-claude.sh" \
+    "BOB_TRANSIENT_ERROR" \
+    "wrapper emits BOB_TRANSIENT_ERROR"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "BOB_TRANSIENT_ERROR" \
+    "wrapper README documents the transient failure marker"
+# the reason for pinning must survive, not just the knob: without it a future reader
+# sees a redundant-looking SHELL assignment and drops it.
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "Shell pinning" \
+    "wrapper README explains why SHELL is pinned"
+assert_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "BOB_SHELL" \
+    "custom-providers documents BOB_SHELL env var"
+assert_contains \
+    "$REPO_ROOT/README.md" \
+    "BOB_SHELL" \
+    "README documents BOB_SHELL env var"
+assert_contains \
+    "$REPO_ROOT/CLAUDE.md" \
+    "BOB_SHELL" \
+    "CLAUDE documents BOB_SHELL env var"
+assert_contains \
+    "$REPO_ROOT/llms.txt" \
+    "BOB_SHELL" \
+    "llms.txt documents BOB_SHELL env var"
+# the wrapper must pin SHELL on the bob command itself, not export it process-wide
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/bob-as-claude.sh" \
+    'SHELL="$bob_shell" "$bob_executable"' \
+    "wrapper scopes SHELL to the bob invocation"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
     "bash scripts/bob-as-claude/install-modes.sh" \
     "wrapper README documents custom-mode installation"
 assert_contains \
@@ -180,8 +285,86 @@ assert_contains \
     "wrapper README documents review mode"
 assert_contains \
     "$REPO_ROOT/scripts/bob-as-claude/README.md" \
-    'review-only `bob`, `claude`, and `codex` guard shims' \
-    "wrapper README documents nested-agent guards"
+    "BOB_SESSION" \
+    "wrapper README documents native nesting protection"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "no guard shims" \
+    "wrapper README documents guard-shim removal"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "spawn_subagent" \
+    "wrapper README documents native parallel review subagents"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "idle_timeout" \
+    "wrapper README documents subagent silence and idle_timeout"
+# headless `bob run` never constructs bob's approval handler, so the docs must describe
+# mode groups + --trust as the only gate and must not send users to a settings grant.
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "### What governs tool access" \
+    "wrapper README documents what governs headless tool access"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "getToolsForGroups" \
+    "wrapper README names the mode-group tool resolution"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "is **not** read by \`bob run\`" \
+    "wrapper README states approval settings are unread headlessly"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "handleToolApproval" \
+    "wrapper README names the interactive-only approval entry point"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "\`--auto-approve\` exists on \`bob chat\` but not on \`bob run\`" \
+    "wrapper README cites --auto-approve as evidence"
+assert_not_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "--grant-approvals" \
+    "wrapper README drops the removed approval grant flag"
+assert_not_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "BOB_SETTINGS_FILE" \
+    "wrapper README drops the removed settings path override"
+assert_not_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "allowedExecutors" \
+    "wrapper README drops the unreachable allowedExecutors guidance"
+assert_not_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "15-entry" \
+    "wrapper README drops the unverified default approvedCommands count"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "bob run -f stream-json" \
+    "wrapper README documents the v2 invocation"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "bob 2.0.0 or newer" \
+    "wrapper README states the minimum bob version"
+assert_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "~/.claude/skills" \
+    "wrapper README documents the auto-loaded Claude skills caveat"
+assert_not_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "--chat-mode" \
+    "wrapper README drops the v1 --chat-mode flag"
+assert_not_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "--hide-intermediary-output" \
+    "wrapper README drops the v1 --hide-intermediary-output flag"
+assert_not_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "--output-format=stream-json" \
+    "wrapper README drops the v1 --output-format flag"
+assert_not_contains \
+    "$REPO_ROOT/scripts/bob-as-claude/README.md" \
+    "attempt_completion" \
+    "wrapper README drops the removed attempt_completion tool"
 assert_contains \
     "$REPO_ROOT/scripts/bob-as-claude/README.md" \
     "ralphex-plan" \
@@ -254,8 +437,104 @@ assert_contains \
     "custom providers doc references bob wrapper path"
 assert_contains \
     "$REPO_ROOT/docs/custom-providers.md" \
-    "attempt_completion" \
+    "isReasoning" \
     "custom providers doc documents bob event translation"
+assert_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "error.message" \
+    "custom providers doc documents v2 tool_result error field"
+assert_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "bob run -f stream-json --mode=<slug> --trust" \
+    "custom providers doc documents the v2 invocation"
+assert_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "Minimum supported version: bob 2.0.0" \
+    "custom providers doc states the minimum bob version"
+assert_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "### What governs tool access" \
+    "custom providers doc documents what governs headless tool access"
+assert_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "getToolsForGroups" \
+    "custom providers doc names the mode-group tool resolution"
+assert_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "is **not** consulted by \`bob run\`" \
+    "custom providers doc states approval settings are unread headlessly"
+assert_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "handleToolApproval" \
+    "custom providers doc names the interactive-only approval entry point"
+assert_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "\`--auto-approve\` exists on \`bob chat\` but not on \`bob run\`" \
+    "custom providers doc cites --auto-approve as evidence"
+assert_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "\`ralphex-review\` adds \`subagent\`" \
+    "custom providers doc documents the review-mode subagent group"
+assert_not_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "--grant-approvals" \
+    "custom providers doc drops the removed approval grant flag"
+assert_not_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "BOB_SETTINGS_FILE" \
+    "custom providers doc drops the removed settings path override"
+assert_not_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "allowedExecutors" \
+    "custom providers doc drops the unreachable allowedExecutors guidance"
+assert_not_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "15-entry" \
+    "custom providers doc drops the unverified default approvedCommands count"
+# the wrapper fails the run on every error event regardless of severity, so the event
+# table must not promise a severity filter that does not exist in the code.
+assert_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    '| `error` (any `severity`) |' \
+    "custom providers doc event table matches error events at any severity"
+assert_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "The event's \`severity\` field is **not** inspected" \
+    "custom providers doc states severity is not inspected"
+assert_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "unspecified bob error" \
+    "custom providers doc documents the empty-message error placeholder"
+# the forced non-zero exit alone cannot fail a run whose stream already carried a
+# signal, so the doc must record the TASK_FAILED retraction the wrapper emits.
+assert_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    'the wrapper also emits `<<<RALPHEX:TASK_FAILED>>>` after the diagnostic' \
+    "custom providers doc documents the post-signal failure retraction"
+assert_not_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    'severity == "error"' \
+    "custom providers doc drops the stale severity filter claim"
+assert_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "spawn_subagent" \
+    "custom providers doc documents native parallel review subagents"
+assert_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "BOB_SESSION" \
+    "custom providers doc documents native nesting protection"
+assert_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "idle_timeout" \
+    "custom providers doc documents subagent silence and idle_timeout"
+assert_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "~/.claude/skills" \
+    "custom providers doc documents the auto-loaded Claude skills caveat"
+assert_contains \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "\`read\`, \`edit\`, \`execute\`, \`mcp\`, \`skill\`, \`todo\`, \`subagent\`, \`mode\`" \
+    "custom providers doc lists the valid v2 tool groups"
 assert_contains \
     "$REPO_ROOT/docs/custom-providers.md" \
     "### Automatic phase mapping" \
@@ -335,6 +614,62 @@ assert_contains \
     "$REPO_ROOT/README.md" \
     "scripts/bob-as-claude/install-modes.sh" \
     "top-level README inventories Bob installer"
+assert_contains \
+    "$REPO_ROOT/README.md" \
+    "bob 2.0.0 or newer" \
+    "top-level README states the minimum bob version"
+assert_contains \
+    "$REPO_ROOT/README.md" \
+    "does not read the \`approval\` section" \
+    "top-level README states approval settings are unread headlessly"
+assert_contains \
+    "$REPO_ROOT/README.md" \
+    "installing the modes is the whole setup step" \
+    "top-level README states mode installation is the only setup step"
+assert_not_contains \
+    "$REPO_ROOT/README.md" \
+    "--grant-approvals" \
+    "top-level README drops the removed approval grant flag"
+assert_not_contains \
+    "$REPO_ROOT/README.md" \
+    "BOB_SETTINGS_FILE" \
+    "top-level README drops the removed settings path override"
+# the v1 flags and terminal tool are gone from every live doc. --yolo is excluded here:
+# the bob sections mention it in "removed in v2" prose, and Copilot's docs use it for real.
+# docs/custom-providers.md is excluded from the loop for the same reason — its migration
+# paragraph names the removed flags on purpose, and is pinned by the assertion below.
+for doc in README.md llms.txt CLAUDE.md; do
+    assert_not_contains \
+        "$REPO_ROOT/$doc" \
+        "--chat-mode=" \
+        "$doc drops the v1 --chat-mode invocation"
+    assert_not_contains \
+        "$REPO_ROOT/$doc" \
+        "--hide-intermediary-output" \
+        "$doc drops the v1 --hide-intermediary-output flag"
+done
+assert_matches \
+    "$REPO_ROOT/docs/custom-providers.md" \
+    "removed \`--yolo\`, \`--hide-intermediary-output\`, and model selection" \
+    "custom providers doc names the removed v1 flags only as removed"
+assert_section_not_contains \
+    "$REPO_ROOT/CLAUDE.md" \
+    "^bob wrapper:" \
+    "^### AWS Bedrock Provider" \
+    "--output-format=stream-json" \
+    "CLAUDE bob paragraph drops the v1 --output-format flag"
+assert_section_not_contains \
+    "$REPO_ROOT/CLAUDE.md" \
+    "^bob wrapper:" \
+    "^### AWS Bedrock Provider" \
+    "attempt_completion" \
+    "CLAUDE bob paragraph drops the removed attempt_completion tool"
+assert_section_not_contains \
+    "$REPO_ROOT/llms.txt" \
+    "^The Bob wrapper requires bob 2\.0\.0" \
+    "^\*\*Codex executor mode" \
+    "attempt_completion" \
+    "llms.txt bob section drops the removed attempt_completion tool"
 
 # llms.txt
 assert_contains \
@@ -357,6 +692,34 @@ assert_contains \
     "$REPO_ROOT/llms.txt" \
     "~/.bob/settings/custom_modes.yaml" \
     "llms.txt documents bob's active global mode path"
+assert_contains \
+    "$REPO_ROOT/llms.txt" \
+    "bob 2.0.0 or newer" \
+    "llms.txt states the minimum bob version"
+assert_contains \
+    "$REPO_ROOT/llms.txt" \
+    "bob run -f stream-json --mode=<slug> --trust" \
+    "llms.txt documents the v2 invocation"
+assert_contains \
+    "$REPO_ROOT/llms.txt" \
+    "it does not read the \`approval\` section" \
+    "llms.txt states approval settings are unread headlessly"
+assert_contains \
+    "$REPO_ROOT/llms.txt" \
+    "installing the shipped modes is the whole setup step" \
+    "llms.txt states mode installation is the only setup step"
+assert_not_contains \
+    "$REPO_ROOT/llms.txt" \
+    "--grant-approvals" \
+    "llms.txt drops the removed approval grant flag"
+assert_contains \
+    "$REPO_ROOT/llms.txt" \
+    "spawn_subagent" \
+    "llms.txt documents native parallel review subagents"
+assert_contains \
+    "$REPO_ROOT/llms.txt" \
+    "~/.claude/skills" \
+    "llms.txt documents the auto-loaded Claude skills caveat"
 
 # CLAUDE.md
 assert_contains \
@@ -387,6 +750,46 @@ assert_not_contains \
     "$REPO_ROOT/CLAUDE.md" \
     "Review adapter is prepended" \
     "CLAUDE removes stale Bob review-adapter trigger"
+assert_contains \
+    "$REPO_ROOT/CLAUDE.md" \
+    "bob run -f stream-json --mode=<slug> --trust" \
+    "CLAUDE documents the v2 invocation"
+assert_contains \
+    "$REPO_ROOT/CLAUDE.md" \
+    "isReasoning" \
+    "CLAUDE documents the v2 reasoning flag"
+assert_contains \
+    "$REPO_ROOT/CLAUDE.md" \
+    "there is no approval preflight and no \`BOB_SETTINGS_FILE\` handling" \
+    "CLAUDE states the approval preflight is gone"
+assert_contains \
+    "$REPO_ROOT/CLAUDE.md" \
+    "Do not reintroduce an approval preflight" \
+    "CLAUDE warns against reintroducing the approval preflight"
+assert_contains \
+    "$REPO_ROOT/CLAUDE.md" \
+    "the installer takes no arguments and rejects unknown ones" \
+    "CLAUDE documents the argument-free installer"
+assert_contains \
+    "$REPO_ROOT/CLAUDE.md" \
+    "\`severity\` is not inspected" \
+    "CLAUDE states error severity is not inspected"
+assert_contains \
+    "$REPO_ROOT/CLAUDE.md" \
+    "bob_signal_emitted" \
+    "CLAUDE documents the post-signal failure retraction"
+assert_not_contains \
+    "$REPO_ROOT/CLAUDE.md" \
+    "\`BOB_VERBOSE\`, \`BOB_EXTRA_ARGS\`, \`BOB_SETTINGS_FILE\`" \
+    "CLAUDE drops BOB_SETTINGS_FILE from the bob env-var list"
+assert_contains \
+    "$REPO_ROOT/CLAUDE.md" \
+    "spawn_subagent" \
+    "CLAUDE documents native parallel review subagents"
+assert_contains \
+    "$REPO_ROOT/CLAUDE.md" \
+    "BOB_SESSION" \
+    "CLAUDE documents native nesting protection"
 
 echo ""
 echo "summary: $passed passed, $failed failed, $total total"

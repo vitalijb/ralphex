@@ -1,7 +1,20 @@
 #!/usr/bin/env bash
 # install the shipped ralphex modes into Bob's global custom-mode document.
+#
+# usage:
+#   install-modes.sh
+#
+# tool access for headless `bob run` comes from each mode's `groups` list plus
+# `--trust`; the approval.* settings in ~/.bob/settings/settings.json are read
+# only by bob's interactive approval handler, which `bob run` never constructs.
+# So installing the modes is the whole setup step.
 
 set -euo pipefail
+
+for arg in "$@"; do
+    echo "error: unknown argument: $arg" >&2
+    exit 1
+done
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 mode_dir="$script_dir/modes"
@@ -23,6 +36,16 @@ error() {
     echo "error: $*" >&2
     exit 1
 }
+
+# tracked from here, before the file exists, so the trap covers every exit path.
+tmp_file=""
+cleanup() {
+    if [[ -n "$tmp_file" && -e "$tmp_file" ]]; then
+        rm -f "$tmp_file"
+    fi
+    return 0
+}
+trap cleanup EXIT
 
 # accept a conservative yaml subset with one top-level customModes sequence.
 # rejecting unsupported yaml features is preferable to replacing a document
@@ -347,14 +370,10 @@ if [[ ${#missing[@]} -eq 0 ]]; then
     exit 0
 fi
 
-mkdir -p "$target_dir"
+# -m applies only to directories this call creates, so an existing bob-owned
+# directory keeps its permissions; a fresh one under $HOME is not world-readable.
+mkdir -p -m 700 "$target_dir"
 tmp_file=$(mktemp "$target_dir/.custom_modes.yaml.tmp.XXXXXX")
-cleanup() {
-    if [[ -n "${tmp_file:-}" && -e "$tmp_file" ]]; then
-        rm -f "$tmp_file"
-    fi
-}
-trap cleanup EXIT
 
 if [[ ! -e "$target" || ! -s "$target" ]]; then
     printf '%s\n' 'customModes:' > "$tmp_file"
