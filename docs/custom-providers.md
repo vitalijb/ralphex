@@ -381,8 +381,9 @@ ralphex appends `--model <m>` / `--effort <e>` per phase. The wrapper forwards `
 
 | ralphex effort | pi thinking |
 |---|---|
-| `off`, `minimal`, `low`, `medium`, `high`, `xhigh` | passed through verbatim |
-| `max` | `xhigh` (pi has no `max`; a one-line note is printed to stderr) |
+| `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` | passed through verbatim |
+
+pi does not fail on a level it cannot honor, so an effort ralphex forwards is not necessarily the one that runs. `max` needs pi 0.80.6 or newer: older releases print a warning and run at their own default level instead. Any pi version clamps the level to what the selected model exposes. The wrapper replays pi's stderr after the run ends, so that warning appears in the log only once the work is done.
 
 ### Event translation
 

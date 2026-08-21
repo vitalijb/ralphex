@@ -20,9 +20,9 @@ make fmt        # format code
 `go get -u ./...` does NOT update dependencies behind build tags. The `e2e/` package uses `//go:build e2e`, so playwright-go and other e2e-only deps require a separate update:
 
 ```bash
-go get -u ./...                                          # update main deps
-go get -u -tags=e2e github.com/playwright-community/playwright-go  # update e2e deps
-go mod tidy && go mod vendor                             # tidy and re-vendor
+go get -u ./...                                        # update main deps
+go get -u -tags=e2e github.com/mxschmitt/playwright-go  # update e2e deps
+go mod tidy && go mod vendor                           # tidy and re-vendor
 ```
 
 ## Project Structure
@@ -169,6 +169,7 @@ Single public entry point: `git.NewService(path, logger, vcsCmd...) (*Service, e
 - `Logger` interface for dependency injection, compatible with `*color.Color`
 - Uses `backend` interface internally, implemented by `externalBackend` which shells out to the configured VCS command
 - Optional `vcsCmd` parameter overrides the default `"git"` command (e.g., path to `hg2git.sh` translation script)
+- `MovePlanToCompleted` commits through `commitFiles` (pathspec-restricted), never the bare `commit`. In worktree mode this call runs against the user's *main* checkout, which stays usable during the run, so a bare commit swept anything staged there into `move completed plan: ...` (#435). The source path is passed only when the move went through `git mv`, which stages the source deletion; the `os.Rename` fallback is reached both for an untracked source and for a tracked one whose destination already exists, and naming a path git does not know fails the whole commit. The list is therefore built from the branch taken, not by re-testing the file. Consequence: a pathspec commit is refused while a merge or cherry-pick is in progress in the target checkout (`cannot do a partial commit during a merge`), so the archive fails loudly there instead of silently absorbing the user's merge
 
 Key files:
 - `pkg/git/service.go` - `Service` type, `backend` interface
@@ -379,7 +380,7 @@ Playwright-based e2e tests for the web dashboard are in `e2e/` directory:
 
 ```bash
 # install playwright browsers (first time only)
-go run github.com/playwright-community/playwright-go/cmd/playwright@latest install --with-deps chromium
+go run github.com/mxschmitt/playwright-go/cmd/playwright@latest install --with-deps chromium
 
 # run web ui e2e tests
 go test -tags=e2e -timeout=10m -count=1 -v ./e2e/...
