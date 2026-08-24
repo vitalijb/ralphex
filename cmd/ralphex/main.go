@@ -512,9 +512,13 @@ func buildNotifyResult(req executePlanRequest, branch, elapsed string, stats git
 
 // displayStats prints completion summary with optional diff statistics and paths.
 // mirrors the startup header format using displayMeta for plan/branch/progress.
-// reflects where the plan actually lives: completed/ only when the move actually
-// succeeded; original path when the move was skipped or failed.
-func displayStats(req executePlanRequest, baseLog *progress.Logger, stats git.DiffStats, elapsed, branch string, planMoved bool) {
+// shows the completed/ path only when the archive succeeded; original path when it was
+// skipped or failed. a failed archive can still have moved the file on disk, which is
+// what the planMoveErr note points at: it is non-nil only when the archive was attempted
+// and failed, and it goes last because the warning at the failure site is well above the
+// completion line.
+func displayStats(req executePlanRequest, baseLog *progress.Logger, stats git.DiffStats, elapsed, branch string,
+	planMoved bool, planMoveErr error) {
 	if stats.Files > 0 {
 		baseLog.LogDiffStats(stats.Files, stats.Additions, stats.Deletions)
 		req.Colors.Info().Printf("\ncompleted in %s (%d files, +%d/-%d lines)\n",
@@ -535,6 +539,9 @@ func displayStats(req executePlanRequest, baseLog *progress.Logger, stats git.Di
 		}
 	}
 	displayMeta(req.Colors, 2, planPath, branch, baseLog.Path())
+	if planMoveErr != nil {
+		req.Colors.Warn().Printf("  plan archive incomplete: %v (check git status, the move may be left staged)\n", planMoveErr)
+	}
 }
 
 // displayMeta prints plan (if set), branch, and progress log path with the given indent.
@@ -668,24 +675,9 @@ func executePlan(ctx context.Context, o opts, req executePlanRequest) error {
 	// move completed plan to completed/ directory.
 	// use MainGitSvc+MainPlanFile when available (worktree mode) because the plan file is in the main repo.
 	// track actual success so the completion summary reflects where the plan really lives.
-	planMoved := false
-	if shouldMovePlan(req) {
-		moveSvc := req.GitSvc
-		movePlanFile := req.PlanFile
-		if req.MainGitSvc != nil {
-			moveSvc = req.MainGitSvc
-		}
-		if req.MainPlanFile != "" {
-			movePlanFile = req.MainPlanFile
-		}
-		if moveErr := moveSvc.MovePlanToCompleted(movePlanFile); moveErr != nil {
-			fmt.Fprintf(os.Stderr, "warning: failed to move plan to completed: %v\n", moveErr)
-		} else {
-			planMoved = true
-		}
-	}
+	planMoved, planMoveErr := archivePlan(req, plr.baseLog)
 
-	displayStats(req, plr.baseLog, stats, elapsed, branch, planMoved)
+	displayStats(req, plr.baseLog, stats, elapsed, branch, planMoved, planMoveErr)
 	keepDashboardAlive(ctx, o, req, plr.closeLog)
 
 	return nil
@@ -729,17 +721,22 @@ func runWithWorktree(ctx context.Context, o opts, req executePlanRequest) (err e
 		return fmt.Errorf("get working directory: %w", err)
 	}
 
+	// resolve the plan copy inside the worktree - the file the run actually ticks. computed here
+	// rather than after the chdir so the progress header can record it for the dashboard.
+	wtPlanFile := worktreePlanFile(req.PlanFile, req.GitSvc.Root(), wtPath)
+
 	// create progress logger BEFORE chdir so progress files land in main repo's .ralphex/progress/.
 	// use branch name derived from plan file since gitSvc still points at the main repo (on master).
 	holder := &status.PhaseHolder{}
 	branch := req.GitSvc.EffectiveBranchName(req.PlanFile, req.BranchOverride)
 	baseLog, err := progress.NewLogger(progress.Config{
-		PlanFile:       req.PlanFile,
-		Mode:           string(req.Mode),
-		Branch:         branch,
-		BranchOverride: req.BranchOverride,
-		Params:         runHeaderParams(o, req.Config, req.Mode),
-		NoColor:        o.NoColor,
+		PlanFile:         req.PlanFile,
+		WorktreePlanFile: wtPlanFile,
+		Mode:             string(req.Mode),
+		Branch:           branch,
+		BranchOverride:   req.BranchOverride,
+		Params:           runHeaderParams(o, req.Config, req.Mode),
+		NoColor:          o.NoColor,
 	}, req.Colors, holder)
 	if err != nil {
 		return fmt.Errorf("create progress logger: %w", err)
@@ -784,10 +781,6 @@ func runWithWorktree(ctx context.Context, o opts, req executePlanRequest) (err e
 	}
 	wtGitSvc.SetCommitTrailer(req.Config.CommitTrailer)
 
-	// resolve plan file path inside the worktree so Claude operates on the local copy,
-	// not the original in the main repo. the plan was copied by CreateWorktreeForPlan.
-	wtPlanFile := resolveWorktreePlanFile(req.PlanFile, req.GitSvc.Root())
-
 	// commit plan file on the feature branch (inside worktree), not on the default branch
 	if planNeedsCommit {
 		if commitErr := wtGitSvc.CommitPlanFile(req.PlanFile, req.GitSvc.Root()); commitErr != nil {
@@ -795,8 +788,15 @@ func runWithWorktree(ctx context.Context, o opts, req executePlanRequest) (err e
 		}
 	}
 
+	// a relative plan path leaves wtPlanFile empty; it still resolves correctly from inside
+	// the worktree, so run with it unchanged.
+	runPlanFile := wtPlanFile
+	if runPlanFile == "" {
+		runPlanFile = req.PlanFile
+	}
+
 	return executePlan(ctx, o, executePlanRequest{
-		PlanFile:      wtPlanFile,
+		PlanFile:      runPlanFile,
 		MainPlanFile:  req.PlanFile, // original path in main repo for MovePlanToCompleted
 		Mode:          req.Mode,
 		GitSvc:        wtGitSvc,
@@ -811,13 +811,15 @@ func runWithWorktree(ctx context.Context, o opts, req executePlanRequest) (err e
 	})
 }
 
-// resolveWorktreePlanFile maps an absolute plan path from the main repo into the worktree CWD.
+// worktreePlanFile maps an absolute plan path from the main repo onto its copy inside wtPath.
 // It resolves symlinks on the plan path to match the repo root (macOS: /tmp -> /private/tmp),
-// then makes the path relative to the root and absolute within the worktree.
-// Falls back to the original path if any step fails or the path is not absolute.
-func resolveWorktreePlanFile(planFile, repoRoot string) string {
+// then joins the repo-relative remainder onto the worktree root, mirroring the layout
+// copyToWorktree writes to. A plan outside repoRoot therefore maps to a path outside wtPath
+// too, which is where the copy really lands. Returns "" only when planFile is relative or
+// filepath.Rel cannot relate the two, leaving the caller to keep the original path.
+func worktreePlanFile(planFile, repoRoot, wtPath string) string {
 	if !filepath.IsAbs(planFile) {
-		return planFile
+		return ""
 	}
 	resolved := planFile
 	if r, err := filepath.EvalSymlinks(resolved); err == nil {
@@ -825,13 +827,9 @@ func resolveWorktreePlanFile(planFile, repoRoot string) string {
 	}
 	rel, err := filepath.Rel(repoRoot, resolved)
 	if err != nil {
-		return planFile
+		return ""
 	}
-	abs, err := filepath.Abs(rel)
-	if err != nil {
-		return planFile
-	}
-	return abs
+	return filepath.Join(wtPath, rel)
 }
 
 // openGitService creates a git.Service for the current directory.
@@ -933,6 +931,30 @@ func makePauseHandler(stdin io.Reader, stdout io.Writer) func(ctx context.Contex
 			return false
 		}
 	}
+}
+
+// archivePlan moves a completed plan into completed/ and reports a failure through the progress
+// logger, so the progress file holds it - a bare stderr write left no trace in the run's own record.
+// worktree mode archives in the main repo, hence the MainGitSvc/MainPlanFile preference.
+// the returned error is what displayStats repeats at the end of the summary.
+func archivePlan(req executePlanRequest, log *progress.Logger) (moved bool, err error) {
+	if !shouldMovePlan(req) {
+		return false, nil
+	}
+
+	moveSvc, movePlanFile := req.GitSvc, req.PlanFile
+	if req.MainGitSvc != nil {
+		moveSvc = req.MainGitSvc
+	}
+	if req.MainPlanFile != "" {
+		movePlanFile = req.MainPlanFile
+	}
+
+	if moveErr := moveSvc.MovePlanToCompleted(movePlanFile); moveErr != nil {
+		log.Warn("failed to move plan to completed: %v", moveErr)
+		return false, fmt.Errorf("move %s: %w", filepath.Base(movePlanFile), moveErr)
+	}
+	return true, nil
 }
 
 // shouldMovePlan returns true when a completed plan file should be moved to the
