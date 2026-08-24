@@ -1,0 +1,216 @@
+================================================================================
+DRAFT SOLUTION: repo-enforced commit subject conventions break ralphex commits
+================================================================================
+status   draft / pre-plan, not yet a ralphex plan
+author   drafted 2026-08-23 from evidence in a real run against ekmf-ws-all
+scope    ralphex (this repo). Interim workarounds for the affected project are
+         listed in section 6 but are NOT the proposed fix.
+
+--------------------------------------------------------------------------------
+1. THE PROBLEM, AS OBSERVED
+--------------------------------------------------------------------------------
+A repository with a commit-message hook that requires more than plain
+Conventional Commits will reject most commits ralphex asks the agent to make.
+
+Observed in a full pipeline run on 2026-08-23 against ekmf-ws-all, whose
+githooks/commit-msg (perl) requires a NUMERIC WORK-ITEM SCOPE:
+
+  ^(build|ci|docs|feat|fix|perf|refactor|style|test|update|revert)
+   (\((\d+(,\d+)?)+\))!?: [^\n]*(\n\n.*)?$
+
+So "fix(15478): text" passes and "fix: text" does not.
+
+Four commits were rejected during that run, all in non-task phases:
+
+  13:53:18  first review pass      "fix: address code review findings"
+  14:04:36  external review eval   (same family)
+  14:08:25  external review eval   "fix: address codex review findings"
+  14:11:03  second review pass     "fix: address code review findings"
+
+Each time the agent recovered within ~12 seconds by re-reading the hook error
+and retrying with a scope. So the run COMPLETED. The cost is not correctness,
+it is four red [tool_error] lines, four wasted round-trips, and a demo or CI log
+that looks like the tool is broken when it is not.
+
+Note what did NOT fail: the task phase. Both task commits passed first time,
+because the plan file carried an explicit "Commit Convention - MANDATORY"
+section and the task prompt tells the agent to follow the plan. That asymmetry
+is the whole diagnosis.
+
+--------------------------------------------------------------------------------
+2. ROOT CAUSE
+--------------------------------------------------------------------------------
+The embedded prompts HARDCODE literal commit messages:
+
+  pkg/config/defaults/prompts/task.txt:41
+      - Commit all changes (code + updated plan) with message: feat: <brief task description>
+  pkg/config/defaults/prompts/review_first.txt:68
+      3. Commit fixes: `git commit -m "fix: address code review findings"`
+  pkg/config/defaults/prompts/review_second.txt:69
+      3. Commit fixes: `git commit -m "fix: address code review findings"`
+  pkg/config/defaults/prompts/codex.txt:52
+      - Commit all fixes with message: "fix: address codex review findings"
+  pkg/config/defaults/prompts/custom_eval.txt:51
+      - Commit all fixes with message: "fix: address external review findings"
+
+Five literals, none carrying a scope, spread across five phases.
+
+There is exactly one place a user can currently express a repo-wide commit
+convention: the plan file. The plan reaches the TASK phase. It does not
+meaningfully reach the review, external-eval, or finalize phases, which are
+driven by their own prompts and given the plan only as background context.
+
+Consequence: a repo with a commit-lint hook works in the task phase and fails
+in every other phase. That is not a property of the repo; it is a gap in
+ralphex.
+
+Secondary risk, same cause, not yet observed: finalize.txt:30 tells the agent it
+may "reword commit messages if needed for clarity". On a repo like this, a
+reword can turn a passing message into a rejected one during a rebase.
+
+--------------------------------------------------------------------------------
+3. WHAT GOOD LOOKS LIKE
+--------------------------------------------------------------------------------
+R1  One place to state the convention, applying to EVERY phase that commits.
+R2  Works for users who have customized their prompt files. Those users must not
+    have to re-merge upstream prompt edits to get this.
+R3  Zero behaviour change when unset. This must be opt-in and invisible by
+    default, like commit_trailer.
+R4  Must beat the hardcoded literal when both are present. A prompt still
+    containing `git commit -m "fix: ..."` must not win.
+R5  No new dependency, no git hook installed by ralphex, no writes outside the
+    ralphex config dir.
+
+--------------------------------------------------------------------------------
+4. OPTIONS CONSIDERED
+--------------------------------------------------------------------------------
+A. Local .ralphex/prompts/ overrides of the five prompts.
+   Works today, no code change. Fails R2 (those five files become customized and
+   stop receiving upstream improvements) and is five files to maintain per
+   project. Fine as a stopgap, wrong as the answer.
+
+B. Repo-side prepare-commit-msg hook that injects a scope when missing.
+   Fixes it for every tool at once, humans included. But: core.hooksPath is
+   ./githooks and tracked, so this means a PR against a shared IBM repo; and
+   silently rewriting a developer's commit subject is intrusive. Also fails R5
+   in spirit. Rejected as a ralphex answer, though a team may legitimately want
+   it for their own reasons.
+
+C. New config option, injected into every commit-instructing prompt.  <-- CHOSEN
+   Mirrors commit_trailer exactly, which already solves the structurally
+   identical problem for trailers. Meets R1-R5.
+
+D. Ask the model to discover the convention itself (read the hook, or retry on
+   failure).
+   This is what already happens, and it costs a failed commit per phase. It also
+   depends on the hook printing a useful error. Not a fix.
+
+--------------------------------------------------------------------------------
+5. PROPOSED DESIGN (option C)
+--------------------------------------------------------------------------------
+New config option, sibling of commit_trailer:
+
+  # ~/.config/ralphex/config or .ralphex/config
+  commit_subject_format = <type>(29999): <description>
+
+Free-form string. ralphex does not parse or validate it; it is passed to the
+model as the required shape. Empty (default) = today's behaviour exactly.
+
+5.1 Plumbing, mirroring CommitTrailer end to end
+    pkg/config/values.go        CommitSubjectFormat field; INI key read in the
+                                loader next to commit_trailer (~:388); merge
+                                clause in mergeExtraFrom (~:575)
+    pkg/config/config.go        Config field (~:94) + mapping (~:326)
+    pkg/config/defaults/config  commented-out template entry beside commit_trailer
+    pkg/processor/prompts.go    appendCommitConventionInstruction(prompt string)
+
+5.2 The injected text must be authoritative, because of R4
+    Wording matters here. The prompts still contain literal examples, so the
+    instruction has to explicitly supersede them:
+
+      Every git commit you make in this run MUST have a subject line of this
+      form:
+        <value>
+      This overrides any example commit message shown elsewhere in these
+      instructions. If a commit is rejected by a commit-message hook, fix the
+      subject to match this form - do not bypass the hook.
+
+    The last clause is deliberate: without it a model that hits a hook rejection
+    may reach for --no-verify.
+
+5.3 Call sites
+    appendCommitTrailerInstruction is called ONCE on each final assembled prompt
+    (see the comment on replaceBaseVariables - calling it earlier duplicates the
+    text when agent references expand). The new function must be called in the
+    same places, and it is worth folding both into a single
+    appendCommitPolicyInstructions(prompt) helper so a future third policy does
+    not have to find all the call sites again.
+
+    Phases needing it: task, review_first, review_second, codex eval,
+    custom_eval, finalize.
+
+5.4 De-literalise the embedded prompts (separate, smaller change)
+    Independently of the config option, the five literals should read as
+    examples rather than commands, e.g.
+      3. Commit fixes (example subject: `fix: address code review findings`)
+    This reduces the conflict the instruction in 5.2 has to override, and helps
+    even users who never set the option. Do NOT skip 5.2 in favour of this
+    alone: customized prompt files keep their hard literals forever.
+
+--------------------------------------------------------------------------------
+6. INTERIM WORKAROUND, AVAILABLE TODAY
+--------------------------------------------------------------------------------
+For a project that needs this before the feature exists, copy only the prompts
+whose phases you actually run and edit their literal:
+
+  mkdir -p .ralphex/prompts
+  cp <ralphex>/pkg/config/defaults/prompts/review_first.txt  .ralphex/prompts/
+  cp <ralphex>/pkg/config/defaults/prompts/review_second.txt .ralphex/prompts/
+  cp <ralphex>/pkg/config/defaults/prompts/codex.txt         .ralphex/prompts/
+  # then change each `fix: ...` literal to `fix(<work-item>): ...`
+
+Task phase needs no override if the plan file states the convention.
+Accept the trade-off: these three files are now pinned and will not pick up
+upstream prompt improvements.
+
+--------------------------------------------------------------------------------
+7. TEST PLAN
+--------------------------------------------------------------------------------
+Unit, table-driven, per project convention:
+  - values: key absent / present / whitespace-only; local overrides global
+  - config: mapping, empty default
+  - prompts: appendCommitConventionInstruction returns input unchanged when
+    unset and when AppConfig is nil; appends exactly once when set
+  - prompts: instruction present in all six phase prompts when set, absent when
+    unset (this is the regression test that matters - it is the thing that
+    silently rots when a new phase is added)
+  - prompts: no duplication when a prompt contains {{agent:name}} references
+
+Manual / e2e:
+  - toy repo with a commit-msg hook requiring a scope; run full pipeline with
+    the option set; assert zero rejected commits across all phases
+  - same repo, option unset; assert current behaviour is unchanged
+
+--------------------------------------------------------------------------------
+8. OPEN QUESTIONS
+--------------------------------------------------------------------------------
+Q1  Name. commit_subject_format vs commit_convention vs commit_message_format.
+    Leaning commit_subject_format: it says subject, so it cannot be confused
+    with commit_trailer, and it does not imply ralphex validates anything.
+Q2  Should a placeholder be supported, e.g. a {{WORK_ITEM}} the plan supplies?
+    Probably not in v1 - a literal string covers the observed need and keeps the
+    option unparsed.
+Q3  Should finalize.txt's "reword commit messages" advice be gated when this
+    option is set? A reword is the one operation that can turn passing history
+    into failing history during a rebase. Cheapest answer is a clause in 5.2's
+    text: rewording must preserve the required subject form.
+Q4  Worth also emitting a one-line startup banner note when the option is set,
+    as --preserve-anthropic-api-key does? Probably yes; cheap and makes a
+    misconfigured run visible before the first commit.
+
+--------------------------------------------------------------------------------
+9. EVIDENCE TRAIL
+--------------------------------------------------------------------------------
+Run log      /tmp/ralphex-rehearsal.log, /tmp/ralphex-verify.log (2026-08-23)
+Hook         <ekmf-ws-all>/githooks/commit-msg
+Demo notes   docs/demo/RUNBOOK.md hazard 5
