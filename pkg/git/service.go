@@ -185,18 +185,19 @@ func (s *Service) preparePlanBranch(planFile string, worktreeMode bool, defaultB
 	}
 
 	if worktreeMode {
-		// completion archives the plan in this checkout, so do not start while another git
-		// operation owns its index and commit state. checked ahead of the branch guard because
-		// a rebase or a checked-out bisect detaches HEAD, and that guard would otherwise report
-		// an empty branch name for a repository that is mid-operation.
+		// a worktree forks committed HEAD and carries none of an unfinished operation's index
+		// or staged state, so an unfinished operation makes the source checkout an unsound base
+		// to fork from. checked ahead of the branch guard because a rebase or a checked-out
+		// bisect detaches HEAD, and that guard would otherwise report an empty branch name for
+		// a repository that is mid-operation.
 		op, opErr := s.repo.operationInProgress()
 		if opErr != nil {
 			return "", false, fmt.Errorf("check for unfinished git operation: %w", opErr)
 		}
 		if op != "" {
 			return "", false, fmt.Errorf("cannot create worktree: %s in progress in %s\n\n"+
-				"ralphex archives the completed plan in this checkout at the end of the run. "+
-				"finish or abort the git operation first", op, s.repo.root())
+				"ralphex does not start a worktree run while the source checkout has an "+
+				"unfinished git operation; finish or abort it first", op, s.repo.root())
 		}
 	}
 
@@ -522,8 +523,8 @@ func (s *Service) MovePlanToCompleted(planFile string) error {
 	}
 
 	// commit the move, restricted to the plan paths. a bare commit would take the whole
-	// index, and in worktree mode this runs against the user's main checkout, where
-	// anything staged during the run would land under ralphex's message.
+	// index of whichever checkout this runs in, sweeping anything the run left staged there
+	// into a commit named for the plan move.
 	commitMsg := "move completed plan: " + filepath.Base(sourceFile)
 	if err := s.repo.commitFiles(s.appendTrailer(commitMsg), commitPaths...); err != nil {
 		return fmt.Errorf("commit plan move: %w", err)

@@ -75,7 +75,7 @@ Then run:
 ralphex docs/plans/my-feature.md
 ```
 
-ralphex will create a branch, execute tasks, commit results, run multi-phase reviews, and move the plan to `completed/` when done.
+ralphex will create a branch, execute tasks, commit results, run multi-phase reviews, and move the plan to `completed/` when done (on the feature branch under `--worktree`).
 
 > [!WARNING]
 > **Anthropic Agent SDK billing change on June 15, 2026**
@@ -181,7 +181,7 @@ See [Custom External Review](#custom-external-review) for details on using custo
 1. Launches 2 agents (`quality` + `implementation`) for final review
 2. Focuses on critical/major issues only
 3. Iterates until no issues found
-4. Moves plan to `completed/` folder on success
+4. Moves plan to `completed/` folder on success (on the feature branch under `--worktree`)
 
 *Second review agents are configurable via `prompts/review_second.txt`.*
 
@@ -208,6 +208,8 @@ Edit `~/.config/ralphex/prompts/finalize.txt` (or `.ralphex/prompts/finalize.txt
 ### Plan Move Behavior (optional)
 
 After successful execution, ralphex moves the plan file into `docs/plans/completed/`. Enabled by default.
+
+Under `--worktree` the archive is committed on the feature branch, alongside the ticked plan. The copy in your main checkout is left exactly as it was — for a plan you never committed, it stays there unticked even after the branch merges. Delete it yourself if you don't want it.
 
 **How to disable:**
 
@@ -309,7 +311,7 @@ ralphex --review
 ralphex --external-only
 ```
 
-Worktrees are automatically removed on successful completion. If a run is interrupted, the worktree directory may remain and can be reused or removed manually.
+Worktrees are automatically removed on successful completion. Two cases leave one behind: an interrupted run, and a run whose plan archive did not complete — the worktree is kept so anything the archive staged can be recovered. The run still reports success and names the retained worktree; inspect it with `git -C <path> status` and run `git worktree remove <path>` before running that plan again, or the next run refuses with `worktree already exists`.
 
 ### Plan Creation
 
@@ -907,6 +909,18 @@ Agents to launch:
 - `pi` - alternative provider for Claude phases (optional, via `scripts/pi-as-claude/`)
 - `bob` - IBM Bob Shell CLI 2.0.0+, alternative provider for Claude phases (optional, via `scripts/bob-as-claude/`; bob 1.0.x is not supported by the wrapper)
 
+## Platform Support
+
+Linux and macOS are the supported platforms. Windows works on a best-effort basis: it builds and runs, but no Windows binaries are released, so it has to be installed from source, and the maintainer has no Windows machine and does not test there.
+
+Features missing on Windows:
+
+- the Ctrl+\ break (SIGQUIT) for pausing a task phase or terminating external review
+- file-lock-based active session detection, used by the web dashboard
+- cleanup of descendant processes on cancellation, since process group signals are unavailable
+
+Windows-only issues and pull requests can rarely be acted on, since the maintainer has no Windows machine to reproduce a report or verify a fix. A patch may still be merged when the cause is clear-cut, the change is small and self-contained, and it cannot affect Linux or macOS. Reports and patches that do not meet that bar are closed.
+
 ## Configuration
 
 ralphex uses a configuration directory at `~/.config/ralphex/` (override with `--config-dir` or `RALPHEX_CONFIG_DIR`) with the following structure:
@@ -998,18 +1012,18 @@ Provider-related CLI flags (`--claude-command`, `--claude-args`, `--external-rev
 | `color_signal` | Completion/failure signals color (hex) | `#ff6464` |
 | `color_timestamp` | Timestamp prefix color (hex) | `#8a8a8a` |
 | `color_info` | Informational messages color (hex) | `#b4b4b4` |
-| `claude_error_patterns` | Patterns to detect in claude output (comma-separated) | `You've hit your limit,You've hit your session limit,API Error: 400,API Error: 401,API Error: 403,API Error: 404,API Error: 413,API Error: 429,API Error: 500,cannot be launched inside another Claude Code session,Not logged in,Your usage allocation has been disabled by your admin,You've hit your org's monthly usage limit,You've hit your individual spend limit` |
+| `claude_error_patterns` | Error patterns to detect in Claude diagnostics or failed-run output (comma-separated) | `You've hit your limit,You've hit your session limit,You've hit your weekly limit,API Error: 400,API Error: 401,API Error: 403,API Error: 404,API Error: 413,API Error: 429,API Error: 500,cannot be launched inside another Claude Code session,Not logged in,Your usage allocation has been disabled by your admin,You've hit your org's monthly usage limit,You've hit your individual spend limit` |
 | `codex_error_patterns` | Patterns to detect in codex output (comma-separated) | `Rate limit exceeded,rate limit reached,429 Too Many Requests,quota exceeded,insufficient_quota,You've hit your usage limit,Selected model is at capacity` |
-| `claude_limit_patterns` | Limit patterns for claude triggering wait+retry (comma-separated) | `You've hit your limit,You've hit your session limit,Your usage allocation has been disabled by your admin,You've hit your org's monthly usage limit,You've hit your individual spend limit` |
+| `claude_limit_patterns` | Limit patterns in Claude diagnostics or failed-run output that trigger wait+retry (comma-separated) | `You've hit your limit,You've hit your session limit,You've hit your weekly limit,API Error: 429,Your usage allocation has been disabled by your admin,You've hit your org's monthly usage limit,You've hit your individual spend limit` |
 | `codex_limit_patterns` | Limit patterns for codex triggering wait+retry (comma-separated) | `Rate limit exceeded,rate limit reached,429 Too Many Requests,quota exceeded,insufficient_quota,You've hit your usage limit,Selected model is at capacity` |
-| `claude_retry_patterns` | Transient claude/fya markers retried like executor timeouts (comma-separated) | `FYA_TRANSIENT_TIMEOUT,API Error: 529,API Error: 502,API Error: 503,API Error: 504,BOB_TRANSIENT_ERROR` |
+| `claude_retry_patterns` | Transient Claude/fya diagnostic or failed-run markers retried like executor timeouts (comma-separated) | `FYA_TRANSIENT_TIMEOUT,API Error: 529,API Error: 502,API Error: 503,API Error: 504,BOB_TRANSIENT_ERROR` |
 | `wait_on_limit` | Wait duration before retrying on rate limit (e.g., `1h`, `30m`) | disabled |
 | `session_timeout` | Per-session timeout for task/review executor (e.g., `30m`, `1h`). Applies to Claude calls in default executor mode and every executor call under `executor = codex`; external codex/custom review in Claude mode is not affected | disabled |
 | `idle_timeout` | Kill executor session when no output for specified duration (e.g., `5m`). Resets on each output line. Applies to the claude executor in default mode and to every executor call under `--codex`; external codex review in default-claude mode is NOT affected (preserves master behavior). Custom review is also not affected | disabled |
 
 Colors use 24-bit RGB (true color), supported natively by all modern terminals (iTerm2, Kitty, Terminal.app, Windows Terminal, GNOME Terminal, Alacritty, Zed, VS Code, etc). Older terminals will degrade gracefully. Use `--no-color` to disable colors entirely.
 
-Error patterns use case-insensitive substring matching. When a pattern is detected in claude or codex output, ralphex exits gracefully with an informative message suggesting how to check usage/status. Multiple patterns are separated by commas, with whitespace trimmed from each pattern.
+Patterns use case-insensitive substring matching, and multiple patterns are separated by commas with whitespace trimmed from each pattern. For Claude, successful assistant messages and successful result summaries are not pattern input: ralphex checks a bounded window of structured CLI diagnostics and non-JSON CLI lines. If the process exits non-zero or the stream fails (an idle timeout cancels the stream, so it counts), it also checks bounded recent surfaced output, which is what keeps limit detection working for wrapper scripts that report failures as ordinary text. A clean assistant response can therefore discuss or quote a configured phrase without being treated as a fresh CLI failure. Codex and custom executors keep their existing failed-exit checks. When an error pattern is detected, ralphex exits gracefully with an informative message suggesting how to check usage/status.
 
 **Transient retry:** Claude retry patterns (`claude_retry_patterns`) are checked before limit and error patterns. They cover wrapper-level stalls such as fya's `FYA_TRANSIENT_TIMEOUT` and transient server-side HTTP errors (`API Error: 529` Overloaded and the `502`/`503`/`504` gateway errors); matches are retried through the existing timeout-style phase path and do not use `wait_on_limit`, so they recover automatically without `--wait`. The task and review retry loops wait a short fixed backoff (5s) before re-running the failed iteration. `API Error: 500` is intentionally excluded — it can be a deterministic server failure and is caught by the enumerated `API Error: 500` error pattern instead. `BOB_TRANSIENT_ERROR` is an opaque marker the bob wrapper emits when bob fails from a transient backend or network cause; classifying in the wrapper keeps this shared list free of English phrases that review prose could trip.
 
@@ -1451,7 +1465,7 @@ Once installed:
 
 The `/ralphex` command runs ralphex in the background and provides status updates on request. The `/ralphex-plan` command guides you through creating well-structured plans with context discovery and approach selection.
 
-> **Note:** ralphex automatically strips the `CLAUDECODE` env var from child processes, allowing it to run from inside Claude Code. However, running from a standalone terminal is still recommended for the best experience. If the nested session error is somehow encountered, ralphex detects it via error pattern matching and exits gracefully.
+> **Note:** ralphex automatically strips Claude Code's per-session env vars (`CLAUDECODE`, `CLAUDE_CODE_SESSION_ID`, `CLAUDE_CODE_MESSAGING_SOCKET` and the rest of the set) from the Claude and Codex child processes, allowing it to run from inside Claude Code. Marker names are matched exactly, so configuration variables such as `CLAUDE_CODE_USE_BEDROCK` are preserved. However, running from a standalone terminal is still recommended for the best experience. If the nested session error is somehow encountered, ralphex detects it via error pattern matching and exits gracefully.
 
 ## For LLMs
 
