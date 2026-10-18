@@ -70,10 +70,10 @@ func TestValuesLoader_Load_EmbeddedOnly(t *testing.T) {
 	assert.Equal(t, "docs/plans", values.PlansDir)
 	assert.Equal(t, "git", values.VcsCommand)
 	assert.Empty(t, values.CommitTrailer)
-	assert.Equal(t, []string{"You've hit your limit", "You've hit your session limit", "API Error: 400", "API Error: 401", "API Error: 403", "API Error: 404", "API Error: 413", "API Error: 429", "API Error: 500", "cannot be launched inside another Claude Code session", "Not logged in", "Your usage allocation has been disabled by your admin", "You've hit your org's monthly usage limit", "You've hit your individual spend limit"}, values.ClaudeErrorPatterns)
-	assert.Equal(t, []string{"Rate limit exceeded", "rate limit reached", "429 Too Many Requests", "quota exceeded", "insufficient_quota", "You've hit your usage limit"}, values.CodexErrorPatterns)
-	assert.Equal(t, []string{"You've hit your limit", "You've hit your session limit", "Your usage allocation has been disabled by your admin", "You've hit your org's monthly usage limit", "You've hit your individual spend limit"}, values.ClaudeLimitPatterns)
-	assert.Equal(t, []string{"Rate limit exceeded", "rate limit reached", "429 Too Many Requests", "quota exceeded", "insufficient_quota", "You've hit your usage limit"}, values.CodexLimitPatterns)
+	assert.Equal(t, []string{"You've hit your limit", "You've hit your session limit", "You've hit your weekly limit", "API Error: 400", "API Error: 401", "API Error: 403", "API Error: 404", "API Error: 413", "API Error: 429", "API Error: 500", "cannot be launched inside another Claude Code session", "Not logged in", "Your usage allocation has been disabled by your admin", "You've hit your org's monthly usage limit", "You've hit your individual spend limit"}, values.ClaudeErrorPatterns)
+	assert.Equal(t, []string{"Rate limit exceeded", "rate limit reached", "429 Too Many Requests", "quota exceeded", "insufficient_quota", "You've hit your usage limit", "Selected model is at capacity"}, values.CodexErrorPatterns)
+	assert.Equal(t, []string{"You've hit your limit", "You've hit your session limit", "You've hit your weekly limit", "API Error: 429", "Your usage allocation has been disabled by your admin", "You've hit your org's monthly usage limit", "You've hit your individual spend limit"}, values.ClaudeLimitPatterns)
+	assert.Equal(t, []string{"Rate limit exceeded", "rate limit reached", "429 Too Many Requests", "quota exceeded", "insufficient_quota", "You've hit your usage limit", "Selected model is at capacity"}, values.CodexLimitPatterns)
 	assert.Equal(t, []string{"FYA_TRANSIENT_TIMEOUT", "API Error: 529", "API Error: 502", "API Error: 503", "API Error: 504", "BOB_TRANSIENT_ERROR"}, values.ClaudeRetryPatterns)
 	assert.Zero(t, values.WaitOnLimit)
 	assert.False(t, values.WaitOnLimitSet)
@@ -2250,6 +2250,8 @@ func TestValuesLoader_parseValuesFromBytes_SessionTimeout(t *testing.T) {
 		{name: "1 hour", input: "session_timeout = 1h", expected: time.Hour, expectedSet: true},
 		{name: "1h30m compound", input: "session_timeout = 1h30m", expected: 90 * time.Minute, expectedSet: true},
 		{name: "90 seconds", input: "session_timeout = 90s", expected: 90 * time.Second, expectedSet: true},
+		{name: "500 milliseconds", input: "session_timeout = 500ms", expected: 500 * time.Millisecond, expectedSet: true},
+		{name: "1 nanosecond", input: "session_timeout = 1ns", expected: time.Nanosecond, expectedSet: true},
 		{name: "zero", input: "session_timeout = 0s", expected: 0, expectedSet: true},
 		{name: "empty value", input: "session_timeout = ", expected: 0, expectedSet: false},
 		{name: "not set", input: "", expected: 0, expectedSet: false},
@@ -2273,6 +2275,7 @@ func TestValuesLoader_parseValuesFromBytes_SessionTimeout_Invalid(t *testing.T) 
 	}{
 		{name: "invalid format", input: "session_timeout = notaduration", errContains: "invalid session_timeout"},
 		{name: "negative duration", input: "session_timeout = -5m", errContains: "must be non-negative"},
+		{name: "negative nanosecond", input: "session_timeout = -1ns", errContains: "must be non-negative"},
 	}
 
 	for _, tc := range tests {
@@ -2372,6 +2375,8 @@ func TestValuesLoader_parseValuesFromBytes_IdleTimeout(t *testing.T) {
 		{name: "5 minutes", input: "idle_timeout = 5m", expected: 5 * time.Minute, expectedSet: true},
 		{name: "1 hour", input: "idle_timeout = 1h", expected: time.Hour, expectedSet: true},
 		{name: "30 seconds", input: "idle_timeout = 30s", expected: 30 * time.Second, expectedSet: true},
+		{name: "500 milliseconds", input: "idle_timeout = 500ms", expected: 500 * time.Millisecond, expectedSet: true},
+		{name: "1 nanosecond", input: "idle_timeout = 1ns", expected: time.Nanosecond, expectedSet: true},
 		{name: "zero", input: "idle_timeout = 0s", expected: 0, expectedSet: true},
 		{name: "empty value", input: "idle_timeout = ", expected: 0, expectedSet: false},
 		{name: "not set", input: "", expected: 0, expectedSet: false},
@@ -2395,6 +2400,7 @@ func TestValuesLoader_parseValuesFromBytes_IdleTimeout_Invalid(t *testing.T) {
 	}{
 		{name: "invalid format", input: "idle_timeout = notaduration", errContains: "invalid idle_timeout"},
 		{name: "negative duration", input: "idle_timeout = -5m", errContains: "must be non-negative"},
+		{name: "negative nanosecond", input: "idle_timeout = -1ns", errContains: "must be non-negative"},
 	}
 
 	for _, tc := range tests {

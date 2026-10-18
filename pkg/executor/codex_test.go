@@ -81,6 +81,30 @@ func TestExecCodexRunner_childEnv(t *testing.T) {
 			env:               []string{"OPENAI_API_KEY=ok", "FOO=bar"},
 			want:              []string{"OPENAI_API_KEY=ok", "FOO=bar"},
 		},
+		{
+			name:              "every Claude Code session marker stripped regardless of mode",
+			stripAnthropicKey: false,
+			env: []string{
+				"PATH=/usr/bin", "CLAUDECODE=1", "CLAUDE_CODE_ENTRYPOINT=cli",
+				"CLAUDE_CODE_EXECPATH=/usr/bin/claude", "CLAUDE_CODE_SESSION_ID=abc",
+				"CLAUDE_CODE_CHILD_SESSION=1", "CLAUDE_CODE_BRIDGE_SESSION_ID=def",
+				"CLAUDE_CODE_MESSAGING_SOCKET=/tmp/sock", "CLAUDE_CODE_MESSAGING_TOKEN=tok",
+				"CLAUDE_PID=123", "CLAUDE_EFFORT=high", "HOME=/home/user",
+			},
+			want: []string{"PATH=/usr/bin", "HOME=/home/user"},
+		},
+		{
+			name:              "keeps user-set CLAUDE_CODE_ config vars",
+			stripAnthropicKey: true,
+			env: []string{
+				"CLAUDE_CODE_USE_BEDROCK=1", "CLAUDE_CODE_MAX_OUTPUT_TOKENS=8192",
+				"CLAUDE_CONFIG_DIR=/custom/config", "CLAUDE_CODE_SESSION_ID=abc",
+			},
+			want: []string{
+				"CLAUDE_CODE_USE_BEDROCK=1", "CLAUDE_CODE_MAX_OUTPUT_TOKENS=8192",
+				"CLAUDE_CONFIG_DIR=/custom/config",
+			},
+		},
 	}
 
 	for _, tc := range tests {
@@ -887,6 +911,8 @@ func TestCodexExecutor_Run_ErrorPattern(t *testing.T) {
 			result := e.Run(context.Background(), "analyze code")
 
 			assert.Equal(t, tc.wantOutput, result.Output)
+			assert.Empty(t, result.DiagnosticText,
+				"Claude diagnostic provenance must not change Codex result semantics")
 
 			if tc.wantError {
 				require.Error(t, result.Error)
@@ -1181,6 +1207,30 @@ func TestCodexExecutor_Run_LimitPattern_TruncationResistant(t *testing.T) {
 	require.ErrorAs(t, result.Error, &limitErr,
 		"limit message past the 256-rune line cap must still be detected (scan before truncation)")
 	assert.Equal(t, "You've hit your usage limit", limitErr.Pattern)
+}
+
+func TestCodexExecutor_Run_LimitPattern_ModelAtCapacity(t *testing.T) {
+	// pins #446: default pattern is the leading clause, message from OpenAI has two sentences
+	exitErr := errors.New("exit status 1")
+	stderr := "--------\nworkdir: /tmp/test\n--------\n" +
+		"ERROR: Selected model is at capacity. Please try a different model.\n"
+
+	mock := &mockCodexRunner{
+		runFunc: func(_ context.Context, _ string, _ ...string) (CodexStreams, func() error, error) {
+			return mockStreams(stderr, ""), mockWaitError(exitErr), nil
+		},
+	}
+	e := &CodexExecutor{
+		runner:        mock,
+		LimitPatterns: []string{"Selected model is at capacity"},
+	}
+
+	result := e.Run(context.Background(), "analyze code")
+
+	require.Error(t, result.Error)
+	var limitErr *LimitPatternError
+	require.ErrorAs(t, result.Error, &limitErr)
+	assert.Equal(t, "Selected model is at capacity", limitErr.Pattern)
 }
 
 func TestCodexExecutor_Run_StderrChatterIgnoredWithoutErrorPrefix(t *testing.T) {
